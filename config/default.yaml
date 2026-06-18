@@ -1,0 +1,40 @@
+database:
+  engine: mysql
+  host: localhost
+  port: 3308
+  name: superclaw
+  user: superclaw
+  password: GEW3fHhi8KxwhMwM
+
+logging:
+  level: INFO
+  dir: logs
+
+browser:
+  headless: false
+  timeout: 30000
+
+risk:
+  daily_comment_limit: 50
+  daily_dm_limit: 20
+  hourly_action_limit: 30
+  min_interval_seconds: 5
+  max_interval_seconds: 10
+  rest_after_n_actions: 10
+  rest_duration_min: 30
+  rest_duration_max: 60
+  circuit_breaker_threshold: 5
+
+scoring:
+  strong_intent_words:
+    - "怎么买"
+    - "多少钱"
+    - "在哪买"
+    - "求链接"
+    - "想要"
+    - "购买"
+  strong_intent_score: 30
+  recent_days_bonus: 20
+  recent_days_threshold: 7
+  replied_bonus: 20
+  contacted_penalty: -20

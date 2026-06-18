@@ -1,0 +1,26 @@
+rules:
+  - name: daily_comment_limit
+    type: daily_limit
+    action_type: comment_reply
+    limit: 50
+
+  - name: daily_dm_limit
+    type: daily_limit
+    action_type: dm
+    limit: 20
+
+  - name: hourly_action_limit
+    type: hourly_limit
+    limit: 30
+
+  - name: per_video_limit
+    type: per_video_limit
+    limit: 10
+
+  - name: contact_cooldown
+    type: cooldown
+    duration_days: 7
+
+  - name: circuit_breaker
+    type: circuit_breaker
+    consecutive_failures: 5
