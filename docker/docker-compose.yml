@@ -1,0 +1,41 @@
+# SuperClaw Docker Compose
+# 用法: docker-compose up -d
+
+services:
+  # ---- SuperClaw 主服务 ----
+  superclaw:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: superclaw
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - SUPERCLAW_ENV=production
+      - SUPERCLAW_APP__DEBUG=false
+      - SUPERCLAW_APP__LOG_LEVEL=INFO
+      - SUPERCLAW_DATABASE__URL=sqlite:///app/data/superclaw.db
+      - SUPERCLAW_QUEUE__MAX_WORKERS=5
+      - SUPERCLAW_RATE_LIMIT__GLOBAL_CAPACITY=100
+    volumes:
+      - superclaw_data:/app/data
+      - superclaw_logs:/app/logs
+    networks:
+      - superclaw-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  superclaw_data:
+    driver: local
+  superclaw_logs:
+    driver: local
+
+networks:
+  superclaw-net:
+    driver: bridge

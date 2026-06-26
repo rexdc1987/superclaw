@@ -1,0 +1,60 @@
+{
+  "pool_selection": {
+    "test": "account_pool_selection",
+    "pool_size": 100,
+    "strategies": {
+      "round_robin": {
+        "iterations": 1000,
+        "avg_us": 0.0,
+        "min_us": 0.0,
+        "max_us": 0.0
+      },
+      "health_first": {
+        "iterations": 1000,
+        "avg_us": 0.0,
+        "min_us": 0.0,
+        "max_us": 0.0
+      },
+      "random": {
+        "iterations": 1000,
+        "avg_us": 0.0,
+        "min_us": 0.0,
+        "max_us": 0.0
+      },
+      "least_used": {
+        "iterations": 1000,
+        "avg_us": 0.0,
+        "min_us": 0.0,
+        "max_us": 0.0
+      }
+    }
+  },
+  "health_scorer": {
+    "test": "health_scorer",
+    "iterations": 1000,
+    "avg_us": 0.0,
+    "min_us": 0.0,
+    "max_us": 0.0
+  },
+  "token_rw": {
+    "test": "token_manager_rw",
+    "iterations": 1000,
+    "write": {
+      "avg_us": 422.0,
+      "min_us": 0.0,
+      "max_us": 31000.0
+    },
+    "read": {
+      "avg_us": 0.0,
+      "min_us": 0.0,
+      "max_us": 0.0
+    }
+  },
+  "context_factory": {
+    "test": "context_factory_create",
+    "iterations": 50,
+    "avg_ms": 0.0,
+    "min_ms": 0.0,
+    "max_ms": 0.0
+  }
+}
