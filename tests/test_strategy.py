@@ -76,9 +76,9 @@ class TestStrategyService:
         from models.lead import Lead
         session = get_session()
         try:
-            lead1 = session.query(Lead).get(l1.id)
+            lead1 = session.get(Lead, l1.id)
             lead1.notes = "我想买这个产品"
-            lead2 = session.query(Lead).get(l2.id)
+            lead2 = session.get(Lead, l2.id)
             lead2.notes = "好视频"
             session.commit()
         finally:
