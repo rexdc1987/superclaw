@@ -9,6 +9,10 @@ from models.audit import AuditLog, ExecutionLog
 from models.comment import Comment
 from models.keyword import KeywordGroup
 from models.user import User
+from models.hongguo_task import HongguoTask
+from models.hongguo_record import HongguoRecord
+from models.hongguo_log import HongguoLog
+from models.hongguo_template import HongguoTemplate
 
 __all__ = [
     "AccountGroup", "Account",
@@ -18,4 +22,5 @@ __all__ = [
     "AuditLog", "ExecutionLog",
     "Comment", "KeywordGroup",
     "User",
+    "HongguoTask", "HongguoRecord", "HongguoLog", "HongguoTemplate",
 ]

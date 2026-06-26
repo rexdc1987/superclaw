@@ -21,7 +21,7 @@ class AccountService:
     def update_account(self, account_id: int, data: dict):
         session = get_session()
         try:
-            account = session.query(Account).get(account_id)
+            account = session.get(Account, account_id)
             if not account:
                 return None
             for key, value in data.items():
@@ -36,7 +36,7 @@ class AccountService:
     def delete_account(self, account_id: int) -> bool:
         session = get_session()
         try:
-            account = session.query(Account).get(account_id)
+            account = session.get(Account, account_id)
             if not account:
                 return False
             session.delete(account)
@@ -65,7 +65,7 @@ class AccountService:
     def update_status(self, account_id, status, error_message=""):
         session = get_session()
         try:
-            account = session.query(Account).get(account_id)
+            account = session.get(Account, account_id)
             if account:
                 account.status = status
                 account.error_message = error_message
@@ -76,7 +76,7 @@ class AccountService:
     def record_action(self, account_id, action_type):
         session = get_session()
         try:
-            account = session.query(Account).get(account_id)
+            account = session.get(Account, account_id)
             if account:
                 account.record_action(action_type)
                 session.commit()
@@ -124,7 +124,7 @@ class AccountService:
     def delete_group(self, group_id) -> bool:
         session = get_session()
         try:
-            g = session.query(AccountGroup).get(group_id)
+            g = session.get(AccountGroup, group_id)
             if not g:
                 return False
             session.delete(g)

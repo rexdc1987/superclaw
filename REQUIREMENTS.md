@@ -16,6 +16,7 @@
 - ⚠️ **风控管理** — 敏感词过滤、频率限制、异常检测
 - 👤 **用户管理** — 多角色权限控制
 - 📊 **数据看板** — 运营数据可视化
+- 📱 **移动端RPA** — 红果短剧/抖音自动搜索+观看+AI智能评论（MuMu模拟器+uiautomator2）
 
 ---
 
@@ -155,6 +156,9 @@ API文档: http://127.0.0.1:8000/docs
 | playbooks | 剧本 | name, type, config_json |
 | actions | 动作记录 | task_id, action_type, status |
 | risk_rules | 风控规则 | rule_type, pattern, action |
+| mobile_rpa_tasks | 移动端RPA任务 | app, action, search_keyword, drama_title, episode, comment_text, status |
+| mobile_rpa_screenshots | RPA截图 | task_id, step_name, file_path, is_evidence |
+| mobile_rpa_comments | 评论记录 | task_id, comment_text, generated_by, verified, evidence_path |
 
 ### 6.2 任务状态机
 ```
@@ -180,6 +184,7 @@ draft → pending → running ⇄ paused → completed
 | 风控管理 | /risk | 风控规则配置 |
 | 用户管理 | /users | 用户 CRUD |
 | 日志 | /logs | 操作日志 |
+| 移动端RPA | /mobile-rpa | 红果/抖音自动评论任务管理、截图查看、评论验证 |
 
 ---
 
@@ -216,3 +221,59 @@ server {
 2. **MySQL 端口**: 使用 3308 而非 3306，避开 ServBay 冲突
 3. **任务状态**: draft 状态可直接启动到 running（已修复状态机）
 4. **字段同步**: Web 端和客户端显示字段需保持一致
+
+---
+
+## 10. 移动端RPA模块（红果短剧自动评论）
+
+### 10.1 功能概述
+
+通过MuMu模拟器+uiautomator2自动化操作红果短剧APP，实现：
+- 🔍 **关键词搜索** — 按关键词搜索短剧
+- ▶️ **自动观看** — 从指定集数开始播放
+- 🤖 **AI评论生成** — 根据短剧标题自动生成口语化评论
+- ✅ **截图验证** — 评论发送后截图确认成功
+- 📊 **任务记录** — 所有任务、截图、评论存入MySQL
+
+### 10.2 数据模型
+
+
+
+### 10.3 API路由
+
+| 方法 | 路由 | 说明 |
+|------|------|------|
+| GET | /api/v1/mobile-rpa/tasks | 任务列表 |
+| POST | /api/v1/mobile-rpa/tasks | 创建任务 |
+| GET | /api/v1/mobile-rpa/tasks/:id | 任务详情 |
+| GET | /api/v1/mobile-rpa/tasks/:id/screenshots | 任务截图 |
+| GET | /api/v1/mobile-rpa/tasks/:id/comments | 评论记录 |
+| POST | /api/v1/mobile-rpa/tasks/:id/run | 执行任务 |
+| DELETE | /api/v1/mobile-rpa/tasks/:id | 删除任务 |
+
+### 10.4 前端页面
+
+**移动端RPA页面** ：
+- 任务列表：关键词、短剧名、评论内容、状态、截图数
+- 创建任务：选择APP、输入关键词、选择目标集数、选择评论生成方式
+- 任务详情：执行日志、截图预览（证据截图高亮）、评论验证状态
+- 截图查看：大图预览、对比（输入截图 vs 验证截图）
+
+### 10.5 技术要点
+
+| 项目 | 说明 |
+|------|------|
+| 执行端 | 吕布（OpenClaw agent，MuMu模拟器） |
+| 连接 | ADB 127.0.0.1:7555, uiautomator2 |
+| 评论按钮 | resource-id: com.phoenix.read:id/cdi（禁止坐标点击） |
+| 全屏检测 | 检查cdi是否存在，不存在则press back退出 |
+| 评论验证 | 发送后重新打开评论列表截图，不验证=不算成功 |
+| AI评论 | 根据标题关键词匹配风格模板，后续接入大模型API |
+
+### 10.6 当前状态
+
+- ✅ 基础脚本已完成（task_hongguo_v7.py ~ v8.py）
+- ✅ 技能已创建（hongguo-zidong-pinglun）
+- ⏳ 待接入SuperClaw后端API
+- ⏳ 待开发前端页面
+- ⏳ 待接入大模型API替代模板评论

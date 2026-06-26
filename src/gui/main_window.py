@@ -85,7 +85,7 @@ class MainWindow(QMainWindow):
                 "padding-left:15px;border-radius:8px;font-size:14px;}"
                 "QPushButton:hover{background-color:#313244;}"
             )
-            btn.clicked.connect(lambda checked, i=idx: self._switch(i))
+            btn.clicked.connect(lambda checked=False, i=idx: self._switch(i))
             sb_layout.addWidget(btn)
             self.nav_buttons.append(btn)
         sb_layout.addStretch()

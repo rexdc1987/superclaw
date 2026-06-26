@@ -5,15 +5,23 @@ database:
   name: superclaw
   user: superclaw
   password: GEW3fHhi8KxwhMwM
-
 logging:
   level: INFO
   dir: logs
-
 browser:
   headless: false
   timeout: 30000
-
+ai:
+  scope: global
+  provider: openai_compatible
+  enabled: true
+  api_key_env: XIAOMI_API_KEY
+  base_url: https://token-plan-cn.xiaomimimo.com/v1
+  model: mimo-v2.5
+  timeout: 30
+  temperature: 0.8
+  max_tokens: 512
+  fallback_to_local: true
 risk:
   daily_comment_limit: 50
   daily_dm_limit: 20
@@ -24,17 +32,18 @@ risk:
   rest_duration_min: 30
   rest_duration_max: 60
   circuit_breaker_threshold: 5
-
 scoring:
   strong_intent_words:
-    - "怎么买"
-    - "多少钱"
-    - "在哪买"
-    - "求链接"
-    - "想要"
-    - "购买"
+  - 怎么买
+  - 多少钱
+  - 在哪买
+  - 求链接
+  - 想要
+  - 购买
   strong_intent_score: 30
   recent_days_bonus: 20
   recent_days_threshold: 7
   replied_bonus: 20
   contacted_penalty: -20
+hongguo:
+  device_addr: emulator-5554

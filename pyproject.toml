@@ -5,25 +5,70 @@ build-backend = "setuptools.backends._legacy:_Backend"
 [project]
 name = "superclaw"
 version = "0.1.0"
-description = "Social media comment lead operations system"
+description = "Social media RPA platform — automated comment, lead generation, and engagement"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.8"
+authors = [
+    {name = "SuperClaw Team"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
 dependencies = [
-    "PySide6>=6.5.0",
-    "SQLAlchemy>=2.0.0",
+    # CLI & 输出
+    "typer[all]>=0.9.0",
+    "rich>=13.0.0",
+    # 配置 & 校验
+    "pydantic>=2.0.0",
     "PyYAML>=6.0",
+    # Web Dashboard
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "jinja2>=3.1.0",
+    "httpx>=0.24.0",
+    # 调度 & 队列
+    "apscheduler>=3.10.0",
+    "networkx>=3.0",
+    # 监控
+    "structlog>=23.0.0",
+    # 浏览器自动化
     "playwright>=1.40.0",
+    "uiautomator2>=3.0.0",
+    # 数据库
+    "SQLAlchemy>=2.0.0",
     "PyMySQL>=1.1.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.0",
+]
+prometheus = [
+    "prometheus-client>=0.17.0",
+]
+
 [project.scripts]
-superclaw = "src.main:main"
+superclaw = "rpa.cli.main:app"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+where = ["src"]
+include = ["rpa*"]
+
+[tool.setuptools.package-data]
+rpa = ["config/*.yaml", "dashboard/templates/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py38"
+line-length = 100

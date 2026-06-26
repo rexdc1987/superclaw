@@ -1,5 +1,5 @@
 """User model for login and access control."""
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, DateTime
 from models.database import Base
 

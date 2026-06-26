@@ -1,7 +1,7 @@
 """User authentication and management service."""
 import hashlib
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from models.database import get_session
 from models.user import User
 
@@ -67,7 +67,7 @@ class UserService:
     def update_user(self, user_id, **kwargs):
         session = get_session()
         try:
-            user = session.query(User).get(user_id)
+            user = session.get(User, user_id)
             if not user:
                 raise ValueError("用户不存在")
             if "password" in kwargs and kwargs["password"]:
@@ -84,7 +84,7 @@ class UserService:
     def delete_user(self, user_id):
         session = get_session()
         try:
-            user = session.query(User).get(user_id)
+            user = session.get(User, user_id)
             if not user:
                 raise ValueError("用户不存在")
             if user.role == "admin":
@@ -106,14 +106,14 @@ class UserService:
     def get_user(self, user_id):
         session = get_session()
         try:
-            return session.query(User).get(user_id)
+            return session.get(User, user_id)
         finally:
             session.close()
 
     def change_password(self, user_id, old_password, new_password):
         session = get_session()
         try:
-            user = session.query(User).get(user_id)
+            user = session.get(User, user_id)
             if not user:
                 raise ValueError("用户不存在")
             if not _verify_password(old_password, user.password_hash):

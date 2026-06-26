@@ -28,7 +28,7 @@ class StealthService:
         """
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task:
                 return {"success": False, "error": "Task not found"}
             import json

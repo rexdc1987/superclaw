@@ -1,6 +1,6 @@
 """任务管理服务"""
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Dict
 from models.database import get_session
 from models.task import Task
@@ -29,7 +29,7 @@ class TaskService:
     def update_task(self, task_id: int, data: dict):
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task: return None
             for key, value in data.items():
                 if hasattr(task, key): setattr(task, key, value)
@@ -42,7 +42,7 @@ class TaskService:
     def delete_task(self, task_id: int) -> bool:
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task: return False
             if task.status == TaskStatus.RUNNING.value:
                 raise TaskError("不能删除运行中的任务")
@@ -61,7 +61,7 @@ class TaskService:
     def start_task(self, task_id: int) -> Task:
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task: raise TaskError("任务不存在")
             self._transition(task, TaskStatus.RUNNING)
             task.started_at = datetime.utcnow()
@@ -74,7 +74,7 @@ class TaskService:
     def pause_task(self, task_id: int) -> Task:
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task: raise TaskError("任务不存在")
             self._transition(task, TaskStatus.PAUSED)
             session.commit()
@@ -86,7 +86,7 @@ class TaskService:
     def resume_task(self, task_id: int) -> Task:
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task: raise TaskError("任务不存在")
             self._transition(task, TaskStatus.RUNNING)
             session.commit()
@@ -98,7 +98,7 @@ class TaskService:
     def cancel_task(self, task_id: int) -> Task:
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task: raise TaskError("任务不存在")
             self._transition(task, TaskStatus.CANCELLED)
             session.commit()
@@ -110,7 +110,7 @@ class TaskService:
     def complete_task(self, task_id: int) -> Task:
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task: raise TaskError("任务不存在")
             self._transition(task, TaskStatus.COMPLETED)
             task.completed_at = datetime.utcnow()
@@ -123,7 +123,7 @@ class TaskService:
     def fail_task(self, task_id: int, error_message: str = "") -> Task:
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task: raise TaskError("任务不存在")
             self._transition(task, TaskStatus.FAILED)
             if error_message:
@@ -137,7 +137,7 @@ class TaskService:
     def update_progress(self, task_id, done=None, total=None):
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if task:
                 if done is not None: task.progress_done = done
                 if total is not None: task.progress_total = total
@@ -158,7 +158,7 @@ class TaskService:
     def get_task_detail(self, task_id):
         session = get_session()
         try:
-            return session.query(Task).get(task_id)
+            return session.get(Task, task_id)
         finally:
             session.close()
 
