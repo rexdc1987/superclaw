@@ -1,0 +1,1222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SuperClaw Hongguo</title>
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #f5f7fb;
+            color: #1f2937;
+        }
+        [v-cloak] { display: none; }
+        .app-shell { min-height: 100vh; display: flex; }
+        .sidebar {
+            width: 236px;
+            flex: 0 0 236px;
+            background: #172033;
+            color: #dce3ef;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .brand {
+            height: 72px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            padding: 0 22px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .brand-title { font-size: 19px; font-weight: 700; letter-spacing: 0; color: #fff; }
+        .brand-subtitle { margin-top: 4px; font-size: 12px; color: #93a4ba; }
+        .nav-list { padding: 14px 10px; display: grid; gap: 6px; }
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-height: 40px;
+            padding: 0 12px;
+            border-radius: 8px;
+            color: #c6d1e0;
+            text-decoration: none;
+            font-size: 14px;
+            transition: background 0.15s ease, color 0.15s ease;
+        }
+        .nav-item:hover, .nav-item.router-link-active {
+            background: rgba(64, 158, 255, 0.16);
+            color: #fff;
+        }
+        .nav-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #64748b;
+        }
+        .router-link-active .nav-dot { background: #409eff; }
+        .main {
+            min-width: 0;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        .topbar {
+            min-height: 72px;
+            background: #fff;
+            border-bottom: 1px solid #e5e7eb;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 28px;
+        }
+        .page-title { margin: 0; font-size: 20px; font-weight: 700; color: #111827; }
+        .page-subtitle { margin-top: 5px; font-size: 13px; color: #667085; }
+        .content {
+            width: 100%;
+            max-width: 1280px;
+            padding: 24px 28px 40px;
+        }
+        .toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .panel {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        }
+        .form-panel { max-width: 860px; }
+        .template-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 360px;
+            gap: 18px;
+            align-items: start;
+        }
+        .muted { color: #667085; font-size: 13px; }
+        .progress-cell { display: grid; gap: 6px; min-width: 150px; }
+        .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+        .empty-state {
+            padding: 42px 0;
+            text-align: center;
+            color: #8a95a5;
+            font-size: 14px;
+        }
+        .template-content {
+            white-space: pre-wrap;
+            line-height: 1.55;
+            color: #1f2937;
+        }
+        .monitor-summary {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 18px;
+            align-items: center;
+            margin-bottom: 18px;
+        }
+        .monitor-title {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+        .monitor-title strong { font-size: 18px; color: #111827; }
+        .monitor-controls { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+        .monitor-grid {
+            display: grid;
+            grid-template-columns: minmax(320px, 44%) minmax(0, 1fr);
+            gap: 18px;
+            align-items: stretch;
+        }
+        .monitor-stack { display: grid; gap: 18px; }
+        .monitor-panel-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        .monitor-panel-title h2 { margin: 0; font-size: 16px; color: #111827; }
+        .screenshot-frame {
+            height: 640px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            border-radius: 8px;
+            background: #111827;
+            border: 1px solid #263244;
+        }
+        .screenshot-frame img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+        }
+        .screenshot-placeholder { color: #9ca3af; font-size: 14px; }
+        .log-terminal {
+            height: 340px;
+            overflow-y: auto;
+            padding: 14px;
+            border-radius: 8px;
+            background: #0f172a;
+            color: #d1d5db;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+            font-size: 12px;
+            line-height: 1.65;
+        }
+        .log-line { white-space: pre-wrap; word-break: break-word; }
+        .log-time { color: #93c5fd; }
+        .log-level-info { color: #86efac; }
+        .log-level-warn { color: #facc15; }
+        .log-level-error { color: #fca5a5; }
+        .record-list {
+            height: 252px;
+            overflow-y: auto;
+            display: grid;
+            gap: 10px;
+        }
+        .record-item {
+            display: grid;
+            grid-template-columns: minmax(72px, auto) minmax(0, 1fr) auto;
+            gap: 10px;
+            align-items: start;
+            padding: 10px 0;
+            border-bottom: 1px solid #edf0f5;
+        }
+        .record-comment { white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+        .mobile-nav { display: none; }
+        @media (max-width: 900px) {
+            .app-shell { display: block; }
+            .sidebar { display: none; }
+            .mobile-nav {
+                display: block;
+                background: #172033;
+                padding: 10px 12px;
+            }
+            .mobile-nav .nav-list {
+                display: flex;
+                overflow-x: auto;
+                padding: 0;
+            }
+            .mobile-nav .nav-item { white-space: nowrap; }
+            .topbar { min-height: auto; padding: 18px 16px; align-items: flex-start; gap: 12px; }
+            .content { padding: 16px; }
+            .toolbar { align-items: flex-start; flex-direction: column; }
+            .template-grid { grid-template-columns: 1fr; }
+            .monitor-summary { grid-template-columns: 1fr; }
+            .monitor-controls { justify-content: flex-start; }
+            .monitor-grid { grid-template-columns: 1fr; }
+            .screenshot-frame { height: 460px; }
+            .record-item { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+{% raw %}
+<div id="app" v-cloak>
+    <div class="app-shell">
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-title">SuperClaw</div>
+                <div class="brand-subtitle">Hongguo comment tasks</div>
+            </div>
+            <nav class="nav-list">
+                <router-link class="nav-item" to="/tasks">
+                    <span class="nav-dot"></span><span>任务列表</span>
+                </router-link>
+                <router-link class="nav-item" to="/create">
+                    <span class="nav-dot"></span><span>创建任务</span>
+                </router-link>
+                <router-link class="nav-item" to="/templates">
+                    <span class="nav-dot"></span><span>评论模板</span>
+                </router-link>
+            </nav>
+        </aside>
+
+        <div class="main">
+            <div class="mobile-nav">
+                <nav class="nav-list">
+                    <router-link class="nav-item" to="/tasks">
+                        <span class="nav-dot"></span><span>任务列表</span>
+                    </router-link>
+                    <router-link class="nav-item" to="/create">
+                        <span class="nav-dot"></span><span>创建任务</span>
+                    </router-link>
+                    <router-link class="nav-item" to="/templates">
+                        <span class="nav-dot"></span><span>评论模板</span>
+                    </router-link>
+                </nav>
+            </div>
+            <header class="topbar">
+                <div>
+                    <h1 class="page-title">{{ pageMeta.title }}</h1>
+                    <div class="page-subtitle">{{ pageMeta.subtitle }}</div>
+                </div>
+                <el-button @click="router.push('/tasks')">返回任务列表</el-button>
+            </header>
+            <main class="content">
+                <router-view></router-view>
+            </main>
+        </div>
+    </div>
+</div>
+
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js"></script>
+<script src="https://unpkg.com/element-plus/dist/index.full.min.js"></script>
+<script>
+const { createApp, ref, reactive, computed, onMounted, onBeforeUnmount, onUnmounted, watch } = Vue;
+const { createRouter, createWebHashHistory, useRoute, useRouter } = VueRouter;
+
+const API_BASE = "/api/v1/hongguo";
+
+async function apiFetch(path, options = {}) {
+    const response = await fetch(`${API_BASE}${path}`, {
+        headers: {
+            "Content-Type": "application/json",
+            ...(options.headers || {}),
+        },
+        ...options,
+    });
+    let data = null;
+    const text = await response.text();
+    if (text) {
+        try {
+            data = JSON.parse(text);
+        } catch (error) {
+            data = text;
+        }
+    }
+    if (!response.ok) {
+        const detail = data && data.detail ? data.detail : response.statusText;
+        throw new Error(Array.isArray(detail) ? detail.map(item => item.msg).join("; ") : detail);
+    }
+    return data;
+}
+
+function templateOptionLabel(item) {
+    const category = item.category || "通用";
+    const content = item.content || "";
+    return `[${category}] ${content.length > 36 ? content.slice(0, 36) + "..." : content}`;
+}
+
+const statusMap = {
+    pending: { label: "待执行", type: "info" },
+    waiting_login: { label: "等待登录", type: "warning" },
+    running: { label: "运行中", type: "primary" },
+    paused: { label: "已暂停", type: "warning" },
+    completed: { label: "已完成", type: "success" },
+    failed: { label: "失败", type: "danger" },
+    stopped: { label: "已停止", type: "info" },
+};
+
+const TaskList = {
+    name: "TaskList",
+    template: `
+        <section>
+            <div class="toolbar">
+                <div>
+                    <el-button type="primary" @click="router.push('/create')">创建任务</el-button>
+                    <el-button :loading="loading" @click="loadTasks">刷新</el-button>
+                </div>
+                <div class="muted" v-if="autoRefreshing">检测到运行中任务，每 5 秒自动刷新</div>
+            </div>
+            <div class="panel">
+                <el-table
+                    v-loading="loading"
+                    :data="tasks"
+                    row-key="id"
+                    style="width: 100%"
+                    empty-text="暂无任务"
+                >
+                    <el-table-column prop="id" label="ID" width="76"></el-table-column>
+                    <el-table-column prop="task_name" label="任务名称" min-width="170">
+                        <template #default="{ row }">
+                            <strong>{{ row.task_name || row.drama_name + '评论任务' }}</strong>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="drama_name" label="剧名" min-width="140"></el-table-column>
+                    <el-table-column prop="comment_mode" label="模式" width="110">
+                        <template #default="{ row }">
+                            <el-tag :type="row.comment_mode === 'random' ? 'success' : 'primary'" effect="plain">
+                                {{ row.comment_mode === 'random' ? '随机' : '指定' }}
+                            </el-tag>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="status" label="状态" width="120">
+                        <template #default="{ row }">
+                            <el-tag :type="statusInfo(row.status).type">{{ statusInfo(row.status).label }}</el-tag>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="进度" min-width="180">
+                        <template #default="{ row }">
+                            <div class="progress-cell">
+                                <el-progress :percentage="progressPercent(row)" :stroke-width="8"></el-progress>
+                                <span class="muted">{{ row.current_episode || 0 }} / {{ row.total_episodes || 0 }}</span>
+                            </div>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="操作" min-width="260" fixed="right">
+                        <template #default="{ row }">
+                            <div class="actions">
+                                <el-button
+                                    v-if="canStart(row)"
+                                    size="small"
+                                    type="primary"
+                                    :loading="busyId === row.id"
+                                    @click="runAction(row, 'start')"
+                                >启动</el-button>
+                                <el-button
+                                    v-if="row.status === 'running'"
+                                    size="small"
+                                    :loading="busyId === row.id"
+                                    @click="runAction(row, 'pause')"
+                                >暂停</el-button>
+                                <el-button
+                                    v-if="row.status === 'paused'"
+                                    size="small"
+                                    type="primary"
+                                    :loading="busyId === row.id"
+                                    @click="runAction(row, 'resume')"
+                                >恢复</el-button>
+                                <el-button
+                                    v-if="['running', 'paused', 'waiting_login'].includes(row.status)"
+                                    size="small"
+                                    type="warning"
+                                    :loading="busyId === row.id"
+                                    @click="runAction(row, 'stop')"
+                                >停止</el-button>
+                                <el-button size="small" @click="router.push('/edit/' + row.id)">编辑</el-button>
+                                <el-button size="small" type="success" @click="router.push('/monitor/' + row.id)">监控</el-button>
+                                <el-button
+                                    size="small"
+                                    type="danger"
+                                    :disabled="row.status === 'running'"
+                                    :loading="busyId === row.id"
+                                    @click="deleteTask(row)"
+                                >删除</el-button>
+                            </div>
+                        </template>
+                    </el-table-column>
+                </el-table>
+            </div>
+        </section>
+    `,
+    setup() {
+        const router = useRouter();
+        const tasks = ref([]);
+        const loading = ref(false);
+        const busyId = ref(null);
+        const timer = ref(null);
+        const autoRefreshing = computed(() => tasks.value.some(task => task.status === "running"));
+
+        function statusInfo(status) {
+            return statusMap[status] || { label: status || "未知", type: "info" };
+        }
+
+        function progressPercent(row) {
+            const total = Number(row.total_episodes || 0);
+            const current = Number(row.current_episode || 0);
+            if (!total) return row.status === "completed" ? 100 : 0;
+            return Math.min(100, Math.round((current / total) * 100));
+        }
+
+        function canStart(row) {
+            return ["pending", "failed", "stopped", "completed"].includes(row.status);
+        }
+
+        async function loadTasks() {
+            loading.value = true;
+            try {
+                tasks.value = await apiFetch("/tasks?limit=200");
+            } catch (error) {
+                ElementPlus.ElMessage.error(error.message || "任务加载失败");
+            } finally {
+                loading.value = false;
+            }
+        }
+
+        async function runAction(row, action) {
+            busyId.value = row.id;
+            try {
+                await apiFetch(`/tasks/${row.id}/${action}`, { method: "POST" });
+                ElementPlus.ElMessage.success("操作已提交");
+                await loadTasks();
+            } catch (error) {
+                ElementPlus.ElMessage.error(error.message || "操作失败");
+            } finally {
+                busyId.value = null;
+            }
+        }
+
+        async function deleteTask(row) {
+            try {
+                await ElementPlus.ElMessageBox.confirm(`确认删除任务「${row.task_name || row.drama_name}」？`, "删除任务", {
+                    confirmButtonText: "删除",
+                    cancelButtonText: "取消",
+                    type: "warning",
+                });
+                busyId.value = row.id;
+                await apiFetch(`/tasks/${row.id}`, { method: "DELETE" });
+                ElementPlus.ElMessage.success("任务已删除");
+                await loadTasks();
+            } catch (error) {
+                if (error !== "cancel") ElementPlus.ElMessage.error(error.message || "删除失败");
+            } finally {
+                busyId.value = null;
+            }
+        }
+
+        watch(autoRefreshing, (enabled) => {
+            if (timer.value) {
+                clearInterval(timer.value);
+                timer.value = null;
+            }
+            if (enabled) timer.value = setInterval(loadTasks, 5000);
+        });
+
+        onMounted(loadTasks);
+        onBeforeUnmount(() => {
+            if (timer.value) clearInterval(timer.value);
+        });
+
+        return {
+            router,
+            tasks,
+            loading,
+            busyId,
+            autoRefreshing,
+            statusInfo,
+            progressPercent,
+            canStart,
+            loadTasks,
+            runAction,
+            deleteTask,
+        };
+    },
+};
+
+const TaskCreate = {
+    name: "TaskCreate",
+    template: `
+        <section class="panel form-panel">
+            <el-form
+                ref="formRef"
+                :model="form"
+                :rules="rules"
+                label-width="150px"
+                label-position="right"
+                @submit.prevent
+            >
+                <el-form-item label="任务名称" prop="task_name">
+                    <el-input v-model.trim="form.task_name" placeholder="留空时自动使用剧名生成"></el-input>
+                </el-form-item>
+                <el-form-item label="短剧名称" prop="drama_name">
+                    <el-input v-model.trim="form.drama_name" placeholder="请输入红果短剧名称"></el-input>
+                </el-form-item>
+                <el-form-item label="评论模式" prop="comment_mode">
+                    <el-radio-group v-model="form.comment_mode">
+                        <el-radio-button label="random">随机评论</el-radio-button>
+                        <el-radio-button label="specified">指定集数</el-radio-button>
+                    </el-radio-group>
+                </el-form-item>
+
+                <template v-if="form.comment_mode === 'random'">
+                    <el-form-item label="随机评论数量" prop="random_comment_count">
+                        <el-input-number v-model="form.random_comment_count" :min="1" :precision="0"></el-input-number>
+                    </el-form-item>
+                    <el-form-item label="最小间隔秒数" prop="random_min_interval">
+                        <el-input-number v-model="form.random_min_interval" :min="1" :precision="0"></el-input-number>
+                    </el-form-item>
+                    <el-form-item label="最大间隔秒数" prop="random_max_interval">
+                        <el-input-number v-model="form.random_max_interval" :min="1" :precision="0"></el-input-number>
+                    </el-form-item>
+                </template>
+
+                <template v-else>
+                    <el-form-item label="起始集数" prop="start_episode">
+                        <el-input-number v-model="form.start_episode" :min="1" :precision="0"></el-input-number>
+                    </el-form-item>
+                    <el-form-item label="集数间隔" prop="episode_interval">
+                        <el-input-number v-model="form.episode_interval" :min="1" :precision="0"></el-input-number>
+                    </el-form-item>
+                    <el-form-item label="评论间隔秒数" prop="comment_interval_sec">
+                        <el-input-number v-model="form.comment_interval_sec" :min="1" :precision="0"></el-input-number>
+                    </el-form-item>
+                </template>
+
+                <el-form-item label="内容来源" prop="content_source">
+                    <el-radio-group v-model="form.content_source">
+                        <el-radio-button label="ai">AI 生成</el-radio-button>
+                        <el-radio-button label="template">模板</el-radio-button>
+                        <el-radio-button label="mixed">混合</el-radio-button>
+                    </el-radio-group>
+                </el-form-item>
+
+                <el-form-item
+                    v-if="form.content_source === 'template' || form.content_source === 'mixed'"
+                    label="评论模板"
+                    prop="templates"
+                >
+                    <el-select
+                        v-model="form.templates"
+                        multiple
+                        filterable
+                        clearable
+                        collapse-tags
+                        collapse-tags-tooltip
+                        :loading="templateLoading"
+                        placeholder="选择模板"
+                        style="width: 100%"
+                    >
+                        <el-option
+                            v-for="item in templateOptions"
+                            :key="item.id"
+                            :label="templateOptionLabel(item)"
+                            :value="item.content"
+                        ></el-option>
+                    </el-select>
+                </el-form-item>
+
+                <el-form-item>
+                    <el-button type="primary" :loading="submitting" @click="submitForm">
+                        {{ isEdit ? '保存修改' : '创建任务' }}
+                    </el-button>
+                    <el-button @click="router.push('/tasks')">取消</el-button>
+                </el-form-item>
+            </el-form>
+        </section>
+    `,
+    setup() {
+        const route = useRoute();
+        const router = useRouter();
+        const formRef = ref(null);
+        const submitting = ref(false);
+        const templateLoading = ref(false);
+        const templateOptions = ref([]);
+        const isEdit = computed(() => Boolean(route.params.id));
+
+        const form = reactive({
+            task_name: "",
+            drama_name: "",
+            comment_mode: "specified",
+            content_source: "ai",
+            start_episode: 1,
+            episode_interval: 1,
+            comment_interval_sec: 30,
+            random_comment_count: 10,
+            random_min_interval: 20,
+            random_max_interval: 60,
+            templates: [],
+        });
+
+        const positive = (min = 1) => (rule, value, callback) => {
+            if (Number(value) < min) callback(new Error(`数值必须大于或等于 ${min}`));
+            else callback();
+        };
+
+        const intervalOrder = (rule, value, callback) => {
+            if (Number(form.random_max_interval) < Number(form.random_min_interval)) {
+                callback(new Error("最大间隔不能小于最小间隔"));
+            } else {
+                callback();
+            }
+        };
+
+        const templatesRequired = (rule, value, callback) => {
+            if ((form.content_source === "template" || form.content_source === "mixed") && !value.length) {
+                callback(new Error("请选择至少一个评论模板"));
+            } else {
+                callback();
+            }
+        };
+
+        const rules = {
+            drama_name: [{ required: true, message: "请输入短剧名称", trigger: "blur" }],
+            start_episode: [{ validator: positive(1), trigger: "change" }],
+            episode_interval: [{ validator: positive(1), trigger: "change" }],
+            comment_interval_sec: [{ validator: positive(1), trigger: "change" }],
+            random_comment_count: [{ validator: positive(1), trigger: "change" }],
+            random_min_interval: [{ validator: positive(1), trigger: "change" }, { validator: intervalOrder, trigger: "change" }],
+            random_max_interval: [{ validator: positive(1), trigger: "change" }, { validator: intervalOrder, trigger: "change" }],
+            templates: [{ validator: templatesRequired, trigger: "change" }],
+        };
+
+        async function loadTemplates() {
+            templateLoading.value = true;
+            try {
+                templateOptions.value = await apiFetch("/templates");
+            } catch (error) {
+                ElementPlus.ElMessage.error(error.message || "模板加载失败");
+            } finally {
+                templateLoading.value = false;
+            }
+        }
+
+        async function loadTask() {
+            if (!isEdit.value) return;
+            try {
+                const task = await apiFetch(`/tasks/${route.params.id}`);
+                Object.assign(form, {
+                    task_name: task.task_name || "",
+                    drama_name: task.drama_name || "",
+                    comment_mode: task.comment_mode || "specified",
+                    content_source: task.content_source || "ai",
+                    start_episode: Number(task.start_episode || 1),
+                    episode_interval: Number(task.episode_interval || 1),
+                    comment_interval_sec: Number(task.comment_interval_sec || 30),
+                    random_comment_count: Number(task.random_comment_count || 10),
+                    random_min_interval: Number(task.random_min_interval || 20),
+                    random_max_interval: Number(task.random_max_interval || 60),
+                    templates: Array.isArray(task.templates) ? task.templates : [],
+                });
+            } catch (error) {
+                ElementPlus.ElMessage.error(error.message || "任务加载失败");
+                router.push("/tasks");
+            }
+        }
+
+        function payload() {
+            return {
+                task_name: form.task_name,
+                drama_name: form.drama_name,
+                comment_mode: form.comment_mode,
+                content_source: form.content_source,
+                start_episode: Number(form.start_episode),
+                episode_interval: Number(form.episode_interval),
+                comment_interval_sec: Number(form.comment_interval_sec),
+                random_comment_count: Number(form.random_comment_count),
+                random_min_interval: Number(form.random_min_interval),
+                random_max_interval: Number(form.random_max_interval),
+                templates: ["template", "mixed"].includes(form.content_source) ? form.templates : [],
+            };
+        }
+
+        async function submitForm() {
+            if (!formRef.value) return;
+            await formRef.value.validate(async (valid) => {
+                if (!valid) return;
+                submitting.value = true;
+                try {
+                    if (isEdit.value) {
+                        await apiFetch(`/tasks/${route.params.id}`, {
+                            method: "PUT",
+                            body: JSON.stringify(payload()),
+                        });
+                        ElementPlus.ElMessage.success("任务已更新");
+                    } else {
+                        await apiFetch("/tasks", {
+                            method: "POST",
+                            body: JSON.stringify(payload()),
+                        });
+                        ElementPlus.ElMessage.success("任务已创建");
+                    }
+                    router.push("/tasks");
+                } catch (error) {
+                    ElementPlus.ElMessage.error(error.message || "保存失败");
+                } finally {
+                    submitting.value = false;
+                }
+            });
+        }
+
+        watch(() => form.content_source, () => {
+            if (form.content_source === "ai") form.templates = [];
+        });
+
+        onMounted(async () => {
+            await Promise.all([loadTemplates(), loadTask()]);
+        });
+
+        return {
+            router,
+            formRef,
+            form,
+            rules,
+            submitting,
+            templateLoading,
+            templateOptions,
+            isEdit,
+            templateOptionLabel,
+            submitForm,
+        };
+    },
+};
+
+const TaskMonitor = {
+    name: "TaskMonitor",
+    template: `
+        <section>
+            <div class="panel monitor-summary" v-loading="taskLoading">
+                <div>
+                    <div class="monitor-title">
+                        <strong>{{ taskTitle }}</strong>
+                        <el-tag :type="statusInfo(task.status).type">{{ statusInfo(task.status).label }}</el-tag>
+                    </div>
+                    <div class="progress-cell">
+                        <el-progress :percentage="progressPercent(task)" :stroke-width="10"></el-progress>
+                        <span class="muted">
+                            当前进度：{{ task.current_episode || 0 }} / {{ task.total_episodes || 0 }}
+                            <template v-if="task.comment_success_count || task.comment_fail_count">
+                                ，成功 {{ task.comment_success_count || 0 }}，失败 {{ task.comment_fail_count || 0 }}
+                            </template>
+                        </span>
+                    </div>
+                </div>
+                <div class="monitor-controls">
+                    <el-button
+                        v-if="canStart(task)"
+                        type="primary"
+                        :loading="busyAction === 'start'"
+                        @click="runAction('start')"
+                    >启动</el-button>
+                    <el-button
+                        v-if="task.status === 'running'"
+                        :loading="busyAction === 'pause'"
+                        @click="runAction('pause')"
+                    >暂停</el-button>
+                    <el-button
+                        v-if="task.status === 'paused'"
+                        type="primary"
+                        :loading="busyAction === 'resume'"
+                        @click="runAction('resume')"
+                    >恢复</el-button>
+                    <el-button
+                        v-if="['running', 'paused', 'waiting_login'].includes(task.status)"
+                        type="warning"
+                        :loading="busyAction === 'stop'"
+                        @click="runAction('stop')"
+                    >停止</el-button>
+                    <el-button @click="router.push('/tasks')">返回</el-button>
+                </div>
+            </div>
+
+            <div class="monitor-grid">
+                <div class="panel">
+                    <div class="monitor-panel-title">
+                        <h2>实时截图</h2>
+                        <el-button size="small" :loading="screenshotLoading" @click="refreshScreenshot">刷新</el-button>
+                    </div>
+                    <div class="screenshot-frame">
+                        <img
+                            v-if="screenshotVisible"
+                            :src="screenshotUrl"
+                            alt="任务实时截图"
+                            @load="onScreenshotLoad"
+                            @error="onScreenshotError"
+                        >
+                        <div v-else class="screenshot-placeholder">
+                            {{ screenshotLoading ? '截图加载中...' : '暂无截图' }}
+                        </div>
+                    </div>
+                </div>
+
+                <div class="monitor-stack">
+                    <div class="panel">
+                        <div class="monitor-panel-title">
+                            <h2>执行日志</h2>
+                            <el-button size="small" :loading="logsLoading" @click="loadLogs">刷新</el-button>
+                        </div>
+                        <div ref="logRef" class="log-terminal">
+                            <div v-if="!logs.length" class="screenshot-placeholder">暂无日志</div>
+                            <div v-for="log in logs" :key="log.id" class="log-line">
+                                <span class="log-time">[{{ formatTime(log.created_at) }}]</span>
+                                <span :class="'log-level-' + (log.level || 'info')"> {{ (log.level || 'info').toUpperCase() }}</span>
+                                <span v-if="log.episode_number"> EP{{ log.episode_number }}</span>
+                                <span> {{ log.message }}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="panel">
+                        <div class="monitor-panel-title">
+                            <h2>评论记录</h2>
+                            <el-button size="small" :loading="recordsLoading" @click="loadRecords">刷新</el-button>
+                        </div>
+                        <div class="record-list">
+                            <div v-if="!records.length" class="empty-state">暂无评论记录</div>
+                            <div v-for="record in records" :key="record.id" class="record-item">
+                                <el-tag effect="plain">第 {{ record.episode_number || '-' }} 集</el-tag>
+                                <div>
+                                    <div class="record-comment">{{ record.comment_content || record.comment_text || record.comment || '-' }}</div>
+                                    <div class="muted">{{ formatTime(record.created_at || record.updated_at) }}</div>
+                                </div>
+                                <el-tag :type="recordStatusType(record.status)">{{ recordStatusLabel(record.status) }}</el-tag>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    `,
+    setup() {
+        const route = useRoute();
+        const router = useRouter();
+        const taskId = computed(() => route.params.id);
+        const task = ref({});
+        const logs = ref([]);
+        const records = ref([]);
+        const taskLoading = ref(false);
+        const logsLoading = ref(false);
+        const recordsLoading = ref(false);
+        const screenshotLoading = ref(false);
+        const screenshotVisible = ref(false);
+        const screenshotUrl = ref("");
+        const busyAction = ref(null);
+        const logRef = ref(null);
+        const timers = [];
+
+        const taskTitle = computed(() => {
+            if (!task.value || !Object.keys(task.value).length) return "任务监控";
+            return task.value.task_name || `${task.value.drama_name || "未命名任务"}评论任务`;
+        });
+
+        function statusInfo(status) {
+            return statusMap[status] || { label: status || "未知", type: "info" };
+        }
+
+        function progressPercent(row) {
+            const total = Number(row && row.total_episodes || 0);
+            const current = Number(row && row.current_episode || 0);
+            if (!total) return row && row.status === "completed" ? 100 : 0;
+            return Math.min(100, Math.round((current / total) * 100));
+        }
+
+        function canStart(row) {
+            return row && ["pending", "failed", "stopped", "completed"].includes(row.status);
+        }
+
+        function formatTime(value) {
+            if (!value) return "-";
+            return String(value).replace("T", " ").slice(0, 19);
+        }
+
+        function recordStatusType(status) {
+            if (status === "success") return "success";
+            if (status === "failed") return "danger";
+            if (status === "skipped") return "warning";
+            return "info";
+        }
+
+        function recordStatusLabel(status) {
+            const labels = { success: "成功", failed: "失败", skipped: "跳过" };
+            return labels[status] || status || "未知";
+        }
+
+        async function loadTask() {
+            taskLoading.value = true;
+            try {
+                task.value = await apiFetch(`/tasks/${taskId.value}`);
+            } catch (error) {
+                ElementPlus.ElMessage.error(error.message || "任务加载失败");
+            } finally {
+                taskLoading.value = false;
+            }
+        }
+
+        async function loadLogs() {
+            logsLoading.value = true;
+            try {
+                const result = await apiFetch(`/tasks/${taskId.value}/logs?limit=100`);
+                logs.value = Array.isArray(result) ? result.slice().reverse() : [];
+                setTimeout(() => {
+                    if (logRef.value) logRef.value.scrollTop = logRef.value.scrollHeight;
+                }, 0);
+            } catch (error) {
+                ElementPlus.ElMessage.error(error.message || "日志加载失败");
+            } finally {
+                logsLoading.value = false;
+            }
+        }
+
+        async function loadRecords() {
+            recordsLoading.value = true;
+            try {
+                const result = await apiFetch(`/tasks/${taskId.value}/records?limit=50`);
+                records.value = Array.isArray(result) ? result : [];
+            } catch (error) {
+                ElementPlus.ElMessage.error(error.message || "评论记录加载失败");
+            } finally {
+                recordsLoading.value = false;
+            }
+        }
+
+        function refreshScreenshot() {
+            screenshotLoading.value = true;
+            screenshotVisible.value = true;
+            screenshotUrl.value = `${API_BASE}/tasks/${taskId.value}/screenshot/image?t=${Date.now()}`;
+        }
+
+        function onScreenshotLoad() {
+            screenshotLoading.value = false;
+            screenshotVisible.value = true;
+        }
+
+        function onScreenshotError() {
+            screenshotLoading.value = false;
+            screenshotVisible.value = false;
+        }
+
+        async function runAction(action) {
+            busyAction.value = action;
+            try {
+                await apiFetch(`/tasks/${taskId.value}/${action}`, { method: "POST" });
+                ElementPlus.ElMessage.success("操作已提交");
+                await Promise.all([loadTask(), loadLogs()]);
+            } catch (error) {
+                ElementPlus.ElMessage.error(error.message || "操作失败");
+            } finally {
+                busyAction.value = null;
+            }
+        }
+
+        onMounted(async () => {
+            await Promise.all([loadTask(), loadLogs(), loadRecords()]);
+            refreshScreenshot();
+            timers.push(setInterval(loadTask, 3000));
+            timers.push(setInterval(loadLogs, 5000));
+            timers.push(setInterval(refreshScreenshot, 5000));
+            timers.push(setInterval(loadRecords, 8000));
+        });
+
+        onUnmounted(() => {
+            timers.forEach(timer => clearInterval(timer));
+        });
+
+        return {
+            router,
+            task,
+            logs,
+            records,
+            taskLoading,
+            logsLoading,
+            recordsLoading,
+            screenshotLoading,
+            screenshotVisible,
+            screenshotUrl,
+            busyAction,
+            logRef,
+            taskTitle,
+            statusInfo,
+            progressPercent,
+            canStart,
+            formatTime,
+            recordStatusType,
+            recordStatusLabel,
+            loadLogs,
+            loadRecords,
+            refreshScreenshot,
+            onScreenshotLoad,
+            onScreenshotError,
+            runAction,
+        };
+    },
+};
+
+const TemplateManager = {
+    name: "TemplateManager",
+    template: `
+        <section class="template-grid">
+            <div class="panel">
+                <div class="toolbar">
+                    <div>
+                        <el-button :loading="loading" @click="loadTemplates">刷新</el-button>
+                    </div>
+                    <span class="muted">默认模板不可删除</span>
+                </div>
+                <el-table
+                    v-loading="loading"
+                    :data="templates"
+                    row-key="id"
+                    style="width: 100%"
+                    empty-text="暂无模板"
+                >
+                    <el-table-column prop="id" label="ID" width="70"></el-table-column>
+                    <el-table-column label="内容" min-width="260">
+                        <template #default="{ row }">
+                            <div class="template-content">{{ row.content }}</div>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="category" label="分类" width="120">
+                        <template #default="{ row }">
+                            <el-tag effect="plain">{{ row.category || '通用' }}</el-tag>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="默认" width="90">
+                        <template #default="{ row }">
+                            <el-tag v-if="isDefault(row)" type="success">默认</el-tag>
+                            <span v-else class="muted">-</span>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="操作" width="120">
+                        <template #default="{ row }">
+                            <el-button
+                                size="small"
+                                type="danger"
+                                :disabled="isDefault(row)"
+                                :loading="busyId === row.id"
+                                @click="deleteTemplate(row)"
+                            >删除</el-button>
+                        </template>
+                    </el-table-column>
+                </el-table>
+            </div>
+
+            <div class="panel">
+                <h2 class="page-title" style="font-size: 16px; margin-bottom: 18px;">新增模板</h2>
+                <el-form ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent>
+                    <el-form-item label="评论内容" prop="content">
+                        <el-input
+                            v-model.trim="form.content"
+                            type="textarea"
+                            :rows="5"
+                            maxlength="500"
+                            show-word-limit
+                            placeholder="请输入评论模板内容"
+                        ></el-input>
+                    </el-form-item>
+                    <el-form-item label="分类" prop="category">
+                        <el-input v-model.trim="form.category" placeholder="通用"></el-input>
+                    </el-form-item>
+                    <el-form-item>
+                        <el-button type="primary" :loading="submitting" @click="createTemplate">添加模板</el-button>
+                        <el-button @click="resetForm">清空</el-button>
+                    </el-form-item>
+                </el-form>
+            </div>
+        </section>
+    `,
+    setup() {
+        const templates = ref([]);
+        const loading = ref(false);
+        const submitting = ref(false);
+        const busyId = ref(null);
+        const formRef = ref(null);
+        const form = reactive({ content: "", category: "通用" });
+        const rules = {
+            content: [{ required: true, message: "请输入评论内容", trigger: "blur" }],
+            category: [{ required: true, message: "请输入分类", trigger: "blur" }],
+        };
+
+        function isDefault(row) {
+            return row.is_default === true || row.is_default === 1 || row.is_default === "1";
+        }
+
+        async function loadTemplates() {
+            loading.value = true;
+            try {
+                templates.value = await apiFetch("/templates");
+            } catch (error) {
+                ElementPlus.ElMessage.error(error.message || "模板加载失败");
+            } finally {
+                loading.value = false;
+            }
+        }
+
+        function resetForm() {
+            form.content = "";
+            form.category = "通用";
+            if (formRef.value) formRef.value.clearValidate();
+        }
+
+        async function createTemplate() {
+            if (!formRef.value) return;
+            await formRef.value.validate(async (valid) => {
+                if (!valid) return;
+                submitting.value = true;
+                try {
+                    await apiFetch("/templates", {
+                        method: "POST",
+                        body: JSON.stringify({
+                            content: form.content,
+                            category: form.category || "通用",
+                        }),
+                    });
+                    ElementPlus.ElMessage.success("模板已添加");
+                    resetForm();
+                    await loadTemplates();
+                } catch (error) {
+                    ElementPlus.ElMessage.error(error.message || "添加失败");
+                } finally {
+                    submitting.value = false;
+                }
+            });
+        }
+
+        async function deleteTemplate(row) {
+            if (isDefault(row)) return;
+            try {
+                await ElementPlus.ElMessageBox.confirm("确认删除该评论模板？", "删除模板", {
+                    confirmButtonText: "删除",
+                    cancelButtonText: "取消",
+                    type: "warning",
+                });
+                busyId.value = row.id;
+                await apiFetch(`/templates/${row.id}`, { method: "DELETE" });
+                ElementPlus.ElMessage.success("模板已删除");
+                await loadTemplates();
+            } catch (error) {
+                if (error !== "cancel") ElementPlus.ElMessage.error(error.message || "删除失败");
+            } finally {
+                busyId.value = null;
+            }
+        }
+
+        onMounted(loadTemplates);
+
+        return {
+            templates,
+            loading,
+            submitting,
+            busyId,
+            formRef,
+            form,
+            rules,
+            isDefault,
+            loadTemplates,
+            resetForm,
+            createTemplate,
+            deleteTemplate,
+        };
+    },
+};
+
+const routes = [
+    { path: "/", redirect: "/tasks" },
+    { path: "/tasks", component: TaskList, meta: { title: "红果评论任务", subtitle: "查看任务状态、执行进度并控制任务运行。" } },
+    { path: "/create", component: TaskCreate, meta: { title: "创建红果任务", subtitle: "配置短剧评论模式、内容来源和执行间隔。" } },
+    { path: "/edit/:id", component: TaskCreate, meta: { title: "编辑红果任务", subtitle: "调整已有任务的评论配置。" } },
+    { path: "/monitor/:id", component: TaskMonitor, meta: { title: "任务监控", subtitle: "实时查看任务执行截图、日志和评论记录。" } },
+    { path: "/templates", component: TemplateManager, meta: { title: "评论模板", subtitle: "管理模板内容和分类，默认模板仅用于选择。" } },
+];
+
+const router = createRouter({
+    history: createWebHashHistory(),
+    routes,
+});
+
+const app = createApp({
+    setup() {
+        const route = useRoute();
+        const pageMeta = computed(() => route.meta || routes[1].meta);
+        return { pageMeta, router };
+    },
+});
+
+app.use(router);
+app.use(ElementPlus);
+app.mount("#app");
+</script>
+{% endraw %}
+</body>
+</html>

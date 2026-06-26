@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SuperClaw - 抖音自动评论</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f7fa;color:#333;display:flex;min-height:100vh}
+        /* 侧边栏 */
+        .sidebar{width:210px;background:#1a1a2e;color:#aaa;flex-shrink:0;display:flex;flex-direction:column}
+        .sidebar-brand{padding:18px 20px;font-size:17px;font-weight:700;color:#fff;border-bottom:1px solid #2a2a4a}
+        .sidebar-brand span{color:#8b8bff}
+        .sidebar nav{flex:1;padding:10px 0}
+        .sidebar nav a{display:flex;align-items:center;gap:9px;padding:9px 20px;color:#999;text-decoration:none;font-size:13px;border-left:3px solid transparent;transition:all .15s}
+        .sidebar nav a:hover{background:#222240;color:#ddd}
+        .sidebar nav a.active{background:#222240;color:#8b8bff;border-left-color:#8b8bff;font-weight:600}
+        .sidebar-footer{padding:14px 20px;font-size:11px;color:#444;border-top:1px solid #2a2a4a}
+        /* 主区域 */
+        .main{flex:1;min-width:0}
+        .topbar{background:#fff;padding:14px 28px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e5e7eb}
+        .topbar h1{font-size:17px;font-weight:600}
+        .topbar .st{font-size:13px;color:#16a34a}
+        .wrap{max-width:1160px;margin:18px auto;padding:0 22px}
+        /* 网格 */
+        .g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+        .g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+        @media(max-width:960px){.g2,.g3{grid-template-columns:1fr}}
+        /* 卡片 */
+        .card{background:#fff;border-radius:10px;padding:18px 20px;box-shadow:0 1px 3px rgba(0,0,0,.07);margin-bottom:16px}
+        .card h2{font-size:14px;margin-bottom:12px;color:#1a1a2e;display:flex;align-items:center;gap:7px}
+        .card h2 .arrow{cursor:pointer;color:#aaa;font-size:12px;transition:transform .2s}
+        .card.collapsed .card-body{display:none}
+        .card.collapsed .arrow{transform:rotate(-90deg)}
+        /* 表单 */
+        .fg{margin-bottom:12px}
+        .fg label{display:block;font-size:12px;color:#666;margin-bottom:4px;font-weight:500}
+        .fg input,.fg select,.fg textarea{width:100%;padding:8px 10px;background:#f9fafb;border:1px solid #d1d5db;border-radius:5px;color:#333;font-size:13px;outline:none;transition:border .15s}
+        .fg input:focus,.fg select:focus,.fg textarea:focus{border-color:#8b8bff;box-shadow:0 0 0 2px rgba(139,139,255,.12)}
+        .fg textarea{resize:vertical;font-family:inherit}
+        .fg-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+        .fg-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+        .fg-hint{font-size:11px;color:#999;margin-top:3px}
+        /* 复选框行 */
+        .chk-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+        .chk-row input[type=checkbox]{width:auto}
+        .chk-row input[type=text]{flex:1}
+        /* range 双值 */
+        .range-group{display:flex;align-items:center;gap:8px}
+        .range-group input[type=number]{width:60px;padding:5px 6px;text-align:center}
+        .range-group span{color:#999}
+        /* 按钮 */
+        .btn{padding:8px 16px;border:none;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s}
+        .btn-primary{background:#8b8bff;color:#fff;width:100%}
+        .btn-primary:hover{background:#7070e6}
+        .btn-primary:disabled{background:#c0c0c0;color:#888;cursor:not-allowed}
+        .btn-sm{padding:4px 10px;font-size:11px;border-radius:4px}
+        .btn-outline{background:#fff;color:#666;border:1px solid #d1d5db}
+        .btn-outline:hover{background:#f3f4f6}
+        .btn-danger{background:#fee2e2;color:#dc2626;border:1px solid #fecaca}
+        .btn-danger:hover{background:#fecaca}
+        .btn-group{display:flex;gap:8px;margin-top:12px}
+        /* 状态条 */
+        .sbar{display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:8px 12px;border-radius:5px;font-size:12px}
+        .sbar.idle{background:#f3f4f6;color:#888}
+        .sbar.running{background:#ecfdf5;color:#16a34a;border:1px solid #bbf7d0}
+        .sbar.ok{background:#ecfdf5;color:#16a34a;border:1px solid #bbf7d0}
+        .sbar.err{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}
+        .spin{width:13px;height:13px;border:2px solid #16a34a;border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;display:none}
+        .sbar.running .spin{display:inline-block}
+        @keyframes sp{to{transform:rotate(360deg)}}
+        /* 日志 */
+        .log{background:#1a1a2e;color:#bbb;border-radius:6px;padding:10px;max-height:260px;overflow-y:auto;font-family:'Cascadia Code','Fira Code',monospace;font-size:11px;line-height:1.7}
+        .log:empty::before{content:'等待执行...';color:#555}
+        .log .ts{color:#555;margin-right:5px}
+        .log .info{color:#8b8bff}
+        .log .ok{color:#4ade80}
+        .log .err{color:#f87171}
+        /* 截图 */
+        .ss-wrap{text-align:center;min-height:80px;display:flex;align-items:center;justify-content:center}
+        .ss-wrap img{max-width:100%;max-height:360px;border-radius:6px;border:1px solid #e5e7eb;cursor:pointer}
+        .ss-wrap .ph{color:#aaa;font-size:12px;padding:24px;border:1px dashed #d1d5db;border-radius:6px;width:100%}
+        /* 结果 */
+        .rbox{background:#f9fafb;border:1px solid #e5e7eb;border-radius:5px;padding:10px;font-size:12px;line-height:1.7;max-height:160px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+        /* 表格 */
+        .tbl{width:100%;border-collapse:collapse;font-size:12px}
+        .tbl th{text-align:left;padding:7px 8px;color:#888;border-bottom:1px solid #e5e7eb;font-weight:500;background:#f9fafb}
+        .tbl td{padding:7px 8px;border-bottom:1px solid #f3f4f6}
+        .tbl tr:hover td{background:#f9fafb}
+        .badge{padding:2px 7px;border-radius:9px;font-size:10px;font-weight:600}
+        .badge.g{background:#dcfce7;color:#16a34a}
+        .badge.r{background:#fee2e2;color:#dc2626}
+        .kw{color:#8b8bff;font-weight:500}
+        .empty{color:#aaa;text-align:center;padding:20px;font-size:12px}
+        .hist-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+        .hist-head h2{margin-bottom:0}
+        /* 账号选择 */
+        .acc-card{display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid #e5e7eb;border-radius:6px;margin-bottom:6px;cursor:pointer;transition:border .15s}
+        .acc-card:hover{border-color:#8b8bff}
+        .acc-card.selected{border-color:#8b8bff;background:#f0f0ff}
+        .acc-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+        .acc-dot.on{background:#16a34a}
+        .acc-dot.off{background:#aaa}
+        .acc-dot.exp{background:#dc2626}
+        .acc-name{font-size:13px;font-weight:500}
+        .acc-meta{font-size:11px;color:#888;margin-left:auto}
+        /* 全屏 */
+        .ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:999;justify-content:center;align-items:center;cursor:pointer}
+        .ov.show{display:flex}
+        .ov img{max-width:92%;max-height:92%;border-radius:6px}
+        .sec-row{margin-bottom:16px}
+    </style>
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-brand">&#x1F43E; Super<span>Claw</span></div>
+    <nav>
+        <a href="/">&#x1F4CA; 概览</a>
+        <a href="/douyin-comment" class="active">&#x1F3AC; 抖音评论</a>
+    </nav>
+    <div class="sidebar-footer">v0.1.0</div>
+</aside>
+
+<div class="main">
+<div class="topbar">
+    <h1>&#x1F3AC; 抖音自动评论</h1>
+    <span class="st">&#x25CF; 就绪</span>
+</div>
+<div class="wrap">
+
+<!-- ===== 区块1: 账号选择 ===== -->
+<div class="card" id="sec-account">
+    <h2><span class="arrow" onclick="toggle('sec-account')">&#x25BC;</span> &#x1F464; 账号选择</h2>
+    <div class="card-body" id="account-list">
+        <!-- JS 填充 -->
+    </div>
+</div>
+
+<div class="g2">
+<!-- ===== 左栏配置 ===== -->
+<div>
+<!-- 区块2: 搜索配置 -->
+<div class="card" id="sec-search">
+    <h2><span class="arrow" onclick="toggle('sec-search')">&#x25BC;</span> &#x1F50D; 搜索配置</h2>
+    <div class="card-body">
+        <div class="fg">
+            <label>搜索关键词（每行一个，轮换使用）</label>
+            <textarea id="keywords" rows="3" placeholder="香港移民&#10;移民政策&#10;人才引进">香港移民</textarea>
+        </div>
+        <div class="fg-row">
+            <div class="fg">
+                <label>时间筛选</label>
+                <select id="time_range"><option value="0">不限</option><option value="1">一天内</option><option value="7">一周内</option><option value="30">一个月内</option></select>
+            </div>
+            <div class="fg">
+                <label>排序方式</label>
+                <select id="sort_by"><option value="general">综合排序</option><option value="latest">最新</option><option value="hottest">最热</option></select>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 区块3: 节奏控制 -->
+<div class="card" id="sec-rhythm">
+    <h2><span class="arrow" onclick="toggle('sec-rhythm')">&#x25BC;</span> &#x23F3; 节奏控制</h2>
+    <div class="card-body">
+        <div class="fg-row3">
+            <div class="fg"><label>评论视频数量</label><input type="number" id="video_count" value="10" min="1" max="100"></div>
+            <div class="fg"><label>评论几个换关键词</label><input type="number" id="keyword_rotate" value="10" min="1"></div>
+            <div class="fg"><label>发送几个休息</label><input type="number" id="rest_after" value="5" min="1"></div>
+        </div>
+        <div class="fg-row">
+            <div class="fg">
+                <label>评论间隔（秒）</label>
+                <div class="range-group"><input type="number" id="interval_min" value="1" min="0" max="60"><span>~</span><input type="number" id="interval_max" value="3" min="1" max="120"></div>
+            </div>
+            <div class="fg">
+                <label>休息间隔（秒）</label>
+                <div class="range-group"><input type="number" id="rest_min" value="5" min="1" max="60"><span>~</span><input type="number" id="rest_max" value="10" min="2" max="300"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 区块4: 评论内容 -->
+<div class="card" id="sec-comment">
+    <h2><span class="arrow" onclick="toggle('sec-comment')">&#x25BC;</span> &#x1F4AC; 评论内容</h2>
+    <div class="card-body">
+        <div class="fg">
+            <label>评论内容（每行一条，随机抽取）</label>
+            <textarea id="comments" rows="4" placeholder="太棒了！&#10;学到了很多&#10;感谢分享"></textarea>
+        </div>
+        <div class="chk-row">
+            <input type="checkbox" id="use_mention"> <label for="use_mention" style="font-size:12px">@用户</label>
+            <input type="text" id="mention_user" placeholder="如：豆包/风启" style="display:none">
+        </div>
+        <div class="chk-row">
+            <input type="checkbox" id="use_image"> <label for="use_image" style="font-size:12px">发图片</label>
+            <input type="text" id="image_folder" placeholder="图片文件夹路径" style="display:none">
+        </div>
+    </div>
+</div>
+</div>
+
+<!-- ===== 右栏 ===== -->
+<div>
+<!-- 区块5: 过滤筛选 -->
+<div class="card" id="sec-filter">
+    <h2><span class="arrow" onclick="toggle('sec-filter')">&#x25BC;</span> &#x1F50D; 过滤筛选</h2>
+    <div class="card-body">
+        <div class="chk-row">
+            <input type="checkbox" id="use_province"> <label for="use_province" style="font-size:12px">过滤省份</label>
+            <select id="filter_province" multiple style="display:none;flex:1;max-height:80px">
+                <option>北京</option><option>上海</option><option>广东</option><option>浙江</option><option>江苏</option><option>四川</option><option>湖北</option><option>河南</option><option>山东</option><option>福建</option>
+            </select>
+        </div>
+        <div class="chk-row">
+            <input type="checkbox" id="use_filter_time"> <label for="use_filter_time" style="font-size:12px">过滤时间</label>
+            <select id="filter_time" style="display:none"><option value="0">不限</option><option value="1">一天内</option><option value="7">一周内</option><option value="30">一个月内</option></select>
+        </div>
+        <div class="chk-row">
+            <input type="checkbox" id="use_filter_kw"> <label for="use_filter_kw" style="font-size:12px">评论区关键词筛选</label>
+            <input type="text" id="filter_keywords" placeholder="空格分隔多个关键词" style="display:none">
+        </div>
+        <div class="fg" style="margin-top:6px"><label>筛选数据量</label><input type="number" id="filter_count" value="10" min="1" max="50"></div>
+    </div>
+</div>
+
+<!-- 区块6: 互动行为 -->
+<div class="card" id="sec-action">
+    <h2><span class="arrow" onclick="toggle('sec-action')">&#x25BC;</span> &#x1F44D; 互动行为</h2>
+    <div class="card-body">
+        <div class="g2" style="gap:6px">
+            <label class="chk-row"><input type="checkbox" id="act_like" checked> 点赞</label>
+            <label class="chk-row"><input type="checkbox" id="act_follow" checked> 关注</label>
+            <label class="chk-row"><input type="checkbox" id="act_fav" checked> 收藏</label>
+            <label class="chk-row"><input type="checkbox" id="act_view" checked> 浏览</label>
+        </div>
+    </div>
+</div>
+
+<!-- 区块7: 执行控制 + 区块8: 结果 -->
+<div class="card">
+    <h2>&#x25B6;&#xFE0F; 执行控制</h2>
+    <div class="sbar idle" id="sbar"><div class="spin"></div><span id="sbar-text">就绪</span><span id="sbar-count" style="margin-left:auto;color:#888"></span></div>
+    <div class="btn-group">
+        <button class="btn btn-primary" id="btn-start" onclick="runTask()" style="flex:2">&#x1F680; 开始执行</button>
+        <button class="btn btn-outline" id="btn-pause" onclick="ctrlTask('pause')" disabled>暂停</button>
+        <button class="btn btn-outline" id="btn-stop" onclick="ctrlTask('stop')" disabled>结束</button>
+    </div>
+    <div style="margin-top:12px"><h2 style="margin-bottom:8px">&#x1F4CB; 执行日志</h2><div class="log" id="log-panel"></div></div>
+    <div style="margin-top:12px"><h2 style="margin-bottom:8px">&#x1F4F8; 截图证据</h2><div class="ss-wrap" id="ss-area"><div class="ph">执行完成后显示截图</div></div></div>
+    <div style="margin-top:12px"><h2 style="margin-bottom:8px">&#x1F4DD; 执行详情</h2><div class="rbox" id="result-detail">等待执行...</div></div>
+</div>
+
+<!-- 区块9: 执行历史 -->
+<div class="card">
+    <div class="hist-head"><h2>&#x1F4DC; 执行历史</h2><button class="btn btn-danger btn-sm" onclick="clearHist()">清空</button></div>
+    <table class="tbl"><thead><tr><th>时间</th><th>关键词</th><th>视频标题</th><th>评论</th><th>状态</th><th>耗时</th></tr></thead><tbody id="hist-body"></tbody></table>
+    <div id="hist-empty" class="empty">暂无执行记录</div>
+</div>
+</div>
+</div><!-- g2 -->
+
+</div><!-- wrap -->
+</div><!-- main -->
+
+<div class="ov" id="ov" onclick="this.classList.remove('show')"><img id="ov-img"></div>
+
+<script>
+/* ---- 折叠 ---- */
+function toggle(id){document.getElementById(id).classList.toggle('collapsed')}
+
+/* ---- @/图片 开关 ---- */
+document.getElementById('use_mention').onchange=function(){document.getElementById('mention_user').style.display=this.checked?'':'none'};
+document.getElementById('use_image').onchange=function(){document.getElementById('image_folder').style.display=this.checked?'':'none'};
+document.getElementById('use_province').onchange=function(){document.getElementById('filter_province').style.display=this.checked?'':'none'};
+document.getElementById('use_filter_time').onchange=function(){document.getElementById('filter_time').style.display=this.checked?'':'none'};
+document.getElementById('use_filter_kw').onchange=function(){document.getElementById('filter_keywords').style.display=this.checked?'':'none'};
+
+/* ---- 账号列表 ---- */
+function renderAccounts(){
+    var list=[];
+    try{list=JSON.parse(localStorage.getItem('sc_dy_accounts')||'[]')}catch(e){}
+    if(!list.length) list=[{id:'default',name:'AI露营DC',status:'on',lastLogin:'刚刚'}];
+    var el=document.getElementById('account-list');
+    var h='';
+    for(var i=0;i<list.length;i++){
+        var a=list[i];
+        var sel=i===0?' selected':'';
+        h+='<div class="acc-card'+sel+'" data-acc="'+esc(a.id)+'" onclick="selectAcc(this)">';
+        h+='<div class="acc-dot '+(a.status||'on')+'"></div>';
+        h+='<span class="acc-name">'+esc(a.name)+'</span>';
+        h+='<span class="acc-meta">'+esc(a.lastLogin||'')+'</span>';
+        h+='</div>';
+    }
+    el.innerHTML=h;
+}
+function selectAcc(el){document.querySelectorAll('.acc-card').forEach(function(c){c.classList.remove('selected')});el.classList.add('selected')}
+function getSelectedAccount(){var c=document.querySelector('.acc-card.selected');return c?c.dataset.acc:'default'}
+
+/* ---- localStorage 历史 ---- */
+var HK='sc_dy_h99';
+function loadH(){try{return JSON.parse(localStorage.getItem(HK)||'[]')}catch(e){return[]}}
+function saveH(l){localStorage.setItem(HK,JSON.stringify(l.slice(0,200)))}
+function pushH(r){var l=loadH();l.unshift(r);saveH(l);renderH()}
+function clearH(){if(!confirm('清空全部历史？'))return;localStorage.removeItem(HK);renderH()}
+function renderH(){
+    var l=loadH(),tb=document.getElementById('hist-body'),em=document.getElementById('hist-empty');
+    if(!l.length){tb.innerHTML='';em.style.display='';return}
+    em.style.display='none';var h='';
+    for(var i=0;i<l.length;i++){var r=l[i];
+        h+='<tr><td>'+esc(r.time||'-')+'</td><td class="kw">'+esc(r.keyword)+'</td><td>'+esc(r.title||'-').substring(0,25)+'</td><td>'+esc(r.comment||'').substring(0,20)+'</td><td><span class="badge '+(r.ok?'g':'r')+'">'+(r.ok?'成功':'失败')+'</span></td><td>'+esc(r.dur||'-')+'</td></tr>';
+    }
+    tb.innerHTML=h;
+}
+
+/* ---- 日志 ---- */
+function log(m,t){t=t||'info';var p=document.getElementById('log-panel'),now=new Date().toLocaleTimeString('zh-CN',{hour12:false}),d=document.createElement('div');d.className=t;d.innerHTML='<span class="ts">['+now+']</span>'+esc(m);p.appendChild(d);p.scrollTop=p.scrollHeight}
+function clearLog(){document.getElementById('log-panel').innerHTML=''}
+
+/* ---- 状态 ---- */
+function setS(t,s){document.getElementById('sbar').className='sbar '+s;document.getElementById('sbar-text').textContent=t}
+function setCnt(n){document.getElementById('sbar-count').textContent=n?'已执行 '+n+' 个':''}
+
+/* ---- 截图 ---- */
+function showSS(u){if(!u)return;document.getElementById('ss-area').innerHTML='<img src="'+esc(u)+'" onclick="fullImg(this.src)">'}
+function fullImg(s){document.getElementById('ov-img').src=s;document.getElementById('ov').classList.add('show')}
+
+/* ---- 执行 ---- */
+var _running=false,_timer=null;
+async function runTask(){
+    if(_running)return;
+    var kw=document.getElementById('keywords').value.trim().split('\n').filter(Boolean);
+    var cmt=document.getElementById('comments').value.trim().split('\n').filter(Boolean);
+    if(!kw.length){alert('请输入搜索关键词');return}
+    if(!cmt.length){alert('请输入评论内容');return}
+
+    var body={
+        account_id: getSelectedAccount(),
+        keywords: kw,
+        time_range: parseInt(document.getElementById('time_range').value),
+        sort_by: document.getElementById('sort_by').value,
+        video_count: parseInt(document.getElementById('video_count').value)||10,
+        comment_interval: [parseInt(document.getElementById('interval_min').value)||1, parseInt(document.getElementById('interval_max').value)||3],
+        keyword_rotate_after: parseInt(document.getElementById('keyword_rotate').value)||10,
+        rest_after: parseInt(document.getElementById('rest_after').value)||5,
+        rest_interval: [parseInt(document.getElementById('rest_min').value)||5, parseInt(document.getElementById('rest_max').value)||10],
+        comments: cmt,
+        mention_user: document.getElementById('use_mention').checked?document.getElementById('mention_user').value:'',
+        send_image: document.getElementById('use_image').checked,
+        image_folder: document.getElementById('use_image').checked?document.getElementById('image_folder').value:'',
+        filter_province: document.getElementById('use_province').checked?Array.from(document.getElementById('filter_province').selectedOptions).map(function(o){return o.value}):[],
+        filter_time: document.getElementById('use_filter_time').checked?parseInt(document.getElementById('filter_time').value):0,
+        filter_keywords: document.getElementById('use_filter_kw').checked?document.getElementById('filter_keywords').value.trim().split(/\s+/).filter(Boolean):[],
+        filter_count: parseInt(document.getElementById('filter_count').value)||10,
+        actions:{like:document.getElementById('act_like').checked,follow:document.getElementById('act_follow').checked,favorite:document.getElementById('act_fav').checked,view:document.getElementById('act_view').checked}
+    };
+
+    _running=true;
+    clearLog();setS('正在执行...','running');setCnt(0);
+    document.getElementById('btn-start').disabled=true;
+    document.getElementById('btn-pause').disabled=false;
+    document.getElementById('btn-stop').disabled=false;
+    document.getElementById('ss-area').innerHTML='<div class="ph">执行中，请稍候...</div>';
+    document.getElementById('result-detail').textContent='执行中...';
+
+    log('开始任务: '+kw.length+'个关键词, 评论'+body.video_count+'个视频, 账号='+body.account_id,'info');
+
+    var t0=Date.now();
+    try{
+        var resp=await fetch('/api/douyin-comment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        var data=await resp.json();
+        var dur=((Date.now()-t0)/1000).toFixed(1)+'s';
+
+        if(data.success){
+            setS('执行成功','ok');
+            log('任务完成 ('+(data.duration||dur)+')','ok');
+            if(data.video_title)log('视频: '+data.video_title,'info');
+            if(data.screenshot){showSS(data.screenshot);log('截图已加载','ok')}
+            document.getElementById('result-detail').textContent=data.detail||JSON.stringify(data,null,2);
+        }else{
+            setS('执行失败','err');
+            log('错误: '+(data.error||'未知'),'err');
+            document.getElementById('result-detail').textContent='错误: '+(data.error||'未知');
+        }
+        pushH({time:new Date().toLocaleString('zh-CN'),keyword:kw[0],title:data.video_title||'',comment:cmt[0]||'',ok:data.success,dur:data.duration||dur});
+    }catch(e){
+        setS('请求失败','err');log('网络错误: '+e.message,'err');
+        document.getElementById('result-detail').textContent='异常: '+e.message;
+        pushH({time:new Date().toLocaleString('zh-CN'),keyword:kw[0],ok:false,dur:'-',comment:cmt[0]||''});
+    }finally{
+        _running=false;document.getElementById('btn-start').disabled=false;
+        document.getElementById('btn-pause').disabled=true;document.getElementById('btn-stop').disabled=true;
+    }
+}
+
+/* ---- 控制 ---- */
+async function ctrlTask(action){
+    if(action==='stop'){_running=false;setS('已停止','idle');log('手动停止','err');return}
+    try{await fetch('/api/douyin-comment/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});log('已发送: '+action,'info')}catch(e){log('控制失败: '+e.message,'err')}
+}
+
+/* ---- 工具 ---- */
+function esc(s){var d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+
+/* ---- 初始化 ---- */
+document.addEventListener('DOMContentLoaded',function(){renderAccounts();renderH();document.getElementById('keywords').addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();runTask()}})});
+</script>
+</body>
+</html>

@@ -1,0 +1,307 @@
+{
+  "totals": {
+    "requests": 26,
+    "prompt_tokens": 3479,
+    "completion_tokens": 7971,
+    "total_tokens": 11450
+  },
+  "by_model": {
+    "openai_compatible:mimo-v2.5": {
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "requests": 26,
+      "prompt_tokens": 3479,
+      "completion_tokens": 7971,
+      "total_tokens": 11450
+    }
+  },
+  "recent": [
+    {
+      "created_at": "2026-06-26T06:27:42.351213+00:00",
+      "context": "task:6:episode:1",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 214,
+      "total_tokens": 358
+    },
+    {
+      "created_at": "2026-06-26T05:52:09.680741+00:00",
+      "context": "task:4:episode:56",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 134,
+      "completion_tokens": 173,
+      "total_tokens": 307
+    },
+    {
+      "created_at": "2026-06-26T05:45:02.701411+00:00",
+      "context": "task:4:episode:49",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 134,
+      "completion_tokens": 326,
+      "total_tokens": 460
+    },
+    {
+      "created_at": "2026-06-26T05:36:00.611617+00:00",
+      "context": "task:4:episode:41",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 134,
+      "completion_tokens": 248,
+      "total_tokens": 382
+    },
+    {
+      "created_at": "2026-06-26T05:15:27.498086+00:00",
+      "context": "task:4:episode:22",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 134,
+      "completion_tokens": 262,
+      "total_tokens": 396
+    },
+    {
+      "created_at": "2026-06-26T05:14:46.706690+00:00",
+      "context": "task:4:episode:21",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 134,
+      "completion_tokens": 433,
+      "total_tokens": 567
+    },
+    {
+      "created_at": "2026-06-26T05:05:14.622221+00:00",
+      "context": "task:4:episode:13",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 134,
+      "completion_tokens": 260,
+      "total_tokens": 394
+    },
+    {
+      "created_at": "2026-06-26T04:31:01.133190+00:00",
+      "context": "task:4:episode:33",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 355,
+      "total_tokens": 499
+    },
+    {
+      "created_at": "2026-06-26T04:30:01.108367+00:00",
+      "context": "task:4:episode:32",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 283,
+      "total_tokens": 427
+    },
+    {
+      "created_at": "2026-06-26T04:26:43.805927+00:00",
+      "context": "task:4:episode:29",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 201,
+      "total_tokens": 345
+    },
+    {
+      "created_at": "2026-06-26T04:21:28.927828+00:00",
+      "context": "task:4:episode:24",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 170,
+      "total_tokens": 314
+    },
+    {
+      "created_at": "2026-06-26T04:06:22.737780+00:00",
+      "context": "task:4:episode:10",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 406,
+      "total_tokens": 550
+    },
+    {
+      "created_at": "2026-06-26T04:03:28.922986+00:00",
+      "context": "task:4:episode:7",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 492,
+      "total_tokens": 636
+    },
+    {
+      "created_at": "2026-06-26T04:01:01.891115+00:00",
+      "context": "task:4:episode:4",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 472,
+      "total_tokens": 616
+    },
+    {
+      "created_at": "2026-06-26T03:24:26.389024+00:00",
+      "context": "task:4:episode:21",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 145,
+      "completion_tokens": 250,
+      "total_tokens": 395
+    },
+    {
+      "created_at": "2026-06-26T03:22:06.829408+00:00",
+      "context": "task:4:episode:20",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 145,
+      "completion_tokens": 385,
+      "total_tokens": 530
+    },
+    {
+      "created_at": "2026-06-26T03:12:09.491372+00:00",
+      "context": "task:4:episode:12",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 145,
+      "completion_tokens": 343,
+      "total_tokens": 488
+    },
+    {
+      "created_at": "2026-06-26T03:06:03.850289+00:00",
+      "context": "task:4:episode:5",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 145,
+      "completion_tokens": 445,
+      "total_tokens": 590
+    },
+    {
+      "created_at": "2026-06-25T10:45:20.126427+00:00",
+      "context": "task:4:episode:21",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 376,
+      "total_tokens": 520
+    },
+    {
+      "created_at": "2026-06-25T10:39:49.734457+00:00",
+      "context": "task:4:episode:16",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 184,
+      "total_tokens": 328
+    },
+    {
+      "created_at": "2026-06-25T10:26:39.173157+00:00",
+      "context": "task:4:episode:1",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 144,
+      "completion_tokens": 512,
+      "total_tokens": 656
+    },
+    {
+      "created_at": "2026-06-25T08:28:46.798970+00:00",
+      "context": "task:4:episode:1",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 145,
+      "completion_tokens": 170,
+      "total_tokens": 315
+    },
+    {
+      "created_at": "2026-06-24T10:43:56.002758+00:00",
+      "context": "task:2:episode:4",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 97,
+      "completion_tokens": 512,
+      "total_tokens": 609
+    },
+    {
+      "created_at": "2026-06-24T07:43:25.506723+00:00",
+      "context": "task:10:episode:12",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 89,
+      "completion_tokens": 244,
+      "total_tokens": 333
+    },
+    {
+      "created_at": "2026-06-24T07:41:07.753933+00:00",
+      "context": "task:10:episode:6",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 89,
+      "completion_tokens": 119,
+      "total_tokens": 208
+    },
+    {
+      "created_at": "2026-06-24T06:46:56.896828+00:00",
+      "context": "settings:test",
+      "source": "ai",
+      "provider": "openai_compatible",
+      "model": "mimo-v2.5",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "prompt_tokens": 91,
+      "completion_tokens": 136,
+      "total_tokens": 227
+    }
+  ]
+}
