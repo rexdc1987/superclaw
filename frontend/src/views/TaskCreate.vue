@@ -1,11 +1,19 @@
 <template>
   <div class="task-create">
     <div class="page-header">
-      <h3>新建红果评论任务</h3>
+      <h3>{{ pageTitle }}</h3>
       <el-button @click="router.push('/hongguo')">返回列表</el-button>
     </div>
 
     <el-card>
+      <el-alert
+        v-if="editLocked"
+        class="edit-alert"
+        type="warning"
+        :closable="false"
+        show-icon
+        title="请先停止当前任务，再修改任务配置"
+      />
       <el-form :model="form" label-width="130px" style="max-width: 680px">
         <el-form-item label="搜索剧名" required>
           <el-input v-model="form.drama_name" placeholder="输入红果短剧名称或搜索关键词" />
@@ -71,7 +79,7 @@
         </el-form-item>
 
         <el-form-item>
-          <el-button type="primary" :loading="submitting" @click="handleSubmit">创建任务</el-button>
+          <el-button type="primary" :loading="submitting" :disabled="editLocked" @click="handleSubmit">{{ submitText }}</el-button>
           <el-button @click="router.push('/hongguo')">取消</el-button>
         </el-form-item>
       </el-form>
@@ -89,7 +97,10 @@ const route = useRoute()
 const router = useRouter()
 const submitting = ref(false)
 const templateText = ref('')
+const editLocked = ref(false)
 const editingId = computed(() => route.query.id ? Number(route.query.id) : null)
+const pageTitle = computed(() => editingId.value ? '编辑红果评论任务' : '新建红果评论任务')
+const submitText = computed(() => editingId.value ? '保存修改' : '创建任务')
 const form = reactive({
   drama_name: '',
   comment_mode: 'specified',
@@ -116,6 +127,10 @@ const playbackSpeedOptions = [
 async function loadTaskForEdit() {
   if (!editingId.value) return
   const task = await getTask(editingId.value)
+  editLocked.value = isLiveActiveTask(task)
+  if (editLocked.value) {
+    ElMessage.warning('请先停止当前任务，再修改任务配置')
+  }
   Object.assign(form, {
     drama_name: task.drama_name || '',
     comment_mode: task.comment_mode || 'specified',
@@ -132,7 +147,16 @@ async function loadTaskForEdit() {
   templateText.value = (task.templates || []).join('\n')
 }
 
+function isLiveActiveTask(task) {
+  if (!['running', 'paused', 'waiting_login'].includes(task?.status)) return false
+  return task?.engine_running !== false
+}
+
 async function handleSubmit() {
+  if (editLocked.value) {
+    ElMessage.warning('请先停止当前任务，再修改任务配置')
+    return
+  }
   if (!form.drama_name.trim()) {
     ElMessage.warning('请输入短剧名称')
     return
@@ -150,8 +174,12 @@ async function handleSubmit() {
       templates: templateText.value.split('\n').map(item => item.trim()).filter(Boolean)
     }
     if (editingId.value) {
-      await updateTask(editingId.value, payload)
-      ElMessage.success('任务已更新')
+      const result = await updateTask(editingId.value, payload)
+      if (result?.updated === false) {
+        ElMessage.info('配置没有变化')
+      } else {
+        ElMessage.success('任务已更新')
+      }
     } else {
       await createTask(payload)
       ElMessage.success('任务创建成功')
@@ -181,5 +209,8 @@ onMounted(loadTaskForEdit)
   margin-left: 10px;
   color: var(--text-secondary);
   font-size: 13px;
+}
+.edit-alert {
+  margin-bottom: 16px;
 }
 </style>

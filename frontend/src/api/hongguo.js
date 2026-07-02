@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
+import { logClientEvent } from '../utils/clientLogger'
 
 const api = axios.create({
   baseURL: '/api/v1/hongguo',
@@ -24,6 +25,13 @@ settingsApi.interceptors.request.use(attachAuth)
 
 function handleResponseError(error) {
   const msg = error.response?.data?.detail || error.message || '请求失败'
+  logClientEvent('api_error', {
+    url: error.config?.url || '',
+    baseURL: error.config?.baseURL || '',
+    method: error.config?.method || '',
+    status: error.response?.status || 0,
+    message: msg,
+  }, msg)
   ElMessage.error(msg)
   return Promise.reject(error)
 }
@@ -41,6 +49,7 @@ export const pauseTask = (id) => api.post('/tasks/' + id + '/pause')
 export const resumeTask = (id) => api.post('/tasks/' + id + '/resume')
 export const stopTask = (id) => api.post('/tasks/' + id + '/stop')
 export const checkLogin = () => api.post('/check-login', null, { timeout: 240000 })
+export const getCurrentDevice = () => api.get('/device-current', { timeout: 30000 })
 export const getDevices = () => api.get('/devices', { timeout: 90000 })
 export const getAISettings = () => settingsApi.get('/ai')
 export const updateAISettings = (data) => settingsApi.put('/ai', data)

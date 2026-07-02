@@ -38,6 +38,7 @@ from services.ai_config_service import (
 
 
 router = APIRouter(prefix="/api/v1/hongguo", tags=["hongguo"])
+_normalize_account_info = HongguoOperations.normalize_account_info
 
 TASK_STATUSES = {
     "pending",
@@ -177,7 +178,7 @@ def _ensure_task_schema(conn) -> None:
             FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA=%s
               AND TABLE_NAME='hongguo_comment_tasks'
-              AND COLUMN_NAME IN ('playback_speed', 'execution_plan_json')
+              AND COLUMN_NAME IN ('playback_speed', 'execution_plan_json', 'rule_updated_at')
             """,
             (db_name,),
         )
@@ -206,6 +207,39 @@ def _ensure_task_schema(conn) -> None:
                 ALTER TABLE hongguo_comment_tasks
                 ADD COLUMN execution_plan_json TEXT DEFAULT NULL
                 AFTER playback_speed
+                """
+            )
+        if "rule_updated_at" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN rule_updated_at DATETIME DEFAULT NULL
+                AFTER updated_at
+                """
+            )
+            cur.execute(
+                """
+                UPDATE hongguo_comment_tasks
+                SET rule_updated_at=COALESCE(updated_at, created_at)
+                WHERE rule_updated_at IS NULL
+                """
+            )
+        cur.execute(
+            """
+            SELECT COLUMN_NAME
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=%s
+              AND TABLE_NAME='hongguo_execution_logs'
+              AND COLUMN_NAME='episode_number'
+            """,
+            (db_name,),
+        )
+        if not cur.fetchone():
+            cur.execute(
+                """
+                ALTER TABLE hongguo_execution_logs
+                ADD COLUMN episode_number INT DEFAULT NULL
+                AFTER message
                 """
             )
 
@@ -247,10 +281,17 @@ def _serialize_task(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not row:
         return None
     row = dict(row)
+    row["created_at"] = row.get("created_at") or row.get("started_at") or row.get("updated_at") or row.get("completed_at")
+    if row.get("duration_seconds") is None and row.get("started_at") and row.get("completed_at"):
+        try:
+            row["duration_seconds"] = max(0, int((row["completed_at"] - row["started_at"]).total_seconds()))
+        except Exception:
+            row["duration_seconds"] = None
     row["status"] = _normalize_status(row.get("status"))
     row["playback_speed"] = _normalize_playback_speed(row.get("playback_speed") or "1.0x")
     row["templates"] = _json_loads(row.get("templates_json"))
     row["execution_plan"] = _json_loads(row.get("execution_plan_json"))
+    row["engine_running"] = _engine_manager().is_running(row.get("id") or 0)
     return row
 
 
@@ -269,6 +310,42 @@ def _fetch_one_or_404(conn, task_id: int) -> Dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="Task not found")
     return row
+
+
+def _is_live_active_task(task_id: int, status: str) -> bool:
+    if _normalize_status(status) not in {"running", "paused", "waiting_login"}:
+        return False
+    return _engine_manager().is_running(task_id)
+
+
+def _task_update_value_changed(current: Dict[str, Any], key: str, value: Any) -> bool:
+    current_value = current.get(key)
+    if key == "playback_speed":
+        try:
+            return _normalize_playback_speed(current_value) != _normalize_playback_speed(value)
+        except Exception:
+            return str(current_value or "") != str(value or "")
+    if key in {
+        "start_episode",
+        "episode_interval",
+        "comment_interval_sec",
+        "random_comment_count",
+        "random_min_interval",
+        "random_max_interval",
+        "total_episodes",
+        "current_episode",
+        "comments_sent",
+        "comments_verified",
+    }:
+        try:
+            return int(current_value or 0) != int(value or 0)
+        except Exception:
+            return current_value != value
+    if key == "templates_json":
+        return _json_loads(current_value) != _json_loads(value)
+    if key == "status":
+        return _normalize_status(current_value) != _normalize_status(value)
+    return (current_value or "") != (value or "")
 
 
 def _insert_log(
@@ -332,6 +409,18 @@ class TaskCreate(TaskBase):
     pass
 
 
+class AccountPersona(BaseModel):
+    hongguo_id: str = ""
+    nickname: str = ""
+    persona: str = ""
+    style: str = ""
+
+    @field_validator("hongguo_id", "nickname", "persona", "style")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return str(value or "").strip()
+
+
 class AISettingsUpdate(BaseModel):
     enabled: bool = True
     provider: str = "openai_compatible"
@@ -343,6 +432,10 @@ class AISettingsUpdate(BaseModel):
     temperature: float = Field(default=0.8, ge=0, le=2)
     max_tokens: int = Field(default=512, ge=32, le=4096)
     fallback_to_local: bool = True
+    comment_scope: str = ""
+    comment_style: str = "grounded"
+    default_persona: str = "普通红果短剧观众，口语化，像随手刷剧后发一句真实短评"
+    account_personas: List[AccountPersona] = Field(default_factory=list)
 
     @field_validator("base_url", "model", "provider", "api_key_env")
     @classmethod
@@ -351,6 +444,11 @@ class AISettingsUpdate(BaseModel):
         if not value:
             raise ValueError("value is required")
         return value
+
+    @field_validator("comment_scope", "comment_style", "default_persona")
+    @classmethod
+    def validate_optional_text(cls, value: str) -> str:
+        return str(value or "").strip()
 
 
 def _public_ai_settings(ai: Dict[str, Any]) -> Dict[str, Any]:
@@ -446,8 +544,8 @@ async def create_task(payload: TaskCreate):
                     drama_name, comment_mode, content_source,
                     start_episode, episode_interval, comment_interval_sec,
                     random_comment_count, random_min_interval, random_max_interval,
-                    templates_json, playback_speed, status, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    templates_json, playback_speed, status, created_at, updated_at, rule_updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     payload.drama_name,
@@ -462,6 +560,7 @@ async def create_task(payload: TaskCreate):
                     _json_dumps(payload.templates),
                     payload.playback_speed,
                     "pending",
+                    now,
                     now,
                     now,
                 ),
@@ -488,7 +587,7 @@ async def list_tasks(
                 f"""
                 SELECT * FROM hongguo_comment_tasks
                 {where}
-                ORDER BY id DESC
+                ORDER BY COALESCE(started_at, updated_at, created_at, completed_at) DESC, id DESC
                 LIMIT %s OFFSET %s
                 """,
                 params,
@@ -531,30 +630,71 @@ async def update_task(task_id: int, payload: TaskUpdate):
         "comments_verified",
         "error_message",
     }
+    plan_sensitive_fields = {
+        "drama_name",
+        "comment_mode",
+        "content_source",
+        "playback_speed",
+        "start_episode",
+        "episode_interval",
+        "comment_interval_sec",
+        "random_comment_count",
+        "random_min_interval",
+        "random_max_interval",
+        "templates_json",
+    }
     assignments = []
     values = []
-    for key, value in data.items():
-        if key not in allowed:
-            continue
-        assignments.append(f"{key}=%s")
-        values.append(value)
-    if not assignments:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-    assignments.append("updated_at=%s")
-    values.append(datetime.now())
-    values.append(task_id)
-
     with _connection() as conn:
         current = _fetch_one_or_404(conn, task_id)
-        if "status" in data:
+        changed_fields = {}
+        for key, value in data.items():
+            if key not in allowed:
+                continue
+            if _task_update_value_changed(current, key, value):
+                changed_fields[key] = value
+        if not changed_fields:
+            return {**_serialize_task(current), "updated": False}
+        plan_dirty = any(key in plan_sensitive_fields for key in changed_fields)
+        if plan_dirty and _is_live_active_task(task_id, current.get("status")):
+            raise HTTPException(status_code=409, detail="请先停止当前任务，再修改任务配置")
+        if "status" in changed_fields:
             current_status = _normalize_status(current.get("status"))
-            target_status = data["status"]
+            target_status = changed_fields["status"]
             allowed = STATUS_TRANSITIONS.get(current_status, set())
             if target_status not in allowed:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Cannot transition from '{current_status}' to '{target_status}'",
                 )
+        for key, value in changed_fields.items():
+            assignments.append(f"{key}=%s")
+            values.append(value)
+        if plan_dirty:
+            assignments.append("execution_plan_json=%s")
+            values.append(None)
+            if "status" not in changed_fields:
+                assignments.append("status=%s")
+                values.append("pending")
+            reset_fields = {
+                "started_at": None,
+                "completed_at": None,
+                "duration_seconds": None,
+                "error_message": None,
+                "current_episode": 0,
+                "total_episodes": 0,
+                "comments_sent": 0,
+                "comments_verified": 0,
+            }
+            for key, value in reset_fields.items():
+                assignments.append(f"{key}=%s")
+                values.append(value)
+        assignments.append("updated_at=%s")
+        values.append(datetime.now())
+        if plan_dirty:
+            assignments.append("rule_updated_at=%s")
+            values.append(values[-1])
+        values.append(task_id)
         with conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -565,13 +705,15 @@ async def update_task(task_id: int, payload: TaskUpdate):
                 values,
             )
         _insert_log(conn, task_id, "任务配置已更新")
-        return _serialize_task(_fetch_one_or_404(conn, task_id))
+        return {**_serialize_task(_fetch_one_or_404(conn, task_id)), "updated": True}
 
 
 @router.delete("/tasks/{task_id}")
 async def delete_task(task_id: int):
     with _connection() as conn:
-        _fetch_one_or_404(conn, task_id)
+        current = _fetch_one_or_404(conn, task_id)
+        if _is_live_active_task(task_id, current.get("status")):
+            raise HTTPException(status_code=409, detail="请先停止当前任务，再删除任务")
         with conn.cursor() as cur:
             cur.execute("DELETE FROM hongguo_execution_logs WHERE task_id=%s", (task_id,))
             cur.execute("DELETE FROM hongguo_comment_records WHERE task_id=%s", (task_id,))
@@ -643,15 +785,20 @@ async def test_ai_settings(payload: Optional[AISettingsUpdate] = None):
     if payload is None:
         ai = _ai_config()
     else:
-        ai = payload.model_dump()
+        saved = _ai_config()
+        ai = {**saved, **payload.model_dump()}
         api_key_env = ai.get("api_key_env") or "OPENAI_API_KEY"
-        ai["api_key"] = ai.get("api_key") or os.environ.get(api_key_env, "")
-        ai["fallback_to_local"] = False
+        ai["api_key"] = payload.api_key or saved.get("api_key") or os.environ.get(api_key_env, "")
+        ai["fallback_to_local"] = True
     try:
         content, source, usage = CommentGenerator(ai).generate_with_usage("红果短剧", "ai")
         from rpa.hongguo.ai_usage import record_usage
         stats = record_usage(usage, context="settings:test") if usage else load_usage_stats()
-        return {"success": True, "source": source, "comment": content, "usage": usage, "stats": stats}
+        result = {"success": True, "source": source, "comment": content, "usage": usage, "stats": stats}
+        if source == "ai" and not usage:
+            result["source"] = "local"
+            result["fallback_reason"] = "AI 返回内容未通过安全校验，已回退本地评论"
+        return result
     except Exception as exc:
         return {"success": False, "message": str(exc)}
 
@@ -670,24 +817,6 @@ async def reset_ai_usage():
 async def start_task(task_id: int):
     with _connection() as conn:
         current = _fetch_one_or_404(conn, task_id)
-        now = datetime.now()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE hongguo_comment_tasks
-                SET status=%s,
-                    started_at=%s,
-                    completed_at=NULL,
-                    duration_seconds=NULL,
-                    error_message=NULL,
-                    current_episode=0,
-                    comments_sent=0,
-                    comments_verified=0,
-                    updated_at=%s
-                WHERE id=%s
-                """,
-                ("running", now, now, task_id),
-            )
     _validate_transition(current.get("status"), "running")
     started = _engine_manager().start_task(task_id)
     if not started:
@@ -734,18 +863,26 @@ async def stop_task(task_id: int):
 async def list_records(
     task_id: int,
     status: Optional[str] = Query(default=None),
+    current_run_only: bool = Query(default=True),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
     if status is not None and status not in RECORD_STATUSES:
         raise HTTPException(status_code=400, detail="Invalid record status")
-    where = "AND status=%s" if status else ""
+    where_parts: List[str] = []
     params: List[Any] = [task_id]
     if status:
+        where_parts.append("status=%s")
         params.append(status)
-    params.extend([limit, offset])
+    where = ""
     with _connection() as conn:
-        _fetch_one_or_404(conn, task_id)
+        task = _fetch_one_or_404(conn, task_id)
+        if current_run_only and task.get("started_at"):
+            where_parts.append("created_at >= %s")
+            params.append(task.get("started_at"))
+        if where_parts:
+            where = "AND " + " AND ".join(where_parts)
+        params.extend([limit, offset])
         with conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -768,18 +905,26 @@ async def list_records(
 async def list_logs(
     task_id: int,
     level: Optional[str] = Query(default=None),
+    current_run_only: bool = Query(default=True),
     limit: int = Query(default=200, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
 ):
     if level is not None and level not in LOG_LEVELS:
         raise HTTPException(status_code=400, detail="Invalid log level")
-    where = "AND level=%s" if level else ""
+    where_parts: List[str] = []
     params: List[Any] = [task_id]
     if level:
+        where_parts.append("level=%s")
         params.append(level)
-    params.extend([limit, offset])
+    where = ""
     with _connection() as conn:
-        _fetch_one_or_404(conn, task_id)
+        task = _fetch_one_or_404(conn, task_id)
+        if current_run_only and task.get("started_at"):
+            where_parts.append("created_at >= %s")
+            params.append(task.get("started_at"))
+        if where_parts:
+            where = "AND " + " AND ".join(where_parts)
+        params.extend([limit, offset])
         with conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -794,24 +939,31 @@ async def list_logs(
 
 
 @router.get("/tasks/{task_id}/screenshot")
-async def latest_screenshot(task_id: int):
-    latest = _latest_screenshot_file(task_id)
-    if latest:
-        return {"task_id": task_id, "screenshot_path": latest}
-
+async def latest_screenshot(task_id: int, current_run_only: bool = Query(default=True)):
     with _connection() as conn:
-        _fetch_one_or_404(conn, task_id)
+        task = _fetch_one_or_404(conn, task_id)
+        since = task.get("started_at") if current_run_only else None
+        latest = _latest_screenshot_file(task_id, since=since)
+        if latest:
+            return {"task_id": task_id, "screenshot_path": latest}
+
+        where = ""
+        params: List[Any] = [task_id]
+        if since:
+            where = "AND created_at >= %s"
+            params.append(since)
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT screenshot_verified, screenshot_input
                 FROM hongguo_comment_records
                 WHERE task_id=%s
                   AND (screenshot_verified IS NOT NULL OR screenshot_input IS NOT NULL)
+                  {where}
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (task_id,),
+                params,
             )
             row = cur.fetchone()
     if not row:
@@ -823,18 +975,22 @@ async def latest_screenshot(task_id: int):
 
 
 @router.get("/tasks/{task_id}/screenshot/latest")
-async def latest_screenshot_file(task_id: int):
+async def latest_screenshot_file(task_id: int, current_run_only: bool = Query(default=True)):
     with _connection() as conn:
-        _fetch_one_or_404(conn, task_id)
-    return {"task_id": task_id, "screenshot_path": _latest_screenshot_file(task_id)}
+        task = _fetch_one_or_404(conn, task_id)
+    since = task.get("started_at") if current_run_only else None
+    return {"task_id": task_id, "screenshot_path": _latest_screenshot_file(task_id, since=since)}
 
 
 @router.get("/tasks/{task_id}/screenshot/image")
-async def screenshot_image(task_id: int):
-    latest = _latest_screenshot_file(task_id)
-    if not latest or not Path(latest).exists():
-        raise HTTPException(status_code=404, detail="No screenshot available")
-    return FileResponse(latest, media_type="image/png")
+async def screenshot_image(task_id: int, current_run_only: bool = Query(default=True)):
+    with _connection() as conn:
+        task = _fetch_one_or_404(conn, task_id)
+    since = task.get("started_at") if current_run_only else None
+    latest = _latest_screenshot_file(task_id, since=since)
+    if latest:
+        return FileResponse(latest, media_type="image/png")
+    raise HTTPException(status_code=404, detail="No screenshot available")
 
 
 @router.get("/tasks/screenshot/proxy")
@@ -847,7 +1003,7 @@ async def screenshot_proxy(path: str):
     return FileResponse(decoded, media_type="image/png")
 
 
-def _latest_screenshot_file(task_id: int) -> Optional[str]:
+def _latest_screenshot_file(task_id: int, since: Optional[datetime] = None) -> Optional[str]:
     screenshot_dir = _task_screenshot_dir(task_id)
     if not screenshot_dir.exists():
         return None
@@ -856,6 +1012,8 @@ def _latest_screenshot_file(task_id: int) -> Optional[str]:
         for path in screenshot_dir.iterdir()
         if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
     ]
+    if since:
+        files = [path for path in files if datetime.fromtimestamp(path.stat().st_mtime) >= since]
     if not files:
         return None
     return str(max(files, key=lambda path: path.stat().st_mtime).as_posix())
@@ -866,10 +1024,9 @@ def check_login():
     try:
         device = connect(_hongguo_device_addr())
         ops = HongguoOperations(device)
+        launched = ops.ensure_app_ready()
         device_info = ops.get_device_info()
-        launched = ops.launch_app()
-        device_info = ops.get_device_info()
-        if not launched and device_info.get("current_package") != "com.phoenix.read":
+        if not launched:
             return {
                 "success": True,
                 "logged_in": False,
@@ -878,9 +1035,12 @@ def check_login():
                 "account": {"logged_in": False, "nickname": "", "hongguo_id": ""},
                 "message": "红果短剧启动失败",
             }
-        result = ops.check_login()
-        device_info = ops.get_device_info()
-        account = ops.get_account_info()
+        result = ops.check_login(close_popups=False)
+        if result.get("status") == "not_logged_in":
+            account = {"logged_in": False, "nickname": "", "hongguo_id": "", "message": result.get("message") or "红果未登录"}
+        else:
+            device_info = ops.get_device_info()
+            account = _normalize_account_info(ops.get_account_info())
         if account.get("logged_in") and not result.get("logged_in"):
             result = {
                 **result,
@@ -888,8 +1048,13 @@ def check_login():
                 "status": "logged_in",
                 "message": account.get("message") or "\u5df2\u767b\u5f55",
             }
-        if result.get("logged_in") and not account.get("logged_in"):
-            account = {**account, "logged_in": True}
+        elif result.get("logged_in") and account and not account.get("logged_in"):
+            result = {
+                **result,
+                "logged_in": False,
+                "status": "not_logged_in",
+                "message": account.get("message") or "\u672a\u786e\u8ba4\u7ea2\u679c\u8d26\u53f7\u767b\u5f55",
+            }
         return {"success": True, **result, "device": device_info, "account": account}
     except Exception as exc:
         return {
@@ -942,6 +1107,42 @@ def list_devices():
         ),
         "settings": public_hongguo_settings(_hongguo_config()),
         "devices": devices,
+    }
+
+
+@router.get("/device-current")
+def current_device():
+    configured = _hongguo_device_addr()
+    entry: Dict[str, Any] = {
+        "serial": configured,
+        "addr": configured,
+        "online": False,
+        "selected": True,
+        "device": {},
+        "message": "",
+    }
+    try:
+        device = connect_exact(configured)
+        ops = HongguoOperations(device)
+        info = ops.get_device_info()
+        serial = info.get("serial") or configured
+        entry.update(
+            {
+                "serial": serial,
+                "addr": serial,
+                "online": True,
+                "device": info,
+                "message": "online",
+            }
+        )
+    except Exception as exc:
+        entry["message"] = str(exc)
+    return {
+        "success": True,
+        "selected_device_addr": configured,
+        "configured_device_online": bool(entry.get("online")),
+        "settings": public_hongguo_settings(_hongguo_config()),
+        "device": entry,
     }
 
 

@@ -101,7 +101,7 @@
         </el-table-column>
         <el-table-column prop="status" label="状态" width="120">
           <template #default="{ row }">
-            <el-tag :type="statusType(row.status)">{{ statusText(row.status) }}</el-tag>
+            <el-tag :type="statusType(row)">{{ statusText(row) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="进度" width="160">
@@ -116,9 +116,9 @@
         </el-table-column>
         <el-table-column label="操作" width="180" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" @click="router.push('/hongguo/create?id=' + row.id)">编辑</el-button>
+            <el-button size="small" :disabled="isActiveTask(row)" @click="handleEdit(row)">编辑</el-button>
             <el-button size="small" @click="router.push('/hongguo/task/' + row.id)">查看</el-button>
-            <el-button size="small" type="danger" @click="handleDelete(row.id)">删除</el-button>
+            <el-button size="small" type="danger" :disabled="isActiveTask(row)" @click="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -135,6 +135,7 @@ import {
   getTasks,
   deleteTask,
   checkLogin,
+  getCurrentDevice,
   getDevices,
   getHongguoSettings,
   updateHongguoSettings,
@@ -173,30 +174,56 @@ async function loadTasks() {
   }
 }
 
-async function handleDelete(id) {
+async function handleDelete(row) {
+  if (isActiveTask(row)) {
+    ElMessage.warning('请先停止当前任务，再删除任务')
+    return
+  }
   await ElMessageBox.confirm('确定删除这个红果评论任务吗？', '删除确认', {
     type: 'warning',
     confirmButtonText: '删除',
     cancelButtonText: '取消',
   })
-  await deleteTask(id)
+  await deleteTask(row.id)
   ElMessage.success('删除成功')
   loadTasks()
 }
 
+function isActiveTask(row) {
+  if (!['running', 'paused', 'waiting_login'].includes(row?.status)) return false
+  return row?.engine_running !== false
+}
+
+function handleEdit(row) {
+  if (isActiveTask(row)) {
+    ElMessage.warning('请先停止当前任务，再修改配置')
+    return
+  }
+  router.push('/hongguo/create?id=' + row.id)
+}
+
 async function loadDeviceSettings() {
-  const settings = await getHongguoSettings()
-  selectedDeviceAddr.value = settings.device_addr || ''
-  configuredDeviceOnline.value = true
-  deviceOptions.value = selectedDeviceAddr.value
-    ? [{
-        addr: selectedDeviceAddr.value,
-        serial: selectedDeviceAddr.value,
-        online: true,
-        selected: true,
-        device: { emulator: '当前默认设备' },
-      }]
-    : []
+  try {
+    const result = await getCurrentDevice()
+    selectedDeviceAddr.value = result.selected_device_addr || result.settings?.device_addr || ''
+    configuredDeviceOnline.value = result.configured_device_online !== false
+    const item = result.device
+    deviceOptions.value = item ? [item] : []
+  } catch (error) {
+    const settings = await getHongguoSettings()
+    selectedDeviceAddr.value = settings.device_addr || ''
+    configuredDeviceOnline.value = false
+    deviceOptions.value = selectedDeviceAddr.value
+      ? [{
+          addr: selectedDeviceAddr.value,
+          serial: selectedDeviceAddr.value,
+          online: false,
+          selected: true,
+          device: {},
+          message: error?.message || '设备状态读取失败',
+        }]
+      : []
+  }
 }
 
 async function refreshDevices() {
@@ -246,7 +273,13 @@ function modeText(mode) {
   return { random: '随机', specified: '指定' }[mode] || mode || '-'
 }
 
-function statusType(status) {
+function isRuntimeLost(row) {
+  return ['running', 'paused', 'waiting_login'].includes(row?.status) && row?.engine_running === false
+}
+
+function statusType(row) {
+  const status = typeof row === 'string' ? row : row?.status
+  if (typeof row === 'object' && isRuntimeLost(row)) return 'warning'
   return {
     pending: 'info',
     waiting_login: 'warning',
@@ -258,7 +291,9 @@ function statusType(status) {
   }[status] || 'info'
 }
 
-function statusText(status) {
+function statusText(row) {
+  const status = typeof row === 'string' ? row : row?.status
+  if (typeof row === 'object' && isRuntimeLost(row)) return '需重新启动'
   return {
     pending: '待执行',
     waiting_login: '等待登录',
@@ -290,10 +325,15 @@ function foregroundSummary(status) {
 
 function accountSummary(status) {
   const account = status?.account || {}
+  const nickname = String(account.nickname || '').trim()
+  const hongguoId = String(account.hongguo_id || '').trim()
+  const promoText = `${nickname} ${hongguoId}`.toLowerCase()
+  const looksLikePromo = promoText.includes('免费短剧') || promoText.includes('尽在红果') || /[（(]\s*get\s*[）)]/.test(promoText)
+  if (looksLikePromo) return '未确认登录'
   if (!status?.logged_in && !account.logged_in) return account.message || '未确认登录'
   const parts = []
-  if (account.nickname) parts.push(account.nickname)
-  if (account.hongguo_id) parts.push(`红果号 ${account.hongguo_id}`)
+  if (nickname) parts.push(nickname)
+  if (hongguoId) parts.push(`红果号 ${hongguoId}`)
   return parts.length ? parts.join(' / ') : (account.message || '已登录，账号信息未识别')
 }
 

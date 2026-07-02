@@ -58,18 +58,22 @@ def ai_config(include_secret: bool = True) -> Dict[str, Any]:
     ai = dict(app_config().get("ai", {}))
     api_key_env = ai.get("api_key_env") or "OPENAI_API_KEY"
     if include_secret:
-        ai["api_key"] = os.environ.get(api_key_env) or ai.get("api_key", "")
+        ai["api_key"] = ai.get("api_key", "") or os.environ.get(api_key_env, "")
     return ai
 
 
 def public_ai_settings(ai: Dict[str, Any] | None = None) -> Dict[str, Any]:
     current = dict(ai if ai is not None else app_config().get("ai", {}))
     api_key_env = current.get("api_key_env") or "OPENAI_API_KEY"
+    saved_key = str(current.get("api_key") or "").strip()
+    env_key = str(os.environ.get(api_key_env) or "").strip()
+    api_key_source = "saved" if saved_key else ("env" if env_key else "")
     return {
         "provider": current.get("provider", "openai_compatible"),
         "enabled": bool(current.get("enabled", False)),
         "api_key_env": api_key_env,
-        "api_key_configured": bool(os.environ.get(api_key_env) or current.get("api_key")),
+        "api_key_configured": bool(saved_key or env_key),
+        "api_key_source": api_key_source,
         "base_url": current.get("base_url", ""),
         "model": current.get("model", ""),
         "timeout": int(current.get("timeout", 30)),
@@ -77,6 +81,12 @@ def public_ai_settings(ai: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "max_tokens": int(current.get("max_tokens", 512)),
         "fallback_to_local": bool(current.get("fallback_to_local", True)),
         "comment_scope": current.get("comment_scope", ""),
+        "comment_style": current.get("comment_style", "grounded"),
+        "default_persona": current.get(
+            "default_persona",
+            "普通红果短剧观众，口语化，像随手刷剧后发一句真实短评",
+        ),
+        "account_personas": current.get("account_personas", []),
         "model_presets": AI_MODEL_PRESETS,
         "usage": load_usage_stats(),
     }

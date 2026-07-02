@@ -135,6 +135,10 @@ def delete_template(template_id: int, db: Session = Depends(get_db)):
 
 def _task_to_response(task) -> TaskResponse:
     """转换任务模型为响应"""
+    created_at = task.created_at or task.started_at or task.updated_at or task.completed_at
+    duration_seconds = task.duration_seconds
+    if duration_seconds is None and task.started_at and task.completed_at:
+        duration_seconds = max(0, int((task.completed_at - task.started_at).total_seconds()))
     return TaskResponse(
         id=task.id,
         drama_name=task.drama_name,
@@ -155,8 +159,8 @@ def _task_to_response(task) -> TaskResponse:
         error_message=task.error_message,
         started_at=task.started_at,
         completed_at=task.completed_at,
-        duration_seconds=task.duration_seconds,
-        created_at=task.created_at,
+        duration_seconds=duration_seconds,
+        created_at=created_at,
         updated_at=task.updated_at,
         progress_percent=task.progress_percent
     )

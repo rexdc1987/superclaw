@@ -56,7 +56,7 @@
               placeholder="填写后保存为当前配置，留空则继续使用已保存密钥或环境变量"
             />
             <div class="field-hint">
-              当前状态：{{ form.api_key_configured ? '已配置' : '未配置' }}
+              当前状态：{{ form.api_key_configured ? '已配置' : '未配置' }}{{ apiKeySourceText }}
             </div>
           </el-form-item>
 
@@ -66,6 +66,45 @@
               placeholder="例如：根据当前标题生成一个AI内容"
             />
             <div class="field-hint">用户没填评论内容时，会优先使用这里的默认范围。</div>
+          </el-form-item>
+
+          <el-form-item label="评论风格">
+            <el-select v-model="form.comment_style">
+              <el-option label="接地气短评" value="grounded" />
+              <el-option label="轻吐槽" value="funny" />
+              <el-option label="嗑剧情" value="plot" />
+              <el-option label="追更型" value="update" />
+              <el-option label="沉浸观众" value="immersive" />
+            </el-select>
+          </el-form-item>
+
+          <el-form-item label="默认人设">
+            <el-input
+              v-model="form.default_persona"
+              type="textarea"
+              :rows="2"
+              placeholder="例如：普通红果短剧观众，口语化，爱追反转，评论不要太像广告"
+            />
+          </el-form-item>
+
+          <el-form-item label="账号人设">
+            <div class="persona-list">
+              <div v-for="(item, index) in form.account_personas" :key="index" class="persona-row">
+                <el-input v-model="item.nickname" placeholder="昵称" />
+                <el-input v-model="item.hongguo_id" placeholder="红果ID" />
+                <el-select v-model="item.style" placeholder="风格">
+                  <el-option label="接地气短评" value="grounded" />
+                  <el-option label="轻吐槽" value="funny" />
+                  <el-option label="嗑剧情" value="plot" />
+                  <el-option label="追更型" value="update" />
+                  <el-option label="沉浸观众" value="immersive" />
+                </el-select>
+                <el-input v-model="item.persona" placeholder="这个账号的人设" />
+                <el-button @click="removePersona(index)">删除</el-button>
+              </div>
+              <el-button @click="addPersona">添加账号人设</el-button>
+            </div>
+            <div class="field-hint">任务启动时按当前红果账号昵称或红果ID匹配，匹配不到就用默认人设。</div>
           </el-form-item>
 
           <el-form-item label="超时">
@@ -179,6 +218,7 @@ const form = reactive({
   api_key_env: 'OPENAI_API_KEY',
   api_key: '',
   api_key_configured: false,
+  api_key_source: '',
   base_url: 'https://api.openai.com/v1',
   model: 'gpt-4.1-mini',
   timeout: 30,
@@ -186,9 +226,18 @@ const form = reactive({
   max_tokens: 512,
   fallback_to_local: true,
   comment_scope: '根据当前标题生成一个AI内容',
+  comment_style: 'grounded',
+  default_persona: '普通红果短剧观众，口语化，像刷剧时顺手发一句真实感受',
+  account_personas: [],
 })
 
 const modelUsageRows = computed(() => Object.values(usage.by_model || {}))
+const apiKeySourceText = computed(() => {
+  if (!form.api_key_configured) return ''
+  if (form.api_key_source === 'saved') return '（使用已保存 API Key）'
+  if (form.api_key_source === 'env') return `（使用环境变量 ${form.api_key_env}）`
+  return ''
+})
 
 function assignUsage(data) {
   const next = data || emptyUsage()
@@ -201,6 +250,9 @@ function assignSettings(data) {
   Object.assign(form, data || {})
   form.api_key = ''
   form.comment_scope = form.comment_scope || '根据当前标题生成一个AI内容'
+  form.comment_style = form.comment_style || 'grounded'
+  form.default_persona = form.default_persona || '普通红果短剧观众，口语化，像刷剧时顺手发一句真实感受'
+  form.account_personas = Array.isArray(form.account_personas) ? form.account_personas : []
   modelPresets.value = data?.model_presets || modelPresets.value
   assignUsage(data?.usage)
   selectedPreset.value = findCurrentPreset()
@@ -226,11 +278,32 @@ function applyPreset(label) {
 
 function payload() {
   const data = { ...form }
+  data.account_personas = (data.account_personas || [])
+    .map((item) => ({
+      nickname: (item.nickname || '').trim(),
+      hongguo_id: (item.hongguo_id || '').trim(),
+      persona: (item.persona || '').trim(),
+      style: item.style || '',
+    }))
+    .filter((item) => item.nickname || item.hongguo_id || item.persona || item.style)
   delete data.api_key_configured
   delete data.model_presets
   delete data.usage
   if (!data.api_key) delete data.api_key
   return data
+}
+
+function addPersona() {
+  form.account_personas.push({
+    nickname: '',
+    hongguo_id: '',
+    persona: '',
+    style: form.comment_style || 'grounded',
+  })
+}
+
+function removePersona(index) {
+  form.account_personas.splice(index, 1)
 }
 
 async function loadSettings() {
@@ -327,6 +400,15 @@ onMounted(loadSettings)
 .slider {
   width: 280px;
 }
+.persona-list {
+  width: 100%;
+}
+.persona-row {
+  display: grid;
+  grid-template-columns: minmax(100px, 0.8fr) minmax(110px, 0.9fr) minmax(120px, 0.8fr) minmax(180px, 1.4fr) auto;
+  gap: 8px;
+  margin-bottom: 8px;
+}
 .usage-cards {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -355,6 +437,9 @@ onMounted(loadSettings)
 }
 @media (max-width: 1100px) {
   .settings-grid {
+    grid-template-columns: 1fr;
+  }
+  .persona-row {
     grid-template-columns: 1fr;
   }
 }

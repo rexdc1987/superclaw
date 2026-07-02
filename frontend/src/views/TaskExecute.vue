@@ -7,6 +7,14 @@
 
     <template v-if="task">
       <el-card>
+        <el-alert
+          v-if="runtimeLost"
+          class="runtime-alert"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="任务执行线程已不存在，请先停止任务，再重新启动或修改配置"
+        />
         <el-descriptions :column="3" border>
           <el-descriptions-item label="短剧名称">{{ task.drama_name }}</el-descriptions-item>
           <el-descriptions-item label="状态">
@@ -22,6 +30,7 @@
           <el-descriptions-item label="创建时间">{{ formatTime(displayCreatedAt) }}</el-descriptions-item>
           <el-descriptions-item label="启动时间">{{ formatTime(displayStartedAt) }}</el-descriptions-item>
           <el-descriptions-item label="完成时间">{{ formatTime(displayCompletedAt) }}</el-descriptions-item>
+          <el-descriptions-item label="执行总时长">{{ displayDuration }}</el-descriptions-item>
           <el-descriptions-item label="刷新状态">
             <el-tag :type="autoRefreshing ? 'success' : 'info'">{{ autoRefreshing ? '自动刷新中' : '手动刷新' }}</el-tag>
           </el-descriptions-item>
@@ -38,6 +47,10 @@
           <div class="plan-row">
             <span class="plan-label">本次评论集数计划</span>
             <span>{{ commentPlanSummary }}</span>
+          </div>
+          <div v-if="skippedPlanSummary !== '-'" class="plan-row">
+            <span class="plan-label">历史成功跳过</span>
+            <span>{{ skippedPlanSummary }}</span>
           </div>
         </div>
 
@@ -87,7 +100,9 @@
             <el-table-column prop="generated_by" label="来源" width="100" />
             <el-table-column prop="status" label="状态" width="110">
               <template #default="{ row }">
-                <el-tag :type="recordStatusType(row.status)">{{ recordStatusText(row.status) }}</el-tag>
+                <el-tag :type="row.history_skipped ? 'info' : recordStatusType(row.status)">
+                  {{ row.history_skipped ? '历史成功' : recordStatusText(row.status) }}
+                </el-tag>
               </template>
             </el-table-column>
             <el-table-column prop="created_at" label="时间" width="180">
@@ -141,15 +156,18 @@ const logs = ref([])
 const loading = ref(false)
 const actionLoading = ref(false)
 const refreshTimer = ref(null)
+const actionRefreshTimer = ref(null)
 
 const normalizedStatus = computed(() => {
   const status = task.value?.status
   return status || 'pending'
 })
 
-const canStart = computed(() => ['pending', 'failed', 'stopped', 'waiting_login', 'completed'].includes(normalizedStatus.value))
-const canPause = computed(() => normalizedStatus.value === 'running')
-const canResume = computed(() => normalizedStatus.value === 'paused')
+const engineRunning = computed(() => task.value?.engine_running === true)
+const runtimeLost = computed(() => ['running', 'paused', 'waiting_login'].includes(normalizedStatus.value) && !engineRunning.value)
+const canStart = computed(() => ['pending', 'failed', 'stopped', 'waiting_login', 'completed'].includes(normalizedStatus.value) || runtimeLost.value)
+const canPause = computed(() => normalizedStatus.value === 'running' && engineRunning.value)
+const canResume = computed(() => normalizedStatus.value === 'paused' && engineRunning.value)
 const canStop = computed(() => ['running', 'paused', 'waiting_login'].includes(normalizedStatus.value))
 const autoRefreshing = computed(() => ['running', 'paused', 'waiting_login'].includes(normalizedStatus.value))
 const latestLog = computed(() => logs.value[0] || null)
@@ -157,14 +175,43 @@ const latestLogTime = computed(() => latestLog.value ? formatTime(latestLog.valu
 const displayCreatedAt = computed(() => task.value?.created_at || '')
 const displayStartedAt = computed(() => task.value?.started_at || '')
 const displayCompletedAt = computed(() => task.value?.completed_at || '')
+const displayDuration = computed(() => {
+  const seconds = task.value?.duration_seconds
+  if (Number.isFinite(Number(seconds))) return formatDuration(Number(seconds))
+  if (autoRefreshing.value && task.value?.started_at) {
+    const started = new Date(task.value.started_at).getTime()
+    if (!Number.isNaN(started)) return formatDuration(Math.max(0, Math.floor((Date.now() - started) / 1000)))
+  }
+  return '-'
+})
 const executionPlan = computed(() => {
   const value = task.value?.execution_plan
   if (value && typeof value === 'object' && !Array.isArray(value)) return value
   return {}
 })
+const planRuleMatchesTask = computed(() => {
+  const t = task.value || {}
+  const rule = executionPlan.value.rule
+  if (!rule || typeof rule !== 'object') return false
+  const keys = [
+    'comment_mode',
+    'content_source',
+    'playback_speed',
+    'start_episode',
+    'episode_interval',
+    'comment_interval_sec',
+    'random_comment_count',
+    'random_min_interval',
+    'random_max_interval',
+  ]
+  return keys.every((key) => {
+    if (rule[key] === undefined || rule[key] === null) return true
+    return String(rule[key]) === String(t[key] ?? '')
+  })
+})
 const ruleSummary = computed(() => {
   const t = task.value || {}
-  const rule = executionPlan.value.rule || {}
+  const rule = planRuleMatchesTask.value ? (executionPlan.value.rule || {}) : {}
   const mode = rule.comment_mode || t.comment_mode
   const source = rule.content_source || t.content_source || 'ai'
   const speed = rule.playback_speed || t.playback_speed || '1.0x'
@@ -180,7 +227,18 @@ const ruleSummary = computed(() => {
   return `从第 ${start} 集开始，每隔 ${interval} 集评论，固定等待 ${delay} 秒，内容 ${source}，倍速 ${speed}`
 })
 const commentPlanSummary = computed(() => {
+  if (!planRuleMatchesTask.value) return '-'
   const episodes = executionPlan.value.comment_episodes
+  if (!Array.isArray(episodes) || episodes.length === 0) {
+    const skipped = executionPlan.value.skipped_comment_episodes
+    if (Array.isArray(skipped) && skipped.length > 0) return '本次无待评论集数'
+    return '-'
+  }
+  return episodes.map((item) => `第${item}集`).join('、')
+})
+const skippedPlanSummary = computed(() => {
+  if (!planRuleMatchesTask.value) return '-'
+  const episodes = executionPlan.value.skipped_comment_episodes
   if (!Array.isArray(episodes) || episodes.length === 0) return '-'
   return episodes.map((item) => `第${item}集`).join('、')
 })
@@ -190,34 +248,70 @@ async function loadData() {
   try {
     const id = route.params.id
     task.value = await getTask(id)
-    const recordsRes = await getRecords(id).catch(() => ({ items: [] }))
-    records.value = (Array.isArray(recordsRes) ? recordsRes : (recordsRes.items || recordsRes.data || []))
-      .slice()
-      .sort((a, b) => {
-        const timeA = new Date(a.created_at || 0).getTime()
-        const timeB = new Date(b.created_at || 0).getTime()
-        if (timeA !== timeB) return timeB - timeA
-        return Number(b.id || 0) - Number(a.id || 0)
-      })
-    const logsRes = await getLogs(id).catch(() => ({ items: [] }))
-    logs.value = Array.isArray(logsRes) ? logsRes : (logsRes.items || logsRes.data || [])
+    const currentRunParams = { current_run_only: true }
+    const recordsRes = await getRecords(id, { current_run_only: false, limit: 500 }).catch(() => ({ items: [] }))
+    const currentRecords = normalizeList(recordsRes)
+    const skippedEpisodes = planRuleMatchesTask.value && Array.isArray(executionPlan.value.skipped_comment_episodes)
+      ? executionPlan.value.skipped_comment_episodes.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0)
+      : []
+    const skippedSet = new Set(skippedEpisodes)
+    records.value = mergeRecords(
+      currentRecords.map((item) => ({
+        ...item,
+        history_skipped: skippedSet.has(Number(item.episode_number)) && item.status === 'success'
+      })),
+      []
+    )
+    const logsRes = await getLogs(id, currentRunParams).catch(() => ({ items: [] }))
+    logs.value = normalizeList(logsRes)
   } finally {
     loading.value = false
   }
 }
 
-async function runAction(action, successText) {
+function normalizeList(response) {
+  return Array.isArray(response) ? response : (response?.items || response?.data || [])
+}
+
+function mergeRecords(currentRecords, historicalRecords) {
+  const byKey = new Map()
+  ;[...currentRecords, ...historicalRecords].forEach((item) => {
+    const key = item.id ? `id:${item.id}` : `ep:${item.episode_number}:${item.created_at || ''}`
+    if (!byKey.has(key)) byKey.set(key, item)
+  })
+  return Array.from(byKey.values())
+    .sort((a, b) => {
+      const timeA = new Date(a.created_at || 0).getTime()
+      const timeB = new Date(b.created_at || 0).getTime()
+      if (timeA !== timeB) return timeB - timeA
+      return Number(b.id || 0) - Number(a.id || 0)
+    })
+}
+
+function scheduleActionRefresh(delay = 800) {
+  if (actionRefreshTimer.value) {
+    clearTimeout(actionRefreshTimer.value)
+    actionRefreshTimer.value = null
+  }
+  actionRefreshTimer.value = setTimeout(() => {
+    actionRefreshTimer.value = null
+    loadData()
+  }, delay)
+}
+
+async function runAction(action, successText, options = {}) {
   actionLoading.value = true
   try {
     await action(route.params.id)
     ElMessage.success(successText)
     await loadData()
+    if (options.delayedRefresh) scheduleActionRefresh(options.delayedRefresh)
   } finally {
     actionLoading.value = false
   }
 }
 
-const handleStart = () => runAction(startTask, '任务已启动')
+const handleStart = () => runAction(startTask, '任务已启动', { delayedRefresh: 1200 })
 const handlePause = () => runAction(pauseTask, '任务已暂停')
 const handleResume = () => runAction(resumeTask, '任务已恢复')
 const handleStop = () => runAction(stopTask, '任务已停止')
@@ -298,6 +392,16 @@ function formatTime(value) {
     : date.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
 }
 
+function formatDuration(value) {
+  const total = Math.max(0, Number(value) || 0)
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = total % 60
+  if (hours > 0) return `${hours}小时${minutes}分${seconds}秒`
+  if (minutes > 0) return `${minutes}分${seconds}秒`
+  return `${seconds}秒`
+}
+
 onMounted(async () => {
   await loadData()
   syncRefreshTimer()
@@ -307,6 +411,7 @@ watch(autoRefreshing, syncRefreshTimer)
 
 onUnmounted(() => {
   if (refreshTimer.value) clearInterval(refreshTimer.value)
+  if (actionRefreshTimer.value) clearTimeout(actionRefreshTimer.value)
 })
 </script>
 
@@ -326,6 +431,9 @@ onUnmounted(() => {
   margin-top: 18px;
   display: flex;
   gap: 10px;
+}
+.runtime-alert {
+  margin-bottom: 14px;
 }
 .plan-panel {
   margin-top: 14px;

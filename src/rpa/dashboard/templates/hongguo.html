@@ -432,7 +432,9 @@ const TaskList = {
         }
 
         function canStart(row) {
-            return ["pending", "failed", "stopped", "completed"].includes(row.status);
+            if (!row) return false;
+            if (["pending", "failed", "stopped", "completed"].includes(row.status)) return true;
+            return ["running", "paused", "waiting_login"].includes(row.status) && row.engine_running === false;
         }
 
         async function loadTasks() {
@@ -893,7 +895,9 @@ const TaskMonitor = {
         }
 
         function canStart(row) {
-            return row && ["pending", "failed", "stopped", "completed"].includes(row.status);
+            if (!row) return false;
+            if (["pending", "failed", "stopped", "completed"].includes(row.status)) return true;
+            return ["running", "paused", "waiting_login"].includes(row.status) && row.engine_running === false;
         }
 
         function formatTime(value) {

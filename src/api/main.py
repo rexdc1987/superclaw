@@ -6,6 +6,7 @@ from fastapi import Depends, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.deps import get_db
+from api.client_events import router as client_events_router
 from api.settings import router as settings_router
 from rpa.dashboard.routes_hongguo import router as hongguo_router
 from models.task import Task
@@ -27,6 +28,7 @@ app.add_middleware(
 # The Hongguo router owns its full /api/v1/hongguo prefix.
 app.include_router(settings_router)
 app.include_router(hongguo_router)
+app.include_router(client_events_router)
 
 
 @app.get("/")

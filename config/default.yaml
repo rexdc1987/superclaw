@@ -22,6 +22,8 @@ ai:
   temperature: 0.8
   max_tokens: 512
   fallback_to_local: true
+  api_key: tp-c8675gosiebxeu1b01wpj0oke7o61oh6ud5fchfsjz6mxgvl
+  comment_scope: 根据当前标题生成一个AI内容
 risk:
   daily_comment_limit: 50
   daily_dm_limit: 20
@@ -46,4 +48,4 @@ scoring:
   replied_bonus: 20
   contacted_penalty: -20
 hongguo:
-  device_addr: emulator-5554
+  device_addr: 192.168.3.134:5555

@@ -104,14 +104,19 @@ async def test_ai_settings(payload: Optional[AISettingsUpdate] = None):
     if payload is None:
         current = ai_config()
     else:
-        current = payload.model_dump()
+        saved = ai_config()
+        current = {**saved, **payload.model_dump()}
         api_key_env = current.get("api_key_env") or "OPENAI_API_KEY"
-        current["api_key"] = current.get("api_key") or os.environ.get(api_key_env, "")
-        current["fallback_to_local"] = False
+        current["api_key"] = payload.api_key or saved.get("api_key") or os.environ.get(api_key_env, "")
+        current["fallback_to_local"] = True
     try:
         content, source, usage = CommentGenerator(current).generate_with_usage("红果短剧", "ai")
         stats = record_usage(usage, context="settings:test") if usage else load_usage_stats()
-        return {"success": True, "source": source, "comment": content, "usage": usage, "stats": stats}
+        result = {"success": True, "source": source, "comment": content, "usage": usage, "stats": stats}
+        if source == "ai" and not usage:
+            result["source"] = "local"
+            result["fallback_reason"] = "AI 返回内容未通过安全校验，已回退本地评论"
+        return result
     except Exception as exc:
         return {"success": False, "message": str(exc)}
 

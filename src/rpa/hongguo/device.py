@@ -49,23 +49,7 @@ def connect_exact(addr: str) -> Any:
 
 def connect(addr: str = DEFAULT_ADDR) -> Any:
     """Connect to a uiautomator2 device."""
-    os.environ.pop("PYTHONPATH", None)
-    u2 = _load_u2()
-    candidates = []
-    if addr:
-        candidates.append(addr)
-    for candidate in discover_addrs():
-        if candidate not in candidates:
-            candidates.append(candidate)
-    last_error: Exception | None = None
-    for candidate in candidates or [addr]:
-        try:
-            d = u2.connect(candidate)
-            _ = d.info
-            return d
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"Unable to connect to device {addr}") from last_error
+    return connect_exact(addr)
 
 
 def check_connection(addr: str = DEFAULT_ADDR) -> bool:
