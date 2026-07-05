@@ -50,16 +50,85 @@
         </div>
       </el-card>
 
+      <el-card class="debug-card">
+        <div class="section-header">
+          <span>一次性准备流程</span>
+          <span class="muted">{{ debugResult ? debugResult.message : '等待执行' }}</span>
+        </div>
+        <div class="debug-actions">
+          <el-button
+            type="primary"
+            :loading="debugLoading === 'prepare'"
+            :disabled="Boolean(debugLoading) || actionLoading || normalizedStatus === 'running'"
+            @click="handlePrepareRun"
+          >
+            执行一次性准备流程
+          </el-button>
+        </div>
+        <div v-if="debugResult" class="debug-result">
+          <el-tag :type="debugResult.success ? 'success' : 'danger'">
+            {{ debugResult.success ? '通过' : '未通过' }}
+          </el-tag>
+          <span>{{ debugResult.message }}</span>
+          <el-image
+            v-if="debugResult.screenshot_url"
+            :src="debugResult.screenshot_url"
+            :preview-src-list="[debugResult.screenshot_url]"
+            fit="cover"
+            class="debug-shot"
+          />
+        </div>
+        <pre v-if="debugResult" class="debug-json">{{ formatDebug(debugResult.data) }}</pre>
+      </el-card>
+
+      <el-card class="debug-card">
+        <div class="section-header">
+          <span>20集阶段测试</span>
+          <span class="muted">自动准备目标剧集后，检查自动跳集、广告、评论命中集数</span>
+        </div>
+        <div class="stage-actions">
+          <el-button
+            v-for="stage in stageRuns"
+            :key="stage.start"
+            size="small"
+            :type="stageActive(stage) ? 'primary' : 'default'"
+            :loading="stageLoading === stage.start"
+            :disabled="Boolean(stageLoading) || actionLoading || normalizedStatus === 'running'"
+            @click="handleStageRun(stage)"
+          >
+            第{{ stage.start }}-{{ stage.end }}集
+          </el-button>
+        </div>
+      </el-card>
+
       <el-card class="process-card">
         <div class="process-header">
           <span>执行过程</span>
-          <span class="muted">{{ latestLogTime }}</span>
+          <span class="muted">{{ liveSummary }}</span>
         </div>
         <div v-if="latestLog" class="latest-log" :class="'level-' + latestLog.level">
           <el-tag :type="latestLog.level === 'error' ? 'danger' : latestLog.level === 'warn' ? 'warning' : 'success'">
             {{ latestLog.level }}
           </el-tag>
           <span>{{ latestLog.message }}</span>
+          <span class="log-time">{{ latestLogTime }}</span>
+        </div>
+        <div v-if="executionSteps.length" class="process-list">
+          <div
+            v-for="item in executionSteps"
+            :key="item.id"
+            class="process-item"
+            :class="'level-' + item.level"
+          >
+            <el-tag
+              size="small"
+              :type="item.level === 'error' ? 'danger' : item.level === 'warn' ? 'warning' : 'success'"
+            >
+              {{ item.level }}
+            </el-tag>
+            <span class="process-message">{{ item.message }}</span>
+            <span class="process-time">{{ formatTime(item.created_at) }}</span>
+          </div>
         </div>
         <el-empty v-else description="暂无执行日志" />
       </el-card>
@@ -131,7 +200,7 @@ import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { getTask, startTask, pauseTask, resumeTask, stopTask, getRecords, getLogs } from '../api/hongguo'
+import { getTask, startTask, pauseTask, resumeTask, stopTask, getRecords, getLogs, runPrepareTask, runStageTask } from '../api/hongguo'
 
 const route = useRoute()
 const router = useRouter()
@@ -140,7 +209,18 @@ const records = ref([])
 const logs = ref([])
 const loading = ref(false)
 const actionLoading = ref(false)
+const debugLoading = ref('')
+const debugResult = ref(null)
+const stageLoading = ref(0)
 const refreshTimer = ref(null)
+const stageRuns = computed(() => {
+  const total = Math.max(Number(task.value?.total_episodes || 0), 144)
+  const stages = []
+  for (let start = 1; start <= total; start += 20) {
+    stages.push({ start, end: Math.min(start + 19, total) })
+  }
+  return stages
+})
 
 const normalizedStatus = computed(() => {
   const status = task.value?.status
@@ -154,6 +234,14 @@ const canStop = computed(() => ['running', 'paused', 'waiting_login'].includes(n
 const autoRefreshing = computed(() => ['running', 'paused', 'waiting_login'].includes(normalizedStatus.value))
 const latestLog = computed(() => logs.value[0] || null)
 const latestLogTime = computed(() => latestLog.value ? formatTime(latestLog.value.created_at) : '-')
+const executionSteps = computed(() => logs.value.slice(0, 12))
+const liveSummary = computed(() => {
+  const status = statusText(normalizedStatus.value)
+  const current = Number(task.value?.current_episode || 0)
+  const total = Number(task.value?.total_episodes || 0)
+  const episode = total ? `第 ${current}/${total} 集` : `第 ${current || 0} 集`
+  return `${status} | ${episode} | ${autoRefreshing.value ? '2秒自动刷新' : '手动刷新'}`
+})
 const displayCreatedAt = computed(() => task.value?.created_at || '')
 const displayStartedAt = computed(() => task.value?.started_at || '')
 const displayCompletedAt = computed(() => task.value?.completed_at || '')
@@ -190,7 +278,7 @@ async function loadData() {
   try {
     const id = route.params.id
     task.value = await getTask(id)
-    const recordsRes = await getRecords(id).catch(() => ({ items: [] }))
+    const recordsRes = await getRecords(id, { limit: 100 }).catch(() => ({ items: [] }))
     records.value = (Array.isArray(recordsRes) ? recordsRes : (recordsRes.items || recordsRes.data || []))
       .slice()
       .sort((a, b) => {
@@ -199,7 +287,7 @@ async function loadData() {
         if (timeA !== timeB) return timeB - timeA
         return Number(b.id || 0) - Number(a.id || 0)
       })
-    const logsRes = await getLogs(id).catch(() => ({ items: [] }))
+    const logsRes = await getLogs(id, { limit: 200 }).catch(() => ({ items: [] }))
     logs.value = Array.isArray(logsRes) ? logsRes : (logsRes.items || logsRes.data || [])
   } finally {
     loading.value = false
@@ -212,6 +300,7 @@ async function runAction(action, successText) {
     await action(route.params.id)
     ElMessage.success(successText)
     await loadData()
+    syncRefreshTimer()
   } finally {
     actionLoading.value = false
   }
@@ -221,6 +310,47 @@ const handleStart = () => runAction(startTask, '任务已启动')
 const handlePause = () => runAction(pauseTask, '任务已暂停')
 const handleResume = () => runAction(resumeTask, '任务已恢复')
 const handleStop = () => runAction(stopTask, '任务已停止')
+
+async function handlePrepareRun() {
+  debugLoading.value = 'prepare'
+  try {
+    debugResult.value = await runPrepareTask(route.params.id)
+    if (debugResult.value?.success) {
+      ElMessage.success(debugResult.value.message || '一次性准备流程完成')
+    } else {
+      ElMessage.warning(debugResult.value?.message || '一次性准备流程未通过')
+    }
+    await loadData()
+    syncRefreshTimer()
+  } finally {
+    debugLoading.value = ''
+  }
+}
+
+async function handleStageRun(stage) {
+  stageLoading.value = stage.start
+  try {
+    const result = await runStageTask(route.params.id, {
+      start_episode: stage.start,
+      end_episode: stage.end,
+    })
+    ElMessage.success(result.message || `阶段测试已启动: 第${stage.start}-${stage.end}集`)
+    await loadData()
+    syncRefreshTimer()
+  } finally {
+    stageLoading.value = 0
+  }
+}
+
+function stageActive(stage) {
+  const current = Number(task.value?.current_episode || 0)
+  return current >= stage.start && current <= stage.end
+}
+
+function formatDebug(value) {
+  if (!value || Object.keys(value).length === 0) return '{}'
+  return JSON.stringify(value, null, 2)
+}
 
 function calcProgress(t) {
   if (typeof t.progress_percent === 'number') return Math.round(t.progress_percent)
@@ -352,6 +482,47 @@ onUnmounted(() => {
 .process-card {
   margin-top: 18px;
 }
+.debug-card {
+  margin-top: 18px;
+}
+.debug-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.stage-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 8px;
+}
+.debug-result {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+.debug-shot {
+  width: 96px;
+  height: 64px;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: zoom-in;
+}
+.debug-json {
+  margin: 12px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .section-header {
   display: flex;
   align-items: center;
@@ -388,6 +559,39 @@ onUnmounted(() => {
 .latest-log span:last-child {
   line-height: 1.5;
 }
+.log-time {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.process-list {
+  margin-top: 12px;
+  display: grid;
+  gap: 8px;
+}
+.process-item {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr) 150px;
+  gap: 10px;
+  align-items: center;
+  min-height: 34px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+.process-message {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.process-time {
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: right;
+}
 .level-error {
   border-color: #f56c6c;
 }
@@ -401,6 +605,13 @@ onUnmounted(() => {
 @media (max-width: 1100px) {
   .detail-grid {
     grid-template-columns: 1fr;
+  }
+  .process-item {
+    grid-template-columns: 64px minmax(0, 1fr);
+  }
+  .process-time {
+    grid-column: 2;
+    text-align: left;
   }
 }
 </style>

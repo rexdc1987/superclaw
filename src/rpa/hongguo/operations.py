@@ -13,8 +13,36 @@ from .device import screenshot
 
 
 APP_PACKAGE = "com.phoenix.read"
+SHORT_SERIES_ACTIVITY = "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity"
 COMMENT_BUTTON_ID = "com.phoenix.read:id/cdi"
 PLAYBACK_SPEED_OPTIONS = ("0.75x", "1.0x", "1.25x", "1.5x", "2.0x", "3.0x")
+AD_CONTINUE_PROMPT_MARKERS = (
+    "上滑继续观看短剧",
+    "上滑继续看短剧",
+    "上滑继续观看",
+    "上滑继续看",
+    "滑动继续观看短剧",
+    "滑动继续看短剧",
+    "滑动继续观看",
+    "滑动继续看",
+)
+AD_PAGE_MARKERS = (
+    "广告",
+    "免费演示",
+    "点击进入直播间",
+    "直播中",
+    "讲解中",
+    "优选服务",
+    "Kuaizi",
+    "筷子科技",
+    "降低剪辑成本",
+    "短视频商家",
+    "官方正规接口",
+    "私域",
+    "矩阵账号",
+    "高效管理",
+)
+AD_SWIPE_CONTEXT_MARKERS = ("上滑", "滑动", "继续观看", "继续看", "短剧")
 TAG_KEYWORDS = {
     "玄幻",
     "传统",
@@ -52,6 +80,15 @@ class HongguoOperations:
                     self._close_popups()
                     return True
             return self._is_app_foreground()
+        except Exception:
+            return False
+
+    def bring_to_foreground(self) -> bool:
+        try:
+            self._start_app()
+            time.sleep(1.5)
+            self._close_popups()
+            return self._is_app_foreground() or self._wait_app_ready(5)
         except Exception:
             return False
 
@@ -179,56 +216,169 @@ class HongguoOperations:
 
     def search_drama(self, keyword: str) -> Dict[str, Any]:
         try:
-            self._close_popups()
-            current_title = self._current_playing_title()
-            if current_title and keyword in current_title:
-                return {"success": True, "titles": [current_title], "message": "已在目标短剧页面"}
-            self._open_theater()
-            if not self._open_search():
-                return {"success": False, "titles": [], "message": "未找到搜索入口"}
-            self._sleep(1.5, 2.5)
-            inp = self.d(className="android.widget.EditText")
-            if self._exists(inp, 3):
-                inp.click()
-                time.sleep(0.5)
-                self._clear_input(inp)
-                self._type_text(keyword)
-            else:
-                self.d.send_keys(keyword)
-            self._sleep(0.8, 1.5)
-            search_btn = self.d(text="搜索")
-            if self._exists(search_btn, 2):
-                search_btn.click()
-            else:
-                self.d.press("enter")
-            self._sleep(3, 5)
-            titles = self._extract_drama_titles()
+            opened = self.open_search_page(keyword)
+            if not opened.get("success"):
+                return {"success": False, "keyword": keyword, "titles": [], **opened}
+            if opened.get("already_on_target"):
+                return {
+                    "success": True,
+                    "keyword": keyword,
+                    "titles": opened.get("titles") or [],
+                    "message": opened.get("message") or "已在目标短剧页面",
+                }
+            input_result = self.input_search_keyword(keyword)
+            if not input_result.get("success"):
+                return {
+                    "success": False,
+                    "keyword": keyword,
+                    "titles": [],
+                    "input_text": input_result.get("input_text") or "",
+                    "message": input_result.get("message") or "搜索框关键词不一致",
+                }
+            submit_result = self.submit_search(keyword)
             return {
-                "success": bool(titles),
+                "success": bool(submit_result.get("success")),
                 "keyword": keyword,
-                "titles": titles,
-                "message": "搜索完成" if titles else "未找到有效短剧标题",
+                "input_text": input_result.get("input_text") or "",
+                "submit": submit_result.get("submit") or {},
+                "titles": submit_result.get("titles") or [],
+                "message": submit_result.get("message") or "搜索完成",
             }
         except Exception as exc:
             return {"success": False, "keyword": keyword, "titles": [], "message": str(exc)}
 
-    def select_drama(self, title: str) -> Dict[str, Any]:
+    def open_search_page(self, keyword: str = "") -> Dict[str, Any]:
         try:
+            self._close_popups()
+            if not self._is_app_foreground():
+                return {"success": False, "keyword": keyword, "titles": [], "message": "红果不在前台，取消搜索"}
             current_title = self._current_playing_title()
-            if current_title and (not title or title in current_title or current_title in title):
+            if current_title and keyword and keyword in current_title:
+                return {
+                    "success": True,
+                    "already_on_target": True,
+                    "titles": [current_title],
+                    "message": "已在目标短剧页面",
+                }
+            self._open_theater()
+            if not self._open_search():
+                return {"success": False, "keyword": keyword, "titles": [], "message": "未找到搜索入口"}
+            self._sleep(1.5, 2.5)
+            return {
+                "success": True,
+                "keyword": keyword,
+                "input_visible": self._exists(self.d(className="android.widget.EditText"), 1),
+                "message": "已进入搜索框",
+            }
+        except Exception as exc:
+            return {"success": False, "keyword": keyword, "titles": [], "message": str(exc)}
+
+    def input_search_keyword(self, keyword: str) -> Dict[str, Any]:
+        try:
+            input_text = ""
+            inp = self.d(className="android.widget.EditText")
+            if self._exists(inp, 3):
+                input_result = self._set_input_text(inp, keyword)
+                input_text = str(input_result.get("actual_text") or "")
+                if not input_result.get("success"):
+                    return {
+                        "success": False,
+                        "keyword": keyword,
+                        "input_text": input_text,
+                        "message": f"搜索框关键词不一致: 期望 {keyword}，实际 {input_text or '空'}",
+                    }
+            else:
+                self._type_text(keyword)
+                input_text = keyword
+            self._sleep(0.8, 1.5)
+            return {"success": True, "keyword": keyword, "input_text": input_text, "message": "关键词已填入"}
+        except Exception as exc:
+            return {"success": False, "keyword": keyword, "input_text": "", "message": str(exc)}
+
+    def submit_search(self, keyword: str) -> Dict[str, Any]:
+        try:
+            submit = self._submit_search(keyword)
+            if not submit.get("success"):
+                return {
+                    "success": False,
+                    "keyword": keyword,
+                    "titles": [],
+                    "submit": submit,
+                    "message": submit.get("message") or "搜索未进入结果页",
+                }
+            titles = self._extract_drama_titles()
+            message = submit.get("message") or "搜索完成"
+            if not submit.get("candidate_visible"):
+                message = "搜索完成" if titles else "未找到有效短剧标题"
+            return {
+                "success": bool(titles),
+                "keyword": keyword,
+                "submit": submit,
+                "titles": titles,
+                "message": message,
+            }
+        except Exception as exc:
+            return {"success": False, "keyword": keyword, "titles": [], "message": str(exc)}
+
+    def find_drama(self, keyword: str) -> Dict[str, Any]:
+        search = self.search_drama(keyword)
+        titles = search.get("titles") or []
+        if not search.get("success"):
+            return {
+                "success": False,
+                "keyword": keyword,
+                "titles": titles,
+                "search": search,
+                "message": search.get("message") or "搜索短剧失败",
+            }
+
+        selected_title = self._choose_title(keyword, titles)
+        if not selected_title:
+            return {
+                "success": False,
+                "keyword": keyword,
+                "titles": titles,
+                "search": search,
+                "message": "没有匹配任务短剧名称的搜索结果",
+            }
+
+        selected = self.select_drama(selected_title, keyword=keyword)
+        success = bool(selected.get("success") and selected.get("playable"))
+        if success:
+            message = selected.get("message") or "已进入短剧详情"
+        elif selected.get("message"):
+            message = selected.get("message")
+        elif selected.get("success") and not selected.get("playable"):
+            message = "短剧不可播放: 未看到播放入口"
+        else:
+            message = "选择短剧失败"
+        return {
+            "success": success,
+            "keyword": keyword,
+            "titles": titles,
+            "search": search,
+            "selected_title": selected_title,
+            "selected": selected,
+            "drama_title": selected.get("drama_title") or selected_title,
+            "playable": bool(selected.get("playable")),
+            "message": message,
+        }
+
+    def select_drama(self, title: str, keyword: str = "") -> Dict[str, Any]:
+        try:
+            if not self._is_app_foreground():
+                return {"success": False, "drama_title": title, "playable": False, "message": "红果不在前台，取消选择短剧"}
+            current_title = self._current_playing_title()
+            expected = keyword or title
+            if current_title and self._title_matches(expected, current_title):
                 return {"success": True, "drama_title": current_title, "playable": True}
+            detail_title = self._extract_detail_title(expected)
+            if detail_title and self._title_matches(expected, detail_title) and self._detail_markers_visible():
+                return self._drama_detail_result(detail_title, expected)
             clicked = False
             if title:
-                if self._click_first_search_suggestion():
-                    clicked = True
-                    if "SearchActivity" in self.d.app_current().get("activity", ""):
-                        self.d.click(int(self.width * 0.25), int(self.height * 0.38))
-                        time.sleep(3)
-                card_title = self.d(resourceId="com.phoenix.read:id/title", textContains=title.strip("《》 "))
-                if not clicked and self._exists(card_title, 2):
-                    card_title.click()
-                    clicked = True
-                for selector in (self.d(text=title), self.d(textContains=title[:8])):
+                clicked = self._click_matching_title(title, expected)
+                for selector in (self.d(text=title), self.d(textContains=title)):
                     if clicked:
                         break
                     if self._exists(selector, 2):
@@ -236,17 +386,45 @@ class HongguoOperations:
                         clicked = True
                         break
             if not clicked:
-                self.d.click(int(self.width * 0.28), int(self.height * 0.38))
+                return {"success": False, "drama_title": title, "playable": False, "message": f"未找到可点击的匹配短剧: {title}"}
             self._sleep(3, 5)
-            drama_title = self._extract_detail_title() or title
-            xml = self._xml()
-            playable = any(
-                text in xml
-                for text in ["观看", "播放", "看全集", "立即观看", "开始播放", "全屏观看", "合集", "第1集"]
-            )
-            return {"success": True, "drama_title": drama_title, "playable": playable}
+            if not self._is_app_foreground():
+                return {"success": False, "drama_title": title, "playable": False, "message": "选择后离开红果 App，已取消"}
+            drama_title = self._extract_detail_title(expected) or title
+            if expected and not self._title_matches(expected, drama_title):
+                return {
+                    "success": False,
+                    "drama_title": drama_title,
+                    "playable": False,
+                    "message": f"进入的短剧不匹配: 期望 {expected}，实际 {drama_title}",
+                }
+            return self._drama_detail_result(drama_title, expected)
         except Exception as exc:
             return {"success": False, "drama_title": title, "playable": False, "message": str(exc)}
+
+    def _drama_detail_result(self, drama_title: str, expected: str = "") -> Dict[str, Any]:
+        xml = " ".join(self._hongguo_nodes(self._xml()))
+        playable = any(
+            text in xml
+            for text in ["观看", "播放", "看全集", "立即观看", "开始播放", "全屏观看", "合集", "选集"]
+        )
+        if not playable and re.search(r"第\d+集", xml) and re.search(r"全\d+集", xml):
+            playable = True
+        if not playable and drama_title and re.search(r"第\d+集", xml):
+            current = self._safe_app_current()
+            playable = current.get("activity") == SHORT_SERIES_ACTIVITY
+        detail_visible = bool(drama_title and re.search(r"全\d+集", xml))
+        return {
+            "success": bool(playable or detail_visible),
+            "drama_title": drama_title,
+            "playable": playable,
+            "detail_visible": detail_visible,
+            "message": "已进入短剧详情" if (playable or detail_visible) else "短剧不可播放",
+        }
+
+    def _detail_markers_visible(self) -> bool:
+        xml = " ".join(self._hongguo_nodes(self._xml()))
+        return bool(re.search(r"全\d+集|第\d+集", xml) or any(marker in xml for marker in ("剧情简介", "剧评", "选集")))
 
     def play_episode(self, episode_number: int) -> bool:
         try:
@@ -394,7 +572,42 @@ class HongguoOperations:
         self.d.click(int(self.width * 0.5), int(self.height * 0.5))
         time.sleep(0.6)
 
+    def is_playback_paused(self) -> bool:
+        if not self._short_series_activity_active():
+            return False
+        return self._center_play_overlay_visible()
+
+    def pause_playback_if_playing(self) -> bool:
+        if not self._short_series_activity_active():
+            return False
+        if self.is_playback_paused():
+            return True
+        self.d.click(int(self.width * 0.5), int(self.height * 0.42))
+        time.sleep(0.8)
+        return self.is_playback_paused()
+
+    def resume_playback_safely(self) -> bool:
+        if not self._short_series_activity_active():
+            return False
+        if self.skip_ad_if_present():
+            return True
+        try:
+            self.d.shell("input keyevent 126")
+            time.sleep(1)
+        except Exception:
+            pass
+        if self._center_play_overlay_visible():
+            try:
+                self.d.click(int(self.width * 0.5), int(self.height * 0.42))
+                time.sleep(1)
+                return True
+            except Exception:
+                return False
+        return True
+
     def resume_playback_if_paused(self, allow_center_fallback: bool = False) -> bool:
+        if self.skip_ad_if_present():
+            return True
         if not self._playback_visible():
             return False
         for selector in (
@@ -407,13 +620,51 @@ class HongguoOperations:
                 try:
                     selector.click()
                     time.sleep(1)
-                    return True
+                    return not self.is_playback_paused()
                 except Exception:
                     continue
-        if allow_center_fallback:
-            self.d.click(int(self.width * 0.5), int(self.height * 0.44))
+        if self._click_play_overlay():
             time.sleep(1)
-            return True
+            return not self.is_playback_paused()
+        if allow_center_fallback:
+            self.d.click(int(self.width * 0.5), int(self.height * 0.42))
+            time.sleep(1)
+            return not self.is_playback_paused()
+        return False
+
+    def _click_play_overlay(self) -> bool:
+        xml = self._xml()
+        overlay_bounds: List[tuple[int, int, int, int]] = []
+        for node in self._hongguo_nodes(xml):
+            if 'clickable="true"' not in node:
+                continue
+            bounds_match = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+            if not bounds_match:
+                continue
+            left, top, right, bottom = (int(value) for value in bounds_match.groups())
+            width = right - left
+            height = bottom - top
+            center_x = (left + right) // 2
+            center_y = (top + bottom) // 2
+            if width < 40 or height < 40:
+                continue
+            if abs(center_x - self.width // 2) <= self.width * 0.18 and self.height * 0.28 <= center_y <= self.height * 0.58:
+                overlay_bounds.append((left, top, right, bottom))
+        if not overlay_bounds:
+            return False
+        overlay_bounds.sort(key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))
+        left, top, right, bottom = overlay_bounds[0]
+        self.d.click((left + right) // 2, (top + bottom) // 2)
+        return True
+
+    def skip_ad_if_present(self, attempts: int = 2) -> bool:
+        if not self._ad_continue_visible():
+            return False
+        for _ in range(max(1, attempts)):
+            self._swipe_up_continue_ad()
+            time.sleep(1.2)
+            if not self._ad_continue_visible():
+                return True
         return False
 
     def _normalize_speed_label(self, value: Optional[str]) -> Optional[str]:
@@ -438,6 +689,9 @@ class HongguoOperations:
         return aliases.get(text)
 
     def get_current_episode(self) -> int:
+        if not self._is_app_foreground():
+            return 0
+
         xml = self._xml()
         if not xml:
             return 0
@@ -473,11 +727,14 @@ class HongguoOperations:
         for episode in numbers:
             if self._is_episode_active(episode, xml):
                 return episode
-        if len(numbers) == 1:
+        if len(numbers) == 1 and self._episode_number_context_visible(xml):
             return numbers[0]
         return 0
 
     def get_total_episodes(self) -> int:
+        if not self._is_app_foreground():
+            return 0
+
         xml = self._xml()
         if not xml:
             return 0
@@ -499,20 +756,105 @@ class HongguoOperations:
         xml = xml or self._xml()
         if not xml:
             return False
+        if self._ad_continue_visible(xml):
+            return True
         if COMMENT_BUTTON_ID in xml:
+            return True
+        if self._short_series_activity_active():
             return True
         markers = (
             "\u5168\u5c4f\u89c2\u770b",
             "\u9009\u96c6",
             "\u5408\u96c6",
             "\u500d\u901f",
-            "\u8bc4\u8bba",
             "\u6709\u8da3\u8bc4\u8bba",
             "\u8bf4\u70b9\u4ec0\u4e48",
         )
         if any(marker in xml for marker in markers):
             return True
-        return bool(re.search(r"\u7b2c\s*\d{1,4}\s*\u96c6", xml))
+        return self._center_play_overlay_visible(xml)
+
+    def _episode_number_context_visible(self, xml: Optional[str] = None) -> bool:
+        xml = xml or self._xml()
+        if not xml:
+            return False
+        if COMMENT_BUTTON_ID in xml:
+            return True
+        if self._short_series_activity_active():
+            return True
+        markers = (
+            "\u5168\u5c4f\u89c2\u770b",
+            "\u9009\u96c6",
+            "\u5408\u96c6",
+            "\u500d\u901f",
+            "\u6709\u8da3\u8bc4\u8bba",
+            "\u8bf4\u70b9\u4ec0\u4e48",
+        )
+        return any(marker in xml for marker in markers)
+
+    def _center_play_overlay_visible(self, xml: Optional[str] = None) -> bool:
+        xml = xml or self._xml()
+        candidate_bounds: List[tuple[int, int, int, int]] = []
+        for node in self._hongguo_nodes(xml):
+            if 'clickable="true"' not in node:
+                continue
+            bounds_match = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+            if not bounds_match:
+                continue
+            left, top, right, bottom = (int(value) for value in bounds_match.groups())
+            width = right - left
+            height = bottom - top
+            center_x = (left + right) // 2
+            center_y = (top + bottom) // 2
+            if width < 40 or height < 40:
+                continue
+            if abs(center_x - self.width // 2) <= self.width * 0.18 and self.height * 0.28 <= center_y <= self.height * 0.58:
+                candidate_bounds.append((left, top, right, bottom))
+        if not candidate_bounds:
+            return False
+        candidate_bounds.sort(key=lambda item: abs(((item[0] + item[2]) // 2) - self.width // 2))
+        return self._center_play_icon_visible_by_screenshot(candidate_bounds[0])
+
+    def _center_play_icon_visible_by_screenshot(self, bounds: tuple[int, int, int, int]) -> bool:
+        try:
+            image = self.d.screenshot().convert("RGB")
+        except Exception:
+            return False
+        left, top, right, bottom = bounds
+        pad_x = max(8, int((right - left) * 0.15))
+        pad_y = max(8, int((bottom - top) * 0.15))
+        crop = image.crop(
+            (
+                max(0, left - pad_x),
+                max(0, top - pad_y),
+                min(self.width, right + pad_x),
+                min(self.height, bottom + pad_y),
+            )
+        )
+        white_pixels = 0
+        for red, green, blue in crop.getdata():
+            if red >= 235 and green >= 235 and blue >= 235:
+                white_pixels += 1
+        return white_pixels >= 900
+
+    def _ad_continue_visible(self, xml: Optional[str] = None) -> bool:
+        text = html.unescape(xml or self._xml())
+        normal_episode_visible = bool(
+            re.search(r"\u7b2c\s*\d{1,4}\s*\u96c6", text)
+            or COMMENT_BUTTON_ID in text
+            or "选集" in text
+            or "倍速" in text
+            or "说点什么" in text
+        )
+        if normal_episode_visible:
+            return False
+        if any(marker in text for marker in AD_CONTINUE_PROMPT_MARKERS):
+            return True
+        if self._short_series_activity_active() and any(marker in text for marker in AD_PAGE_MARKERS):
+            return True
+        has_swipe_hint = any(marker in text for marker in ("上滑", "滑动"))
+        has_continue_hint = any(marker in text for marker in ("继续观看", "继续看"))
+        return has_swipe_hint and has_continue_hint and "短剧" in text
 
     def _is_episode_active(self, episode_number: int, xml: Optional[str] = None) -> bool:
         if episode_number <= 0:
@@ -566,6 +908,8 @@ class HongguoOperations:
 
     def exit_fullscreen(self) -> bool:
         exited = False
+        if not self._short_series_activity_active():
+            return exited
         for _ in range(2):
             if self.d(resourceId=COMMENT_BUTTON_ID).exists(timeout=2):
                 return exited
@@ -622,11 +966,14 @@ class HongguoOperations:
             if not self._open_comment_panel(2):
                 return {"verified": False, "screenshot_path": "", "message": "未找到评论按钮"}
             self._sleep(2, 3)
-            if screenshot_dir:
-                screenshot_path = self.take_screenshot(f"ep{episode_number or 'x'}_comment_panel", screenshot_dir)
             search_key = content[:8] if len(content) > 8 else content
             for _ in range(3):
                 if self._exists(self.d(textContains=search_key), 2) or search_key in self._xml():
+                    if screenshot_dir:
+                        screenshot_path = self.take_screenshot(
+                            f"ep{episode_number or 'x'}_comment_list_verified",
+                            screenshot_dir,
+                        )
                     return {"verified": True, "screenshot_path": screenshot_path}
                 self._swipe_up(0.45)
                 time.sleep(1.5)
@@ -816,7 +1163,8 @@ class HongguoOperations:
             try:
                 current = self.d.app_current()
                 xml = self._xml()
-                if current.get("package") == APP_PACKAGE and any(text in xml for text in ready_markers):
+                app_visible = self._first_visible_package(xml) == APP_PACKAGE or self._has_large_hongguo_window(xml)
+                if current.get("package") == APP_PACKAGE and app_visible and any(text in xml for text in ready_markers):
                     return True
             except Exception:
                 pass
@@ -826,9 +1174,95 @@ class HongguoOperations:
     def _is_app_foreground(self) -> bool:
         try:
             current = self.d.app_current()
-            return current.get("package") == APP_PACKAGE
+            if current.get("package") != APP_PACKAGE:
+                return False
+            xml = self._xml()
+            first_package = self._first_visible_package(xml)
+            if first_package == APP_PACKAGE:
+                return True
+            if self._has_large_hongguo_window(xml):
+                return True
+            if first_package and first_package != APP_PACKAGE:
+                return False
+            return self._has_hongguo_business_nodes(xml) and self._hongguo_visible_area_ratio(xml) >= 0.2
         except Exception:
             return False
+
+    def _safe_app_current(self) -> Dict[str, Any]:
+        try:
+            return self.d.app_current() or {}
+        except Exception:
+            return {}
+
+    def _short_series_activity_active(self) -> bool:
+        current = self._safe_app_current()
+        return current.get("package") == APP_PACKAGE and current.get("activity") == SHORT_SERIES_ACTIVITY
+
+    def _first_visible_package(self, xml: str) -> str:
+        for node in re.findall(r"<node\b[^>]+>", xml or ""):
+            if 'visible-to-user="false"' in node:
+                continue
+            package_match = re.search(r'package="([^"]+)"', node)
+            if package_match:
+                return package_match.group(1)
+        return ""
+
+    def _node_bounds(self, node: str) -> Optional[tuple[int, int, int, int]]:
+        match = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+        if not match:
+            return None
+        left, top, right, bottom = (int(value) for value in match.groups())
+        if right <= left or bottom <= top:
+            return None
+        return left, top, right, bottom
+
+    def _has_large_hongguo_window(self, xml: str) -> bool:
+        screen_area = max(1, self.width * self.height)
+        for node in self._hongguo_nodes(xml):
+            bounds = self._node_bounds(node)
+            if not bounds:
+                continue
+            left, top, right, bottom = bounds
+            node_width = right - left
+            node_height = bottom - top
+            area_ratio = (node_width * node_height) / screen_area
+            if node_width >= self.width * 0.55 and node_height >= self.height * 0.25 and area_ratio >= 0.18:
+                return True
+            if left <= self.width * 0.08 and right >= self.width * 0.92 and node_height >= self.height * 0.45:
+                return True
+        return False
+
+    def _launcher_visible(self, xml: str) -> bool:
+        launcher_packages = ("app.lawnchair", "com.android.launcher", "com.android.launcher3")
+        screen_area = max(1, self.width * self.height)
+        for node in re.findall(r"<node\b[^>]+>", xml or ""):
+            package_match = re.search(r'package="([^"]+)"', node)
+            if not package_match or package_match.group(1) not in launcher_packages:
+                continue
+            bounds = self._node_bounds(node)
+            if not bounds:
+                continue
+            left, top, right, bottom = bounds
+            if ((right - left) * (bottom - top)) / screen_area >= 0.5:
+                return True
+        return False
+
+    def _hongguo_visible_area_ratio(self, xml: str) -> float:
+        max_area = 0
+        for node in self._hongguo_nodes(xml):
+            bounds = self._node_bounds(node)
+            if not bounds:
+                continue
+            left, top, right, bottom = bounds
+            max_area = max(max_area, (right - left) * (bottom - top))
+        return max_area / max(1, self.width * self.height)
+
+    def _has_hongguo_business_nodes(self, xml: str) -> bool:
+        nodes = self._hongguo_nodes(xml)
+        if len(nodes) < 3:
+            return False
+        text = " ".join(nodes)
+        return any(marker in text for marker in ("搜索", "选集", "全", "第", "播放", "热度", "剧评", "简介", "关注"))
 
     def _start_app(self) -> None:
         try:
@@ -911,30 +1345,83 @@ class HongguoOperations:
     def _click_episode_number(self, episode_number: int) -> bool:
         current_episode = self.get_current_episode()
         self._click_episode_range_tab(episode_number)
-        for _ in range(5):
+        for _ in range(8):
+            clipped_target_visible = False
             for els in (
                 self.d(text=str(episode_number)),
                 self.d(text=f"第{episode_number}集"),
                 self.d(textContains=f"第{episode_number}集"),
+                self.d(description=str(episode_number)),
+                self.d(description=f"第{episode_number}集"),
+                self.d(descriptionContains=f"第{episode_number}集"),
             ):
                 if self._exists(els, 1):
                     try:
                         count = els.count
                         for i in range(count):
                             info = els[i].info
-                            y = info.get("bounds", {}).get("top", 0)
-                            if y > self.height * 0.25:
+                            bounds = info.get("bounds", {}) or {}
+                            top = int(bounds.get("top", 0) or 0)
+                            bottom = int(bounds.get("bottom", 0) or 0)
+                            if bottom and bottom >= self.height * 0.94:
+                                clipped_target_visible = True
+                                continue
+                            if top > self.height * 0.12:
                                 els[i].click()
                                 return True
                     except Exception:
                         els.click()
                         return True
+            if clipped_target_visible:
+                self._swipe_up(0.25)
+                time.sleep(0.8)
+                continue
+            xml_click = self._click_episode_number_from_xml(episode_number)
+            if xml_click is True:
+                return True
+            if xml_click is False:
+                time.sleep(0.8)
+                continue
             if current_episode and current_episode > episode_number:
                 self._swipe_down(0.35)
             else:
                 self._swipe_up(0.35)
             time.sleep(1)
         return False
+
+    def _click_episode_number_from_xml(self, episode_number: int) -> Optional[bool]:
+        labels = {str(episode_number), f"第{episode_number}集"}
+        xml = self._xml()
+        candidates: List[tuple[int, int, int, int]] = []
+        clipped_candidates: List[tuple[int, int, int, int]] = []
+        for node in self._hongguo_nodes(xml):
+            node_labels = [
+                html.unescape(value).strip()
+                for value in re.findall(r'(?:text|content-desc)="([^"]*)"', node)
+            ]
+            if not node_labels:
+                continue
+            if not any(label in labels for label in node_labels):
+                continue
+            bounds = self._node_bounds(node)
+            if not bounds:
+                continue
+            left, top, right, bottom = bounds
+            if bottom <= self.height * 0.12:
+                continue
+            if bottom >= self.height * 0.94:
+                clipped_candidates.append((left, top, right, bottom))
+                continue
+            candidates.append((left, top, right, bottom))
+        if not candidates and clipped_candidates:
+            self._swipe_up(0.25)
+            return False
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[1], item[0]))
+        left, top, right, bottom = candidates[0]
+        self.d.click((left + right) // 2, (top + bottom) // 2)
+        return True
 
     def _episode_range_label(self, episode_number: int, page_size: int = 30) -> Optional[str]:
         if episode_number <= 0 or page_size <= 0:
@@ -970,13 +1457,14 @@ class HongguoOperations:
             return True
         return False
 
-    def _extract_episode_numbers(self, xml: str) -> List[int]:
+    def _extract_episode_numbers(self, xml: str, include_totals: bool = False) -> List[int]:
         numbers: List[int] = []
         seen: set[int] = set()
-        for pattern in (
-            r"\u7b2c\s*(\d{1,4})\s*\u96c6",
-            r"(?:\u5168|\u66f4\u65b0\u81f3|\u5df2\u66f4\u65b0\u81f3)\s*(\d{1,4})\s*\u96c6",
-        ):
+        patterns = [r"\u7b2c\s*(\d{1,4})\s*\u96c6"]
+        if include_totals:
+            patterns.append(r"(?:\u5168|\u66f4\u65b0\u81f3|\u5df2\u66f4\u65b0\u81f3)\s*(\d{1,4})\s*\u96c6")
+
+        for pattern in patterns:
             for value in re.findall(pattern, xml):
                 try:
                     episode = int(value)
@@ -989,38 +1477,194 @@ class HongguoOperations:
         return numbers
 
     def _extract_drama_titles(self) -> List[str]:
+        return self._extract_drama_titles_from_xml(self._xml())
+
+    def _extract_drama_titles_from_xml(self, xml: str) -> List[str]:
         titles = []
         seen = set()
-        xml = self._xml()
-        for text in re.findall(r'resource-id="com\.phoenix\.read:id/title"[^>]*text="([^"]+)"', xml):
+        hongguo_nodes = self._hongguo_nodes(xml)
+        for node in hongguo_nodes:
+            if 'resource-id="com.phoenix.read:id/title"' not in node:
+                continue
+            text_match = re.search(r'text="([^"]+)"', node)
+            if not text_match:
+                continue
+            text = html.unescape(text_match.group(1)).strip()
             if self._is_title_candidate(text) and text not in seen:
                 titles.append(text)
                 seen.add(text)
-        for text in re.findall(r'text="([^"]{2,30})"', xml):
+        for node in hongguo_nodes:
+            text_match = re.search(r'text="([^"]{2,30})"', node)
+            if not text_match:
+                continue
+            text = html.unescape(text_match.group(1)).strip()
             if self._is_title_candidate(text) and text not in seen:
                 titles.append(text)
                 seen.add(text)
         return titles
 
-    def _extract_detail_title(self) -> str:
+    def _hongguo_nodes(self, xml: str) -> List[str]:
+        return [node for node in re.findall(r"<node\b[^>]+>", xml or "") if f'package="{APP_PACKAGE}"' in node]
+
+    def _click_matching_title(self, title: str, expected: str = "") -> bool:
+        target = str(title or "").strip("《》 ")
+        if not target:
+            return False
+        xml = self._xml()
+        matches: List[tuple[int, int, int, int, str]] = []
+        for node in re.findall(r"<node\b[^>]+>", xml):
+            if 'package="com.phoenix.read"' not in node:
+                continue
+            text_match = re.search(r'text="([^"]*)"', node)
+            bounds_match = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+            if not text_match or not bounds_match:
+                continue
+            node_text = html.unescape(text_match.group(1)).strip()
+            if not node_text:
+                continue
+            if node_text != target and target not in node_text and not self._title_matches(expected or target, node_text):
+                continue
+            left, top, right, bottom = (int(value) for value in bounds_match.groups())
+            if bottom <= self.height * 0.08:
+                continue
+            matches.append((left, top, right, bottom, node_text))
+        if not matches:
+            return False
+        expected_key = self._normalize_title_key(expected or target)
+        matches.sort(
+            key=lambda item: (
+                self._normalize_title_key(item[4]) != self._normalize_title_key(target),
+                not self._normalize_title_key(item[4]).startswith(expected_key),
+                item[1],
+            )
+        )
+        left, top, right, bottom, _ = matches[0]
+        x = max((left + right) // 2, int(self.width * 0.24))
+        y = (top + bottom) // 2
+        self.d.click(x, y)
+        return True
+
+    def _extract_detail_title(self, expected: str = "") -> str:
         xml = self._xml()
         current_title = self._current_playing_title()
         if current_title:
             return current_title
+        candidates: List[str] = []
+        seen = set()
+        node_text = " ".join(self._hongguo_nodes(xml))
         for pattern in [
             r'text="([^"]{4,25})"[^>]*bounds="\[24,\d+\]\[\d+,\d+\]"',
             r'text="([^"]{4,25})"',
         ]:
-            for candidate in re.findall(pattern, xml):
-                if self._is_title_candidate(candidate):
+            for candidate in re.findall(pattern, node_text):
+                candidate = html.unescape(candidate).strip()
+                if self._is_title_candidate(candidate) and candidate not in seen:
+                    candidates.append(candidate)
+                    seen.add(candidate)
+        if expected:
+            for candidate in candidates:
+                if self._title_matches(expected, candidate):
                     return candidate
+            return ""
+        return candidates[0] if candidates else ""
+
+    def _choose_title(self, keyword: str, titles: List[str]) -> str:
+        matches = [title for title in titles if self._title_matches(keyword, title)]
+        if not matches:
+            return ""
+        keyword_key = self._normalize_title_key(keyword)
+        extended = [
+            title
+            for title in matches
+            if self._normalize_title_key(title).startswith(keyword_key)
+            and self._normalize_title_key(title) != keyword_key
+            and self._looks_like_specific_title(title)
+        ]
+        if extended:
+            return max(extended, key=lambda value: len(self._normalize_title_key(value)))
+        for title in matches:
+            if self._normalize_title_key(title) == keyword_key:
+                return title
+        return matches[0]
+
+    def _looks_like_specific_title(self, title: str) -> bool:
+        text = str(title or "").strip()
+        if not self._is_title_candidate(text):
+            return False
+        if self._looks_like_non_drama_result(text):
+            return False
+        if re.fullmatch(r"[\d.]+分", text):
+            return False
+        if any(word in text for word in TAG_KEYWORDS) and len(text) <= 8:
+            return False
+        return len(self._normalize_title_key(text)) >= 4
+
+    def _choose_first_matching_title(self, keyword: str, titles: List[str]) -> str:
+        for title in titles:
+            if self._title_matches(keyword, title):
+                return title
         return ""
 
+    def _title_matches(self, keyword: str, title: str) -> bool:
+        if self._looks_like_non_drama_result(title):
+            return False
+        keyword_key = self._normalize_title_key(keyword)
+        title_key = self._normalize_title_key(title)
+        if not keyword_key or not title_key:
+            return False
+        if keyword_key == title_key:
+            return True
+        if title_key.startswith(keyword_key):
+            if keyword_key[-1:].isdigit() and title_key[len(keyword_key) : len(keyword_key) + 1].isdigit():
+                return False
+            return True
+        season = self._season_marker(keyword_key)
+        if season and self._season_marker(title_key) != season:
+            return False
+        if self._has_variant_marker(keyword_key) and not self._has_variant_marker(title_key):
+            return False
+        return title_key in keyword_key and len(title_key) >= 4
+
+    def _normalize_title_key(self, value: str) -> str:
+        return re.sub(r"[\s《》<>:：·,，。.!！?？\-_/\\]+", "", str(value or "").lower())
+
+    def _looks_like_non_drama_result(self, text: str) -> bool:
+        text = html.unescape(str(text or "")).strip()
+        if len(text) > 32:
+            return True
+        if "#" in text:
+            return True
+        non_drama_markers = (
+            "水墨山海",
+            "共庆半周年",
+            "官方正规接口",
+            "矩阵账号",
+            "免费演示",
+            "点击进入直播间",
+            "Kuaizi",
+            "筷子科技",
+            "视频神器",
+        )
+        return any(marker in text for marker in non_drama_markers)
+
+    def _season_marker(self, value: str) -> str:
+        match = re.search(r"第([一二三四五六七八九十\d]+)季", value)
+        return match.group(1) if match else ""
+
+    def _has_variant_marker(self, value: str) -> bool:
+        return bool(re.search(r"\d+|第[一二三四五六七八九十\d]+[季部篇]|[上下续前后]篇", value))
+
     def _is_title_candidate(self, text: str) -> bool:
-        text = text.strip()
+        text = html.unescape(str(text or "")).strip()
         if len(text) < 2:
             return False
         if re.fullmatch(r"\d{1,2}:\d{2}", text):
+            return False
+        if re.fullmatch(r"\d+(?:\.\d+)?分", text):
+            return False
+        if re.fullmatch(r"(?:全|共|更新至|已更新至)?\s*\d{1,4}\s*集", text):
+            return False
+        if re.fullmatch(r"\d+(?:\.\d+)?(?:万|亿)?(?:热度|播放|人在看|人气)?", text):
             return False
         if re.fullmatch(r"[\d\s:：/\\.-]+", text):
             return False
@@ -1086,13 +1730,180 @@ class HongguoOperations:
             except Exception:
                 pass
 
-    def _type_text(self, text: str) -> None:
+    def _set_input_text(self, inp: Any, text: str) -> Dict[str, Any]:
+        value = str(text or "")
         try:
-            self.d.clear_text()
+            inp.click()
         except Exception:
             pass
-        for char in text:
-            self.d.send_keys(char)
+        time.sleep(0.3)
+        for writer in ("set_text", "send_keys"):
+            try:
+                method = getattr(inp, writer)
+            except Exception:
+                method = None
+            if callable(method):
+                try:
+                    method(value)
+                    actual = self._read_input_text(inp)
+                    if self._input_text_matches(value, actual):
+                        return {"success": True, "actual_text": actual}
+                except TypeError:
+                    pass
+                except Exception:
+                    pass
+        self._clear_input(inp)
+        time.sleep(0.2)
+        self._type_text(value)
+        actual = self._read_input_text(inp)
+        return {"success": self._input_text_matches(value, actual), "actual_text": actual}
+
+    def _read_input_text(self, inp: Any) -> str:
+        candidates = [inp]
+        try:
+            candidates.insert(0, self.d(className="android.widget.EditText"))
+        except Exception:
+            pass
+        for candidate in candidates:
+            try:
+                info = getattr(candidate, "info", {}) or {}
+                text = str(info.get("text") or "").strip()
+                if text:
+                    return text
+            except Exception:
+                pass
+        xml = self._xml()
+        match = re.search(r'class="android\.widget\.EditText"[^>]*text="([^"]*)"', xml)
+        if match:
+            return html.unescape(match.group(1)).strip()
+        return ""
+
+    def _input_text_matches(self, expected: str, actual: str) -> bool:
+        if not expected:
+            return True
+        if not actual:
+            return False
+        return self._normalize_title_key(expected) == self._normalize_title_key(actual)
+
+    def _submit_search(self, keyword: str) -> Dict[str, Any]:
+        actions = []
+        for action_name, action in (
+            ("click_search_button", self._click_visible_search_button),
+            ("tap_search_button", lambda: self.d.click(int(self.width * 0.93), int(self.height * 0.083))),
+            ("press_enter", lambda: self.d.press("enter")),
+            ("keyevent_enter", lambda: self.d.shell("input keyevent 66")),
+            ("press_search", lambda: self.d.press("search")),
+            ("keyevent_search", lambda: self.d.shell("input keyevent 84")),
+            ("tap_search_icon", lambda: self.d.click(int(self.width * 0.9), int(self.height * 0.055))),
+        ):
+            try:
+                action()
+                actions.append(action_name)
+                result = self._wait_search_results_page(keyword)
+                if result.get("success"):
+                    result["action"] = action_name
+                    result["actions"] = actions
+                    return result
+                if result.get("app_foreground") is False:
+                    result["action"] = action_name
+                    result["actions"] = actions
+                    return result
+            except Exception:
+                pass
+        for action_name, selector in (
+            ("click_text_search", self.d(text="搜索")),
+            ("click_desc_search", self.d(descriptionContains="搜索")),
+            ("click_search_resource", self.d(resourceId="com.phoenix.read:id/hds")),
+        ):
+            if self._exists(selector, 1):
+                try:
+                    selector.click()
+                    actions.append(action_name)
+                    result = self._wait_search_results_page(keyword)
+                    if result.get("success"):
+                        result["action"] = action_name
+                        result["actions"] = actions
+                        return result
+                    if result.get("app_foreground") is False:
+                        result["action"] = action_name
+                        result["actions"] = actions
+                        return result
+                except Exception:
+                    pass
+        xml = self._xml()
+        candidate_visible = self._candidate_results_visible(keyword, xml)
+        return {
+            "success": candidate_visible,
+            "actions": actions,
+            "app_foreground": self._is_app_foreground(),
+            "tabs_visible": self._search_results_visible(xml),
+            "candidate_visible": candidate_visible,
+            "message": "已展示搜索候选结果，可直接进入目标剧集" if candidate_visible else "已填写关键词，但未进入搜索结果页",
+        }
+
+    def _wait_search_results_page(self, keyword: str, timeout: float = 6) -> Dict[str, Any]:
+        deadline = time.time() + timeout
+        last_xml = ""
+        while time.time() < deadline:
+            if not self._is_app_foreground():
+                return {"success": False, "app_foreground": False, "message": "提交搜索后离开红果 App"}
+            last_xml = self._xml()
+            if self._search_results_visible(last_xml):
+                return {"success": True, "app_foreground": True, "tabs_visible": True, "message": "已进入搜索结果页"}
+            time.sleep(0.5)
+        candidate_visible = self._candidate_results_visible(keyword, last_xml)
+        return {
+            "success": candidate_visible,
+            "app_foreground": self._is_app_foreground(),
+            "tabs_visible": self._search_results_visible(last_xml),
+            "candidate_visible": candidate_visible,
+            "message": "已展示搜索候选结果，可直接进入目标剧集" if candidate_visible else "提交搜索后未看到结果页 tabs",
+        }
+
+    def _search_results_visible(self, xml: str = "") -> bool:
+        text = " ".join(self._hongguo_nodes(xml or self._xml()))
+        tab_hits = sum(1 for marker in ("综合", "短剧", "影视", "用户") if marker in text)
+        return tab_hits >= 2 and any(marker in text for marker in ("搜索", "剧场", "播放", "热度", "全部"))
+
+    def _candidate_results_visible(self, keyword: str, xml: str = "") -> bool:
+        if not keyword:
+            return False
+        text = xml or self._xml()
+        if not self._is_app_foreground():
+            return False
+        return bool(self._choose_title(keyword, self._extract_drama_titles_from_xml(text)))
+
+    def _click_visible_search_button(self) -> None:
+        xml = self._xml()
+        for node in re.findall(r"<node\b[^>]+>", xml):
+            if 'package="com.phoenix.read"' not in node or 'text="搜索"' not in node:
+                continue
+            bounds_match = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+            if not bounds_match:
+                continue
+            left, top, right, bottom = (int(value) for value in bounds_match.groups())
+            if left < self.width * 0.65 or bottom > self.height * 0.18:
+                continue
+            self.d.click((left + right) // 2, (top + bottom) // 2)
+            return
+        raise RuntimeError("未找到右上角搜索按钮")
+
+    def _type_text(self, text: str) -> None:
+        value = str(text or "")
+        if not value:
+            return
+        try:
+            self.d.send_keys(value)
+            return
+        except TypeError:
+            pass
+        except Exception:
+            pass
+        for char in value:
+            try:
+                self.d.send_keys(char, clear=False)
+            except TypeError:
+                self.d.send_keys(char)
             time.sleep(random.uniform(0.02, 0.08))
 
     def _exists(self, el: Any, timeout: float = 3) -> bool:
@@ -1125,6 +1936,12 @@ class HongguoOperations:
         start_y = int(self.height * 0.65)
         end_y = max(50, int(start_y - self.height * distance))
         self.d.swipe(cx, start_y, cx + random.randint(-10, 10), end_y, duration=0.4)
+
+    def _swipe_up_continue_ad(self) -> None:
+        cx = self.width // 2 + random.randint(-20, 20)
+        start_y = int(self.height * 0.88)
+        end_y = int(self.height * 0.28)
+        self.d.swipe(cx, start_y, cx + random.randint(-8, 8), end_y, duration=0.35)
 
     def _swipe_down(self, distance: float = 0.5) -> None:
         cx = self.width // 2 + random.randint(-30, 30)

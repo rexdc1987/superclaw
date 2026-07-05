@@ -46,4 +46,4 @@ scoring:
   replied_bonus: 20
   contacted_penalty: -20
 hongguo:
-  device_addr: emulator-5554
+  device_addr: 192.168.3.134:5555

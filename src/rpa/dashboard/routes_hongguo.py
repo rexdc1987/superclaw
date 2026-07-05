@@ -1,4 +1,4 @@
-"""Hongguo comment task API routes.
+﻿"""Hongguo comment task API routes.
 
 Phase 1 intentionally uses PyMySQL directly because the Hongguo PRD requires
 MySQL as the source of truth and defines the table contract by column name.
@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +23,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 from pymysql.cursors import DictCursor
 
-from rpa.hongguo.ai_usage import load_usage_stats, reset_usage_stats
+from rpa.hongguo.ai_usage import load_usage_stats, record_usage, reset_usage_stats
 from rpa.hongguo.comment_gen import CommentGenerator
 from rpa.hongguo.device import DEFAULT_ADDR, connect, connect_exact, discover_addrs
 from rpa.hongguo.engine import DEFAULT_SCREENSHOT_ROOT, TaskEngineManager
@@ -405,6 +407,11 @@ class TaskUpdate(BaseModel):
         return value
 
 
+class StageRunRequest(BaseModel):
+    start_episode: int = Field(ge=1)
+    end_episode: int = Field(ge=1)
+
+
 class TemplateCreate(BaseModel):
     content: str
     category: str = "通用"
@@ -619,6 +626,1359 @@ def _validate_transition(current_status: str, target_status: str) -> None:
             status_code=400,
             detail=f"Cannot transition from '{current_status}' to '{target_status}'",
         )
+
+
+DEBUG_STEPS = {
+    "connect",
+    "launch",
+    "login",
+    "page-state",
+    "open-search",
+    "input-keyword",
+    "submit-search",
+    "open-drama",
+    "set-speed",
+    "episodes",
+    "detect-ad",
+    "skip-ad",
+    "play-first",
+    "play-target",
+    "play-next",
+    "observe-current",
+    # Compatibility aliases for older frontend tabs/bookmarks.
+    "search",
+    "select",
+    "find-drama",
+}
+
+
+def _debug_screenshot(ops: HongguoOperations, task_id: int, tag: str) -> str:
+    try:
+        return ops.take_screenshot(f"debug_{tag}", str(_task_screenshot_dir(task_id).as_posix()))
+    except Exception:
+        return ""
+
+
+def _debug_response(
+    step: str,
+    success: bool,
+    message: str,
+    data: Optional[Dict[str, Any]] = None,
+    screenshot_path: str = "",
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "step": step,
+        "success": success,
+        "message": message,
+        "data": data or {},
+    }
+    if screenshot_path:
+        result["screenshot_path"] = screenshot_path
+        result["screenshot_url"] = _public_screenshot_url(screenshot_path)
+    return result
+
+
+def _check_hongguo_login(ops: HongguoOperations) -> Dict[str, Any]:
+    result = ops.check_login()
+    device_info = ops.get_device_info()
+    account = ops.get_account_info()
+    if account.get("logged_in") and not result.get("logged_in"):
+        result = {
+            **result,
+            "logged_in": True,
+            "status": "logged_in",
+            "message": account.get("message") or "已登录",
+        }
+    if result.get("logged_in") and not account.get("logged_in"):
+        account = {**account, "logged_in": True}
+    return {**result, "device": device_info, "account": account}
+
+
+def _debug_page_state(ops: HongguoOperations, task: Dict[str, Any]) -> Dict[str, Any]:
+    keyword = str(task.get("drama_name") or "").strip()
+    xml = ops._xml()
+    launcher_visible = ops._launcher_visible(xml)
+    app_foreground = ops._is_app_foreground()
+    return {
+        "device": ops.get_device_info(),
+        "app": ops._safe_app_current(),
+        "app_foreground": app_foreground,
+        "launcher_visible": launcher_visible,
+        "first_visible_package": ops._first_visible_package(xml),
+        "hongguo_visible_area_ratio": ops._hongguo_visible_area_ratio(xml),
+        "current_episode": ops.get_current_episode(),
+        "total_episodes": ops.get_total_episodes(),
+        "playback_visible": ops._playback_visible(xml),
+        "playback_paused": ops.is_playback_paused(),
+        "ad_visible": ops._ad_continue_visible(xml),
+        "detail_title": ops._extract_detail_title(keyword),
+        "playing_title": ops._current_playing_title(),
+    }
+
+
+def _stage_comment_episodes(task: Dict[str, Any], total: int, start: int, end: int) -> List[int]:
+    total = max(1, int(total or end or 1))
+    end = min(max(start, end), total)
+    if task.get("comment_mode") == "random":
+        return []
+    rule_start = max(1, int(task.get("start_episode") or 1))
+    interval = max(1, int(task.get("episode_interval") or 1))
+    return [episode for episode in range(rule_start, end + 1, interval) if start <= episode <= end]
+
+
+def _prepare_step(steps: List[Dict[str, Any]], key: str, success: bool, message: str, data: Optional[Dict[str, Any]] = None) -> None:
+    steps.append(
+        {
+            "step": key,
+            "success": bool(success),
+            "message": message,
+            "data": data or {},
+        }
+    )
+
+
+class PrepareFlowError(RuntimeError):
+    def __init__(self, message: str, data: Dict[str, Any]):
+        super().__init__(message)
+        self.data = data
+
+
+def _raise_prepare_error(message: str, data: Dict[str, Any]) -> None:
+    data["failed_step"] = data.get("steps", [{}])[-1].get("step") if data.get("steps") else ""
+    raise PrepareFlowError(message, data)
+
+
+def _run_prepare_flow(task_id: int, task: Dict[str, Any], update_task: bool = True) -> Dict[str, Any]:
+    keyword = str(task.get("drama_name") or "").strip()
+    if not keyword:
+        raise RuntimeError("任务短剧名称为空")
+
+    device = connect(_hongguo_device_addr())
+    ops = HongguoOperations(device)
+    steps: List[Dict[str, Any]] = []
+    data: Dict[str, Any] = {
+        "keyword": keyword,
+        "device": ops.get_device_info(),
+        "steps": steps,
+    }
+
+    _prepare_step(steps, "connect", True, "设备连接成功", {"device": data["device"]})
+
+    before_state = _debug_page_state(ops, task)
+    _prepare_step(steps, "page-state", True, "页面状态已识别", before_state)
+    data["before_state"] = before_state
+
+    launched = ops.launch_app()
+    _prepare_step(steps, "launch", launched, "红果启动成功" if launched else "红果启动未确认")
+    if not launched:
+        _raise_prepare_error("红果启动未确认", data)
+
+    login = _check_hongguo_login(ops)
+    data["login"] = login
+    _prepare_step(steps, "login", bool(login.get("logged_in")), login.get("message") or "登录检测完成", login)
+    if not login.get("logged_in"):
+        _raise_prepare_error(login.get("message") or "登录检测失败", data)
+
+    opened = ops.open_search_page(keyword)
+    data["opened"] = opened
+    _prepare_step(steps, "open-search", bool(opened.get("success")), opened.get("message") or "已进入搜索框", opened)
+    if not opened.get("success"):
+        _raise_prepare_error(opened.get("message") or "进入搜索框失败", data)
+
+    input_result = ops.input_search_keyword(keyword)
+    data["input"] = input_result
+    _prepare_step(steps, "input-keyword", bool(input_result.get("success")), input_result.get("message") or "关键词已填入", input_result)
+    if not input_result.get("success"):
+        _raise_prepare_error(input_result.get("message") or "关键词填入失败", data)
+
+    search = ops.submit_search(keyword)
+    data["search"] = search
+    data["titles"] = search.get("titles") or []
+    _prepare_step(steps, "submit-search", bool(search.get("success")), search.get("message") or "搜索完成", search)
+    if not search.get("success"):
+        _raise_prepare_error(search.get("message") or "提交搜索失败", data)
+
+    titles = ops._extract_drama_titles()
+    selected_title = ops._choose_title(keyword, titles)
+    data["titles"] = titles
+    data["selected_title"] = selected_title
+    if not selected_title:
+        _prepare_step(steps, "open-drama", False, "没有匹配任务短剧名称的搜索结果", {"titles": titles})
+        _raise_prepare_error("没有匹配任务短剧名称的搜索结果", data)
+
+    selected = ops.select_drama(selected_title, keyword=keyword)
+    data["selected"] = selected
+    data["drama_title"] = selected.get("drama_title") or selected_title
+    _prepare_step(steps, "open-drama", bool(selected.get("success")), selected.get("message") or "已进入目标剧集", selected)
+    if not selected.get("success"):
+        _raise_prepare_error(selected.get("message") or "进入目标剧集失败", data)
+
+    playback_speed = str(task.get("playback_speed") or "1.0x")
+    speed_set = True if playback_speed == "1.0x" else ops.set_playback_speed(playback_speed)
+    data["playback_speed"] = playback_speed
+    data["speed_set"] = speed_set
+    _prepare_step(steps, "set-speed", speed_set, f"倍速已设置: {playback_speed}" if speed_set else f"倍速设置失败: {playback_speed}")
+    if not speed_set:
+        _raise_prepare_error(f"倍速设置失败: {playback_speed}", data)
+
+    total = ops.get_total_episodes()
+    current = ops.get_current_episode()
+    data["total_episodes"] = total
+    data["current_episode_before_first"] = current
+    _prepare_step(steps, "episodes", total > 0 or current > 0, f"当前第{current}集，总集数{total}", {"current_episode": current, "total_episodes": total})
+
+    played = ops.play_episode(1)
+    time.sleep(2)
+    after = ops.get_current_episode()
+    data["current_episode"] = after
+    data["played_first"] = played
+    _prepare_step(
+        steps,
+        "play-first",
+        bool(played and after == 1),
+        "第1集播放已确认" if after == 1 else "第1集播放未确认",
+        {"played": played, "after_episode": after},
+    )
+    if not played or after != 1:
+        _raise_prepare_error("第1集播放未确认", data)
+
+    final_state = _debug_page_state(ops, task)
+    data["final_state"] = final_state
+
+    if update_task:
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE hongguo_comment_tasks
+                    SET current_episode=%s,
+                        total_episodes=COALESCE(NULLIF(%s, 0), total_episodes),
+                        status='stopped',
+                        error_message=NULL,
+                        updated_at=%s
+                    WHERE id=%s
+                    """,
+                    (1, total, datetime.now(), task_id),
+                )
+    return data
+
+
+def _run_stage_task(task_id: int, start_episode: int, end_episode: int) -> None:
+    try:
+        with _connection() as conn:
+            task = _fetch_one_or_404(conn, task_id)
+            _insert_log(conn, task_id, f"阶段测试: 开始第{start_episode}-{end_episode}集")
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE hongguo_comment_tasks
+                    SET status='running', current_episode=%s, completed_at=NULL, error_message=NULL, updated_at=%s
+                    WHERE id=%s
+                    """,
+                    (start_episode, datetime.now(), task_id),
+                )
+
+        device = connect(_hongguo_device_addr())
+        ops = HongguoOperations(device)
+        task_snapshot = dict(task)
+
+        stage_state = _debug_page_state(ops, task_snapshot)
+        if not stage_state.get("playback_visible"):
+            shot = _debug_screenshot(ops, task_id, f"stage_{start_episode}_{end_episode}_not_playback")
+            raise RuntimeError(f"阶段测试未检测到播放页，请先执行一次性准备流程，已截图 {shot}")
+
+        with _connection() as conn:
+            _insert_log(
+                conn,
+                task_id,
+                f"阶段测试: 使用当前播放页继续测试 | keyword={task_snapshot.get('drama_name') or ''} | current={stage_state.get('current_episode') or 0} | total={stage_state.get('total_episodes') or task_snapshot.get('total_episodes') or 0} | speed={task_snapshot.get('playback_speed') or ''}",
+            )
+        total = int(stage_state.get("total_episodes") or 0) or ops.get_total_episodes() or int(task_snapshot.get("total_episodes") or end_episode)
+        end_episode = min(end_episode, max(start_episode, total))
+        comment_hits = set(_stage_comment_episodes(task_snapshot, total, start_episode, end_episode))
+
+        playback_speed = str(task_snapshot.get("playback_speed") or "1.0x")
+        speed_set = True
+        if playback_speed != "1.0x":
+            speed_set = ops.set_playback_speed(playback_speed)
+            with _connection() as conn:
+                level = "info" if speed_set else "warn"
+                message = f"阶段测试: 倍速已设置为 {playback_speed}" if speed_set else f"阶段测试: 倍速设置失败，目标 {playback_speed}"
+                _insert_log(conn, task_id, message, level)
+
+        if not ops.play_episode(start_episode):
+            shot = _debug_screenshot(ops, task_id, f"stage_{start_episode}_{end_episode}_start_failed")
+            raise RuntimeError(f"阶段测试无法切到第{start_episode}集，截图: {shot}")
+
+        with _connection() as conn:
+            _insert_log(
+                conn,
+                task_id,
+                f"阶段测试: 已切到第{start_episode}集，倍速 {playback_speed}，评论命中集数 {sorted(comment_hits)}",
+            )
+
+        for episode in range(start_episode, end_episode + 1):
+            current = ops.get_current_episode()
+            if current and current != episode:
+                raise RuntimeError(f"阶段测试跳集异常: 期望第{episode}集，当前第{current}集")
+
+            with _connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE hongguo_comment_tasks SET current_episode=%s, updated_at=%s WHERE id=%s",
+                        (episode, datetime.now(), task_id),
+                    )
+                _insert_log(conn, task_id, f"阶段测试: 正在观察第{episode}集")
+
+            if episode in comment_hits:
+                shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_comment_hit")
+                with _connection() as conn:
+                    _insert_log(conn, task_id, f"阶段测试: 第{episode}集命中评论规则，已截图留证 {shot}")
+
+            if episode >= end_episode:
+                break
+
+            target = episode + 1
+            deadline = time.time() + max(30, int(task_snapshot.get("comment_interval_sec") or 30) + 90)
+            last_seen = current
+            unknown_reads = 0
+            stale_current_reads = 0
+            stale_recoveries = 0
+            last_recovery_at = 0.0
+            while time.time() < deadline:
+                if not ops._is_app_foreground():
+                    app = ops._safe_app_current()
+                    first_package = ops._first_visible_package(ops._xml())
+                    shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_not_foreground")
+                    with _connection() as conn:
+                        _insert_log(
+                            conn,
+                            task_id,
+                            f"阶段测试: 第{episode}集后红果不在前台，当前={app.get('package') or '-'}，可见={first_package or '-'}，已截图 {shot}，尝试拉回红果",
+                            "warn",
+                        )
+                    foreground = ops.bring_to_foreground()
+                    time.sleep(2)
+                    resumed = ops.resume_playback_if_paused(allow_center_fallback=True)
+                    recovered_episode = ops.get_current_episode()
+                    with _connection() as conn:
+                        _insert_log(conn, task_id, f"阶段测试: 红果前台恢复={foreground}，继续播放={resumed}，当前集={recovered_episode or 0}", "info")
+                    if not recovered_episode and not ops._ad_continue_visible():
+                        shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_lost_playback")
+                        raise RuntimeError(f"阶段测试第{episode}集后已离开播放页，恢复失败，需重跑一次性准备流程，已截图 {shot}")
+                    unknown_reads = 0
+                    last_recovery_at = time.time()
+                    continue
+
+                if ops._ad_continue_visible():
+                    shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_ad")
+                    with _connection() as conn:
+                        _insert_log(conn, task_id, f"阶段测试: 第{episode}集后出现广告，已截图 {shot}，尝试上滑继续")
+                    ops.skip_ad_if_present()
+                    time.sleep(3)
+                    unknown_reads = 0
+                    continue
+
+                current = ops.get_current_episode()
+                if current == target:
+                    with _connection() as conn:
+                        _insert_log(conn, task_id, f"阶段测试: 已自动进入第{target}集")
+                    break
+                if current == episode:
+                    stale_current_reads += 1
+                    now = time.time()
+                    if stale_current_reads >= 8 and now - last_recovery_at >= 20:
+                        stale_recoveries += 1
+                        last_recovery_at = now
+                        shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_stale_current")
+                        with _connection() as conn:
+                            _insert_log(
+                                conn,
+                                task_id,
+                                f"阶段测试: 第{episode}集后长时间仍识别为第{episode}集，已截图 {shot}，尝试拉回红果/跳广告/继续播放",
+                                "warn",
+                            )
+                        foreground = ops.bring_to_foreground()
+                        time.sleep(2)
+                        skipped = ops.skip_ad_if_present()
+                        resumed = ops.resume_playback_if_paused(allow_center_fallback=True)
+                        recovered_episode = ops.get_current_episode()
+                        forced = False
+                        if recovered_episode and stale_recoveries >= 2 and time.time() >= deadline - 35:
+                            forced = ops.play_episode(target)
+                            time.sleep(2)
+                        with _connection() as conn:
+                            _insert_log(
+                                conn,
+                                task_id,
+                                f"阶段测试: 停留恢复完成，前台={foreground}，跳广告={skipped}，继续播放={resumed}，当前集={recovered_episode or 0}，强制切目标集={forced}",
+                                "info" if not forced else "warn",
+                            )
+                        if not recovered_episode and not ops._ad_continue_visible():
+                            shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_lost_playback")
+                            raise RuntimeError(f"阶段测试第{episode}集后已离开播放页，恢复失败，需重跑一次性准备流程，已截图 {shot}")
+                        continue
+                else:
+                    stale_current_reads = 0
+                if current:
+                    unknown_reads = 0
+                if current and current > target:
+                    if ops._ad_continue_visible():
+                        time.sleep(2)
+                        continue
+                    raise RuntimeError(f"阶段测试跳过目标集: 目标第{target}集，当前第{current}集")
+                if current and current < episode:
+                    raise RuntimeError(f"阶段测试回退异常: 当前第{current}集，上一集第{episode}集")
+                if not current:
+                    unknown_reads += 1
+                    now = time.time()
+                    if unknown_reads >= 4 and now - last_recovery_at >= 10:
+                        last_recovery_at = now
+                        shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_unknown_recover")
+                        with _connection() as conn:
+                            _insert_log(
+                                conn,
+                                task_id,
+                                f"阶段测试: 第{episode}集后连续无法识别当前集，已截图 {shot}，尝试恢复红果前台/跳广告/继续播放",
+                                "warn",
+                            )
+                        skipped = ops.skip_ad_if_present()
+                        foreground = ops.bring_to_foreground()
+                        time.sleep(2)
+                        skipped = ops.skip_ad_if_present() or skipped
+                        resumed = ops.resume_playback_if_paused(allow_center_fallback=True)
+                        recovered_episode = ops.get_current_episode()
+                        with _connection() as conn:
+                            _insert_log(
+                                conn,
+                                task_id,
+                                f"阶段测试: 恢复动作完成，前台={foreground}，跳广告={skipped}，继续播放={resumed}，当前集={recovered_episode or 0}",
+                                "info",
+                            )
+                        if not recovered_episode and not ops._ad_continue_visible():
+                            shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_lost_playback")
+                            raise RuntimeError(f"阶段测试第{episode}集后已离开播放页，恢复失败，需重跑一次性准备流程，已截图 {shot}")
+                        time.sleep(2)
+                        continue
+                if current != last_seen:
+                    last_seen = current
+                    with _connection() as conn:
+                        message = f"阶段测试: 等待第{target}集，当前第{current}集" if current else f"阶段测试: 等待第{target}集，当前集数无法识别"
+                        _insert_log(conn, task_id, message, "warn" if not current else "info")
+                time.sleep(2)
+            else:
+                shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_next_timeout")
+                raise RuntimeError(f"阶段测试第{episode}集后未自动进入第{target}集，已截图 {shot}")
+
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE hongguo_comment_tasks
+                    SET status='stopped', current_episode=%s, completed_at=%s, error_message=NULL, updated_at=%s
+                    WHERE id=%s
+                    """,
+                    (end_episode, datetime.now(), datetime.now(), task_id),
+                )
+            _insert_log(conn, task_id, f"阶段测试: 第{start_episode}-{end_episode}集完成")
+    except Exception as exc:
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE hongguo_comment_tasks
+                    SET status='failed', error_message=%s, completed_at=%s, updated_at=%s
+                    WHERE id=%s
+                    """,
+                    (str(exc), datetime.now(), datetime.now(), task_id),
+                )
+            _insert_log(conn, task_id, f"阶段测试失败: {exc}", "error")
+
+
+def _stage_log(task_id: int, message: str, level: str = "info") -> None:
+    with _connection() as conn:
+        _insert_log(conn, task_id, message, level)
+
+
+def _stage_templates(task: Dict[str, Any]) -> List[str]:
+    value = task.get("templates_json")
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+
+def _stage_save_record(
+    task_id: int,
+    episode: int,
+    content: str,
+    source: str,
+    status: str,
+    screenshot_input: str = "",
+    screenshot_verified: str = "",
+    error_message: Optional[str] = None,
+) -> None:
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO hongguo_comment_records (
+                    task_id, episode_number, comment_text, generated_by,
+                    status, screenshot_input, screenshot_verified, error_message, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    task_id,
+                    episode,
+                    content,
+                    source,
+                    status,
+                    screenshot_input or None,
+                    screenshot_verified or None,
+                    error_message,
+                    datetime.now(),
+                ),
+            )
+
+
+def _stage_comment_already_verified(task_id: int, episode: int) -> bool:
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM hongguo_comment_records
+                WHERE task_id=%s AND episode_number=%s AND status='success'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (task_id, episode),
+            )
+            return cur.fetchone() is not None
+
+
+def _stage_increment_counter(task_id: int, counter: str) -> None:
+    if counter not in {"sent", "verified"}:
+        return
+    column = "comments_verified" if counter == "verified" else "comments_sent"
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE hongguo_comment_tasks SET {column}={column}+1 WHERE id=%s", (task_id,))
+
+
+def _stage_expected_total(task: Dict[str, Any], state: Dict[str, Any], end_episode: int) -> int:
+    return int(task.get("total_episodes") or state.get("total_episodes") or end_episode or 0)
+
+
+def _stage_total_mismatch_is_fatal(
+    ops: HongguoOperations,
+    task: Dict[str, Any],
+    state: Dict[str, Any],
+    expected_total: int,
+    total: int,
+    current: int = 0,
+    target: int = 0,
+) -> bool:
+    if not expected_total or not total or total == expected_total:
+        return False
+
+    keyword = str(task.get("drama_name") or "").strip()
+    detail_title = str(state.get("detail_title") or "").strip()
+    title_matches = bool(detail_title and keyword and ops._title_matches(keyword, detail_title))
+    if title_matches and total < expected_total:
+        # On the playback page Hongguo sometimes exposes only the currently
+        # visible episode label, so get_total_episodes can temporarily read
+        # 143 while the prepared task total is 144. Keep the jump guard, but
+        # do not treat that as a different drama when the title still matches.
+        observed_floor = max(current, target)
+        if observed_floor and total >= observed_floor:
+            return False
+        if expected_total - total <= 1:
+            return False
+
+    return True
+
+
+def _stage_assert_target_playback(
+    ops: HongguoOperations,
+    task: Dict[str, Any],
+    state: Dict[str, Any],
+    expected_total: int,
+) -> None:
+    app = state.get("app") or {}
+    if app.get("package") != "com.phoenix.read":
+        raise RuntimeError(f"阶段测试未停留在红果 APP，当前 package={app.get('package') or '-'}")
+    if app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
+        raise RuntimeError(f"阶段测试未停留在目标短剧播放页，当前 activity={app.get('activity') or '-'}")
+    total = int(state.get("total_episodes") or 0)
+    current = int(state.get("current_episode") or 0)
+    if _stage_total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current):
+        raise RuntimeError(f"阶段测试检测到短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
+    if not current:
+        raise RuntimeError("阶段测试未识别到当前集数，请先确认一次性准备流程已切到目标剧播放页")
+    if not ops._playback_visible():
+        raise RuntimeError("阶段测试未检测到播放控件，请先确认一次性准备流程已完成")
+
+
+def _stage_resume_if_paused(task_id: int, ops: HongguoOperations, episode: int) -> bool:
+    if not ops.is_playback_paused():
+        return False
+    resumed = ops.resume_playback_if_paused(allow_center_fallback=True)
+    still_paused = ops.is_playback_paused()
+    ok = bool(resumed and not still_paused)
+    _stage_log(
+        task_id,
+        f"阶段测试v3: 第{episode}集检测到暂停，已尝试恢复播放={resumed}，仍暂停={still_paused}",
+        "info" if ok else "warn",
+    )
+    return ok
+
+
+def _stage_safe_resume_playback(task_id: int, ops: HongguoOperations, episode: int, reason: str) -> bool:
+    resumed = ops.resume_playback_safely()
+    still_paused = ops.is_playback_paused()
+    ok = bool(resumed and not still_paused)
+    _stage_log(
+        task_id,
+        f"阶段测试v3: 第{episode}集{reason}，发送安全播放指令={resumed}，仍暂停={still_paused}",
+        "info" if ok else "warn",
+    )
+    return ok
+
+
+def _stage_wait_for_episode(
+    task_id: int,
+    ops: HongguoOperations,
+    task: Dict[str, Any],
+    target: int,
+    expected_total: int,
+    timeout: int = 60,
+) -> bool:
+    deadline = time.time() + max(20, timeout)
+    last_log_at = 0.0
+    while time.time() < deadline:
+        state = _debug_page_state(ops, task)
+        app = state.get("app") or {}
+        current = int(state.get("current_episode") or 0)
+        if app.get("package") != "com.phoenix.read":
+            raise RuntimeError(f"阶段测试切集时红果不在前台，当前 package={app.get('package') or '-'}")
+        if state.get("ad_visible"):
+            shot = _debug_screenshot(ops, task_id, f"stage_seek_ep{target}_ad")
+            skipped = ops.skip_ad_if_present(attempts=3)
+            if not skipped:
+                ops._swipe_up_continue_ad()
+            _stage_log(task_id, f"阶段测试: 切第{target}集时遇到广告，已截图 {shot}，上滑继续观看", "warn")
+            time.sleep(3)
+            continue
+        if app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
+            raise RuntimeError(f"阶段测试切集时未停留在短剧播放页，当前 activity={app.get('activity') or '-'}")
+        total = int(state.get("total_episodes") or 0)
+        if _stage_total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current, target=target):
+            raise RuntimeError(f"阶段测试切集时短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
+        if current == target:
+            return True
+        now = time.time()
+        if now - last_log_at >= 10:
+            _stage_log(task_id, f"阶段测试: 正在确认第{target}集，当前识别第{current or 0}集")
+            last_log_at = now
+        _stage_safe_resume_playback(task_id, ops, current or target, "切集确认中")
+        time.sleep(2)
+    return False
+
+
+def _stage_seek_start_episode(
+    task_id: int,
+    ops: HongguoOperations,
+    task: Dict[str, Any],
+    start_episode: int,
+    expected_total: int,
+) -> None:
+    for attempt in range(1, 3):
+        state = _debug_page_state(ops, task)
+        current = int(state.get("current_episode") or 0)
+        if current == start_episode:
+            _stage_log(task_id, f"阶段测试v3: 已在阶段起始第{start_episode}集")
+            return
+        if state.get("ad_visible"):
+            shot = _debug_screenshot(ops, task_id, f"stage_seek_ep{start_episode}_ad")
+            skipped = ops.skip_ad_if_present(attempts=3)
+            if not skipped:
+                ops._swipe_up_continue_ad()
+            _stage_log(task_id, f"阶段测试v3: 切第{start_episode}集前遇到广告，已截图 {shot}，上滑继续观看", "warn")
+            time.sleep(3)
+            continue
+        app = state.get("app") or {}
+        if app.get("package") != "com.phoenix.read":
+            raise RuntimeError(f"阶段测试切第{start_episode}集前红果不在前台，当前 package={app.get('package') or '-'}")
+        if app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
+            raise RuntimeError(f"阶段测试切第{start_episode}集前未停留在短剧播放页，当前 activity={app.get('activity') or '-'}")
+        total = int(state.get("total_episodes") or 0)
+        if _stage_total_mismatch_is_fatal(
+            ops,
+            task,
+            state,
+            expected_total,
+            total,
+            current=current,
+            target=start_episode,
+        ):
+            raise RuntimeError(f"阶段测试切第{start_episode}集前短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
+        if not state.get("playback_visible"):
+            raise RuntimeError("阶段测试切集前未检测到播放/选集页面")
+        _stage_log(task_id, f"阶段测试v3: 按阶段起始集切到第{start_episode}集，当前第{current or 0}集，尝试{attempt}/2")
+        played = ops.play_episode(start_episode)
+        if played or _stage_wait_for_episode(task_id, ops, task, start_episode, expected_total, timeout=60):
+            _stage_log(task_id, f"阶段测试v3: 第{start_episode}集播放已确认")
+            return
+        time.sleep(2)
+    shot = _debug_screenshot(ops, task_id, f"stage_seek_ep{start_episode}_failed")
+    raise RuntimeError(f"阶段测试无法切到第{start_episode}集，已按阶段起始集重试，截图: {shot}")
+
+
+def _stage_handle_comment(
+    task_id: int,
+    ops: HongguoOperations,
+    task: Dict[str, Any],
+    episode: int,
+    expected_total: int,
+) -> None:
+    drama_title = (
+        ops._current_playing_title()
+        or ops._extract_detail_title(str(task.get("drama_name") or ""))
+        or str(task.get("drama_name") or "")
+    )
+    generator = CommentGenerator(_ai_config())
+    content, source, usage = generator.generate_with_usage(
+        drama_title,
+        task.get("content_source", "ai"),
+        _stage_templates(task),
+    )
+    if usage:
+        record_usage(usage, context=f"stage:{task_id}:episode:{episode}")
+
+    paused = ops.pause_playback_if_playing()
+    _stage_log(task_id, f"阶段测试: 第{episode}集命中评论规则，暂停播放={paused}，准备评论")
+    screenshot_dir = str(_task_screenshot_dir(task_id).as_posix())
+    input_path = ops.take_screenshot(f"stage_ep{episode}_before_comment", screenshot_dir)
+    post = ops.post_comment(content, episode)
+    if not post.get("success"):
+        failed_path = ops.take_screenshot(f"stage_ep{episode}_post_failed", screenshot_dir)
+        _stage_save_record(
+            task_id,
+            episode,
+            content,
+            source,
+            "failed",
+            input_path,
+            failed_path,
+            post.get("message") or "评论发送失败",
+        )
+        _stage_log(task_id, f"阶段测试: 第{episode}集评论发送失败 - {post.get('message')}", "error")
+        ops.ensure_playback_page(episode)
+        _stage_resume_if_paused(task_id, ops, episode)
+        return
+
+    _stage_increment_counter(task_id, "sent")
+    verify = ops.verify_comment(content, episode, screenshot_dir)
+    verify_path = verify.get("screenshot_path") or ops.take_screenshot(
+        f"stage_ep{episode}_{'verified' if verify.get('verified') else 'not_found'}",
+        screenshot_dir,
+    )
+    status = "success" if verify.get("verified") else "failed"
+    error = None if verify.get("verified") else verify.get("message", "评论验证失败")
+    _stage_save_record(task_id, episode, content, source, status, input_path, verify_path, error)
+    if status == "success":
+        _stage_increment_counter(task_id, "verified")
+    _stage_log(
+        task_id,
+        f"阶段测试: 第{episode}集评论{'验证成功' if status == 'success' else '验证失败'}，截图 {verify_path}",
+        "info" if status == "success" else "error",
+    )
+
+    ops.ensure_playback_page(episode)
+    state = _debug_page_state(ops, task)
+    _stage_assert_target_playback(ops, task, state, expected_total)
+    _stage_resume_if_paused(task_id, ops, episode)
+
+
+def _stage_wait_for_next_episode(
+    task_id: int,
+    ops: HongguoOperations,
+    task: Dict[str, Any],
+    episode: int,
+    target: int,
+    expected_total: int,
+) -> bool:
+    deadline = time.time() + max(300, int(task.get("comment_interval_sec") or 30) + 240)
+    last_log_at = 0.0
+    same_episode_since = 0.0
+    forced_target = False
+    while time.time() < deadline:
+        state = _debug_page_state(ops, task)
+        app = state.get("app") or {}
+        current = int(state.get("current_episode") or 0)
+        ad_visible = bool(state.get("ad_visible"))
+
+        if app.get("package") != "com.phoenix.read":
+            raise RuntimeError(f"阶段测试第{episode}集后红果不在前台，当前 package={app.get('package') or '-'}")
+        if ad_visible:
+            shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_ad")
+            skipped = ops.skip_ad_if_present(attempts=3)
+            if not skipped:
+                ops._swipe_up_continue_ad()
+                _stage_log(
+                    task_id,
+                    f"阶段测试: 第{episode}集后出现广告，常规跳过未确认成功，已截图 {shot}，执行兜底上滑",
+                    "warn",
+                )
+            else:
+                _stage_log(task_id, f"阶段测试: 第{episode}集后出现广告，已截图 {shot}，上滑继续观看")
+            time.sleep(3)
+            continue
+        if app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
+            total = int(state.get("total_episodes") or 0)
+            raise RuntimeError(
+                f"阶段测试第{episode}集后已离开目标短剧播放页，当前 activity={app.get('activity') or '-'}，识别总集数={total or 0}"
+            )
+        total = int(state.get("total_episodes") or 0)
+        if current == 0 and total == 0:
+            shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_unknown_ad_overlay")
+            _stage_log(
+                task_id,
+                f"阶段测试: 第{episode}集后播放页集数不可见，按广告/遮罩页处理，已截图 {shot}，上滑继续观看",
+                "warn",
+            )
+            ops._swipe_up_continue_ad()
+            time.sleep(3)
+            continue
+        if _stage_total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current, target=target):
+            raise RuntimeError(f"阶段测试第{episode}集后跳到其他短剧: 期望总集数 {expected_total}，实际 {total}")
+
+        if current == target:
+            _stage_log(task_id, f"阶段测试: 已自动进入第{target}集")
+            return True
+        if current == episode:
+            now = time.time()
+            if same_episode_since <= 0:
+                same_episode_since = now
+            if now - last_log_at >= 30:
+                _stage_log(
+                    task_id,
+                    f"阶段测试: 仍在第{episode}集，播放页=True，广告=False，等待自动播放第{target}集",
+                )
+                _stage_safe_resume_playback(task_id, ops, episode, "仍停留当前集，检查是否暂停")
+                last_log_at = now
+            if not forced_target and now - same_episode_since >= 150:
+                shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_stale_force_target")
+                forced_target = ops.play_episode(target)
+                _stage_log(
+                    task_id,
+                    f"阶段测试v3: 第{episode}集停留超过150秒，已截图 {shot}，强制切第{target}集={forced_target}",
+                    "warn",
+                )
+                time.sleep(3)
+        elif current == 0:
+            now = time.time()
+            same_episode_since = 0.0
+            if now - last_log_at >= 20:
+                _stage_log(task_id, f"阶段测试: 第{episode}集后暂未识别到集数，播放页=True，广告=False，继续观察", "warn")
+                _stage_safe_resume_playback(task_id, ops, episode, "集数暂未识别，检查是否暂停")
+                last_log_at = now
+        else:
+            same_episode_since = 0.0
+        if current > target:
+            raise RuntimeError(f"阶段测试跳过目标集: 目标第{target}集，当前第{current}集")
+        if current < episode:
+            raise RuntimeError(f"阶段测试回退异常: 上一集第{episode}集，当前第{current}集")
+        time.sleep(2)
+    return False
+
+
+def _run_stage_task_v2(task_id: int, start_episode: int, end_episode: int) -> None:
+    try:
+        with _connection() as conn:
+            task = _fetch_one_or_404(conn, task_id)
+            _insert_log(conn, task_id, f"阶段测试v3: 开始第{start_episode}-{end_episode}集")
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE hongguo_comment_tasks
+                    SET status='running', current_episode=%s, completed_at=NULL, error_message=NULL, updated_at=%s
+                    WHERE id=%s
+                    """,
+                    (start_episode, datetime.now(), task_id),
+                )
+
+        device = connect(_hongguo_device_addr())
+        ops = HongguoOperations(device)
+        task_snapshot = dict(task)
+
+        stage_state = _debug_page_state(ops, task_snapshot)
+        expected_total = _stage_expected_total(task_snapshot, stage_state, end_episode)
+        _stage_assert_target_playback(ops, task_snapshot, stage_state, expected_total)
+        current_episode = int(stage_state.get("current_episode") or 0)
+        total = expected_total or int(stage_state.get("total_episodes") or end_episode)
+        end_episode = min(end_episode, max(start_episode, total))
+        comment_hits = set(_stage_comment_episodes(task_snapshot, total, start_episode, end_episode))
+        _stage_log(
+            task_id,
+            f"阶段测试v3: 一次性准备状态已确认 | current={current_episode} | total={total} | hits={sorted(comment_hits)}",
+        )
+
+        playback_speed = str(task_snapshot.get("playback_speed") or "1.0x")
+        if playback_speed != "1.0x":
+            speed_set = ops.set_playback_speed(playback_speed)
+            _stage_log(
+                task_id,
+                f"阶段测试v3: 倍速{'已设置' if speed_set else '设置失败'} {playback_speed}",
+                "info" if speed_set else "warn",
+            )
+
+        run_start_episode = start_episode
+        if start_episode <= current_episode <= end_episode:
+            run_start_episode = current_episode
+            _stage_log(
+                task_id,
+                f"阶段测试v3: 当前已在阶段范围内，从第{run_start_episode}集继续，不重跑阶段起始集",
+            )
+        else:
+            _stage_seek_start_episode(task_id, ops, task_snapshot, start_episode, total)
+        _stage_resume_if_paused(task_id, ops, run_start_episode)
+
+        for episode in range(run_start_episode, end_episode + 1):
+            state = _debug_page_state(ops, task_snapshot)
+            _stage_assert_target_playback(ops, task_snapshot, state, total)
+            current = int(state.get("current_episode") or 0)
+            if current and current != episode:
+                raise RuntimeError(f"阶段测试跳集异常: 期望第{episode}集，当前第{current}集")
+
+            with _connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE hongguo_comment_tasks SET current_episode=%s, updated_at=%s WHERE id=%s",
+                        (episode, datetime.now(), task_id),
+                    )
+                _insert_log(conn, task_id, f"阶段测试v3: 正在观察第{episode}集")
+
+            _stage_resume_if_paused(task_id, ops, episode)
+            if episode in comment_hits:
+                if _stage_comment_already_verified(task_id, episode):
+                    _stage_log(task_id, f"阶段测试v3: 第{episode}集已有成功评论记录，跳过重复评论")
+                else:
+                    _stage_handle_comment(task_id, ops, task_snapshot, episode, total)
+
+            if episode >= end_episode:
+                break
+            target = episode + 1
+            if not _stage_wait_for_next_episode(task_id, ops, task_snapshot, episode, target, total):
+                shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_next_timeout")
+                raise RuntimeError(f"阶段测试第{episode}集后未自动进入第{target}集，已截图 {shot}")
+
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE hongguo_comment_tasks
+                    SET status='stopped', current_episode=%s, completed_at=%s, error_message=NULL, updated_at=%s
+                    WHERE id=%s
+                    """,
+                    (end_episode, datetime.now(), datetime.now(), task_id),
+                )
+            _insert_log(conn, task_id, f"阶段测试v3: 第{start_episode}-{end_episode}集完成")
+    except Exception as exc:
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE hongguo_comment_tasks
+                    SET status='failed', error_message=%s, completed_at=%s, updated_at=%s
+                    WHERE id=%s
+                    """,
+                    (str(exc), datetime.now(), datetime.now(), task_id),
+                )
+            _insert_log(conn, task_id, f"阶段测试v3失败: {exc}", "error")
+
+
+@router.post("/tasks/{task_id}/debug/{step}")
+async def debug_task_step(task_id: int, step: str):
+    if step not in DEBUG_STEPS:
+        raise HTTPException(status_code=400, detail=f"Invalid debug step: {step}")
+    with _connection() as conn:
+        task = _fetch_one_or_404(conn, task_id)
+        _insert_log(conn, task_id, f"分步测试: 开始 {step}")
+
+    try:
+        device = connect(_hongguo_device_addr())
+        ops = HongguoOperations(device)
+        data: Dict[str, Any] = {"device": ops.get_device_info()}
+        screenshot_path = ""
+
+        if step == "connect":
+            screenshot_path = _debug_screenshot(ops, task_id, step)
+            result = _debug_response(step, True, "设备连接成功", data, screenshot_path)
+        elif step == "launch":
+            launched = ops.launch_app()
+            login = _check_hongguo_login(ops) if launched else {}
+            data.update({"launched": launched, "login": login, "device": ops.get_device_info()})
+            screenshot_path = _debug_screenshot(ops, task_id, step)
+            result = _debug_response(step, launched, "红果启动成功" if launched else "红果启动未确认", data, screenshot_path)
+        elif step == "login":
+            login = _check_hongguo_login(ops)
+            data.update({"login": login, "account": login.get("account") or {}, "device": login.get("device") or data.get("device")})
+            screenshot_path = _debug_screenshot(ops, task_id, step)
+            result = _debug_response(
+                step,
+                bool(login.get("logged_in")),
+                login.get("message") or "登录检测完成",
+                data,
+                screenshot_path,
+            )
+        elif step == "page-state":
+            state = _debug_page_state(ops, task)
+            data.update(state)
+            screenshot_path = _debug_screenshot(ops, task_id, step)
+            current = state.get("current_episode") or 0
+            ad = "，检测到广告提示" if state.get("ad_visible") else ""
+            result = _debug_response(
+                step,
+                True,
+                f"当前第{current}集，播放页={bool(state.get('playback_visible'))}{ad}",
+                data,
+                screenshot_path,
+            )
+        elif step in {"open-search", "input-keyword", "submit-search", "open-drama", "set-speed", "find-drama", "search", "select"}:
+            keyword = str(task.get("drama_name") or "").strip()
+            if not keyword:
+                raise RuntimeError("任务短剧名称为空")
+            if step == "open-search":
+                opened = ops.open_search_page(keyword)
+                data.update({"keyword": keyword, "opened": opened})
+                screenshot_path = _debug_screenshot(ops, task_id, step)
+                result = _debug_response(
+                    step,
+                    bool(opened.get("success")),
+                    opened.get("message") or "已进入搜索框",
+                    data,
+                    screenshot_path,
+                )
+            elif step == "input-keyword":
+                input_result = ops.input_search_keyword(keyword)
+                data.update({"keyword": keyword, "input": input_result, "input_text": input_result.get("input_text") or ""})
+                screenshot_path = _debug_screenshot(ops, task_id, step)
+                result = _debug_response(
+                    step,
+                    bool(input_result.get("success")),
+                    input_result.get("message") or "关键词已填入",
+                    data,
+                    screenshot_path,
+                )
+            elif step == "submit-search":
+                search = ops.submit_search(keyword)
+                data.update(
+                    {
+                        "keyword": keyword,
+                        "search": search,
+                        "titles": search.get("titles") or [],
+                    }
+                )
+                screenshot_path = _debug_screenshot(ops, task_id, step)
+                result = _debug_response(
+                    step,
+                    bool(search.get("success")),
+                    search.get("message") or "搜索完成",
+                    data,
+                    screenshot_path,
+                )
+            elif step == "search":
+                launched = ops.launch_app()
+                search = ops.search_drama(keyword)
+                data.update(
+                    {
+                        "launched": launched,
+                        "keyword": keyword,
+                        "search": search,
+                        "titles": search.get("titles") or [],
+                    }
+                )
+                screenshot_path = _debug_screenshot(ops, task_id, step)
+                result = _debug_response(
+                    step,
+                    bool(search.get("success")),
+                    search.get("message") or "搜索完成",
+                    data,
+                    screenshot_path,
+                )
+            elif step in {"open-drama", "select"}:
+                titles = ops._extract_drama_titles()
+                selected_title = ops._choose_title(keyword, titles)
+                if selected_title:
+                    selected = ops.select_drama(selected_title, keyword=keyword)
+                    success = bool(selected.get("success"))
+                    message = selected.get("message") or ("已进入短剧详情" if success else "短剧不可播放")
+                else:
+                    selected = {}
+                    success = False
+                    message = "没有匹配任务短剧名称的搜索结果"
+                data.update(
+                    {
+                        "keyword": keyword,
+                        "titles": titles,
+                        "selected_title": selected_title,
+                        "selected": selected,
+                        "drama_title": selected.get("drama_title") or selected_title,
+                        "playable": bool(selected.get("playable")),
+                        "detail_visible": bool(selected.get("detail_visible")),
+                    }
+                )
+                screenshot_path = _debug_screenshot(ops, task_id, step)
+                result = _debug_response(step, success, message, data, screenshot_path)
+            elif step == "set-speed":
+                speed = str(task.get("playback_speed") or "1.0x")
+                success = True if speed == "1.0x" else ops.set_playback_speed(speed)
+                data.update({"playback_speed": speed, "speed_set": success, "state": _debug_page_state(ops, task)})
+                screenshot_path = _debug_screenshot(ops, task_id, step)
+                result = _debug_response(
+                    step,
+                    bool(success),
+                    f"倍速已设置: {speed}" if success else f"倍速设置失败: {speed}",
+                    data,
+                    screenshot_path,
+                )
+            else:
+                launched = ops.launch_app()
+                found = ops.find_drama(keyword)
+                data.update({"launched": launched, **found})
+                screenshot_path = _debug_screenshot(ops, task_id, step)
+                result = _debug_response(
+                    step,
+                    bool(found.get("success")),
+                    found.get("message") or "搜索并进入短剧完成",
+                    data,
+                    screenshot_path,
+                )
+        elif step == "episodes":
+            total = ops.get_total_episodes()
+            current = ops.get_current_episode()
+            data.update(
+                {
+                    "current_episode": current,
+                    "total_episodes": total,
+                    "playback_visible": ops._playback_visible(),
+                    "detail_title": ops._extract_detail_title(str(task.get("drama_name") or "")),
+                    "playing_title": ops._current_playing_title(),
+                }
+            )
+            screenshot_path = _debug_screenshot(ops, task_id, step)
+            result = _debug_response(step, total > 0 or current > 0, f"当前第{current}集，总集数{total}", data, screenshot_path)
+        elif step == "detect-ad":
+            visible = ops._ad_continue_visible()
+            data.update(_debug_page_state(ops, task))
+            screenshot_path = _debug_screenshot(ops, task_id, step)
+            result = _debug_response(
+                step,
+                True,
+                "检测到广告继续观看提示" if visible else "未检测到广告继续观看提示",
+                data,
+                screenshot_path,
+            )
+        elif step == "skip-ad":
+            before = _debug_page_state(ops, task)
+            skipped = ops.skip_ad_if_present()
+            time.sleep(2)
+            after = _debug_page_state(ops, task)
+            data.update({"before": before, "after": after, "skipped": skipped})
+            screenshot_path = _debug_screenshot(ops, task_id, step)
+            result = _debug_response(
+                step,
+                bool(skipped),
+                "已上滑跳过广告" if skipped else "当前没有可跳过的广告提示",
+                data,
+                screenshot_path,
+            )
+        elif step in {"play-first", "play-target", "play-next"}:
+            before = ops.get_current_episode()
+            if step == "play-first":
+                target_episode = 1
+            elif step == "play-next":
+                target_episode = max(1, int(before or task.get("current_episode") or 0) + 1)
+            else:
+                target_episode = max(1, int(task.get("start_episode") or 1))
+            played = ops.play_episode(target_episode)
+            time.sleep(2)
+            after = ops.get_current_episode()
+            data.update(
+                {
+                    "target_episode": target_episode,
+                    "before_episode": before,
+                    "after_episode": after,
+                    "played": played,
+                    "confirmed": after == target_episode,
+                    "state": _debug_page_state(ops, task),
+                }
+            )
+            screenshot_path = _debug_screenshot(ops, task_id, step)
+            result = _debug_response(
+                step,
+                bool(played and after == target_episode),
+                f"第{target_episode}集播放已确认" if after == target_episode else f"第{target_episode}集播放未确认",
+                data,
+                screenshot_path,
+            )
+        elif step == "observe-current":
+            before = _debug_page_state(ops, task)
+            time.sleep(8)
+            after = _debug_page_state(ops, task)
+            before_ep = int(before.get("current_episode") or 0)
+            after_ep = int(after.get("current_episode") or 0)
+            data.update({"before": before, "after": after})
+            screenshot_path = _debug_screenshot(ops, task_id, step)
+            if after.get("ad_visible"):
+                message = "观察到广告提示，下一步请点“跳广告”"
+            elif before_ep and after_ep and after_ep != before_ep:
+                message = f"观察到集数变化: 第{before_ep}集 -> 第{after_ep}集"
+            elif after_ep:
+                message = f"仍在第{after_ep}集"
+            else:
+                message = "观察后仍无法识别当前集数"
+            result = _debug_response(step, True, message, data, screenshot_path)
+        else:
+            target_episode = 1 if step == "play-first" else int(task.get("start_episode") or 1)
+            before = ops.get_current_episode()
+            played = ops.play_episode(target_episode)
+            after = ops.get_current_episode()
+            data.update(
+                {
+                    "target_episode": target_episode,
+                    "before_episode": before,
+                    "after_episode": after,
+                    "played": played,
+                    "confirmed": after == target_episode,
+                    "playback_visible": ops._playback_visible(),
+                }
+            )
+            screenshot_path = _debug_screenshot(ops, task_id, step)
+            result = _debug_response(
+                step,
+                bool(played and after == target_episode),
+                f"第{target_episode}集播放已确认" if after == target_episode else f"第{target_episode}集播放未确认",
+                data,
+                screenshot_path,
+            )
+
+        with _connection() as conn:
+            detail = ""
+            if step in {"find-drama", "search", "select", "open-search", "input-keyword", "submit-search", "open-drama", "set-speed"}:
+                search = data.get("search") or {}
+                submit = search.get("submit") or {}
+                selected = data.get("selected") or {}
+                opened = data.get("opened") or {}
+                input_result = data.get("input") or {}
+                detail_parts = [
+                    f"keyword={data.get('keyword') or ''}",
+                    f"opened={opened.get('message') or ''}",
+                    f"input={data.get('input_text') or search.get('input_text') or input_result.get('input_text') or ''}",
+                    f"submit={submit.get('message') or ''}",
+                    f"action={submit.get('action') or ''}",
+                    f"actions={submit.get('actions') or []}",
+                    f"titles={(data.get('titles') or [])[:5]}",
+                    f"selected={selected.get('message') or ''}",
+                    f"drama={data.get('drama_title') or ''}",
+                ]
+                detail = " | " + " | ".join(detail_parts)
+            _insert_log(
+                conn,
+                task_id,
+                f"分步测试: {step} - {result['message']}{detail}",
+                "info" if result["success"] else "warn",
+            )
+        return result
+    except Exception as exc:
+        with _connection() as conn:
+            _insert_log(conn, task_id, f"分步测试: {step} 失败 - {exc}", "error")
+        return _debug_response(step, False, str(exc))
+
+
+@router.post("/tasks/{task_id}/prepare-run")
+async def run_prepare_task(task_id: int):
+    with _connection() as conn:
+        task = _fetch_one_or_404(conn, task_id)
+        status = _normalize_status(task.get("status"))
+        if status in {"running", "paused", "waiting_login"}:
+            raise HTTPException(status_code=400, detail="任务正在运行中，请先停止后再执行准备流程")
+        _insert_log(conn, task_id, "一次性准备流程: 开始")
+
+    try:
+        data = _run_prepare_flow(task_id, dict(task))
+        shot = ""
+        try:
+            device = connect(_hongguo_device_addr())
+            shot = _debug_screenshot(HongguoOperations(device), task_id, "prepare")
+        except Exception:
+            shot = ""
+        result = _debug_response("prepare", True, "一次性准备流程完成，已切到第1集", data, shot)
+        with _connection() as conn:
+            _insert_log(
+                conn,
+                task_id,
+                f"一次性准备流程: 完成 | keyword={data.get('keyword') or ''} | drama={data.get('drama_title') or ''} | total={data.get('total_episodes') or 0} | speed={data.get('playback_speed') or ''}",
+            )
+        return result
+    except Exception as exc:
+        shot = ""
+        try:
+            device = connect(_hongguo_device_addr())
+            shot = _debug_screenshot(HongguoOperations(device), task_id, "prepare_failed")
+        except Exception:
+            shot = ""
+        data = exc.data if isinstance(exc, PrepareFlowError) else {}
+        with _connection() as conn:
+            _insert_log(conn, task_id, f"一次性准备流程: 失败 - {exc}", "error")
+        return _debug_response("prepare", False, str(exc), data, shot)
+
+
+@router.post("/tasks/{task_id}/stage-run")
+async def run_stage_task(task_id: int, payload: StageRunRequest):
+    if payload.end_episode < payload.start_episode:
+        raise HTTPException(status_code=400, detail="end_episode must be >= start_episode")
+    if payload.end_episode - payload.start_episode + 1 > 20:
+        raise HTTPException(status_code=400, detail="阶段测试最多支持20集")
+    with _connection() as conn:
+        task = _fetch_one_or_404(conn, task_id)
+        status = _normalize_status(task.get("status"))
+        if status in {"running", "paused", "waiting_login"}:
+            raise HTTPException(status_code=400, detail="任务正在运行中，请先停止后再启动阶段测试")
+        _insert_log(conn, task_id, f"阶段测试已提交: 第{payload.start_episode}-{payload.end_episode}集")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE hongguo_comment_tasks
+                SET status='running',
+                    current_episode=%s,
+                    completed_at=NULL,
+                    error_message=NULL,
+                    updated_at=%s
+                WHERE id=%s
+                """,
+                (payload.start_episode, datetime.now(), task_id),
+            )
+    thread = threading.Thread(
+        target=_run_stage_task_v2,
+        args=(task_id, payload.start_episode, payload.end_episode),
+        name=f"hongguo-stage-{task_id}-{payload.start_episode}-{payload.end_episode}",
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "success": True,
+        "message": f"阶段测试已启动: 第{payload.start_episode}-{payload.end_episode}集",
+        "start_episode": payload.start_episode,
+        "end_episode": payload.end_episode,
+    }
 
 
 @router.get("/settings/ai")
@@ -878,27 +2238,16 @@ def check_login():
                 "account": {"logged_in": False, "nickname": "", "hongguo_id": ""},
                 "message": "红果短剧启动失败",
             }
-        result = ops.check_login()
-        device_info = ops.get_device_info()
-        account = ops.get_account_info()
-        if account.get("logged_in") and not result.get("logged_in"):
-            result = {
-                **result,
-                "logged_in": True,
-                "status": "logged_in",
-                "message": account.get("message") or "\u5df2\u767b\u5f55",
-            }
-        if result.get("logged_in") and not account.get("logged_in"):
-            account = {**account, "logged_in": True}
-        return {"success": True, **result, "device": device_info, "account": account}
+        result = _check_hongguo_login(ops)
+        return {"success": True, **result}
     except Exception as exc:
         return {
             "success": True,
             "logged_in": False,
-            "status": "check_failed",
+            "status": "device_connect_failed",
             "device": {},
             "account": {"logged_in": False, "nickname": "", "hongguo_id": ""},
-            "message": str(exc),
+            "message": f"设备连接失败: {exc}",
         }
 
 

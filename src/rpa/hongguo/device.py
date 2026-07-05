@@ -87,5 +87,14 @@ def screenshot(device: Any, path: str) -> str:
     """Capture a screenshot and return the normalized path."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    serial = getattr(device, "serial", None) or getattr(device, "_serial", None)
+    if serial:
+        try:
+            import adbutils
+
+            adbutils.adb.device(serial).screenshot().save(str(target))
+            return str(target).replace("\\", "/")
+        except Exception:
+            pass
     device.screenshot(str(target))
     return str(target).replace("\\", "/")

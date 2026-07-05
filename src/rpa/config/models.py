@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 class AppConfig(BaseModel):
     """应用基础配置"""
     name: str = "SuperClaw"
-    version: str = "0.1.0"
+    version: str = "0.2.0"
     env: str = Field("production", pattern="^(development|staging|production)$")
     debug: bool = False
     log_level: str = Field("INFO", pattern="^(DEBUG|INFO|WARNING|ERROR)$")

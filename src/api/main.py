@@ -13,7 +13,7 @@ from models.task import Task
 app = FastAPI(
     title="SuperClaw API",
     description="社交媒体评论引流运营系统",
-    version="1.0.0",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -31,7 +31,7 @@ app.include_router(hongguo_router)
 
 @app.get("/")
 def root():
-    return {"message": "SuperClaw API", "version": "1.0.0"}
+    return {"message": "SuperClaw API", "version": "0.2.0"}
 
 
 @app.get("/health")

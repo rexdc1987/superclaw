@@ -617,7 +617,7 @@ class TestHongguoPlaybackHeuristics:
                 return {"package": "com.phoenix.read"}
 
             def dump_hierarchy(self):
-                return ""
+                return '<node package="com.phoenix.read" text="搜索" />'
 
             def window_size(self):
                 return (1080, 1920)
@@ -692,6 +692,63 @@ class TestHongguoPlaybackHeuristics:
         ops = HongguoOperations(DummyDevice())
         assert ops.get_current_episode() == 1
 
+    def test_get_current_episode_ignores_home_feed_episode_hint(self):
+        class DummyDevice:
+            def app_current(self):
+                return {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.pages.main.MainFragmentActivity",
+                }
+
+            def dump_hierarchy(self):
+                return '<node package="com.phoenix.read" text="第98集 高能短剧推荐" />'
+
+            def window_size(self):
+                return (900, 1600)
+
+        ops = HongguoOperations(DummyDevice())
+        assert ops.get_current_episode() == 0
+
+    def test_get_current_episode_ignores_total_episode_hint(self):
+        class DummyDevice:
+            def app_current(self):
+                return {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                }
+
+            def dump_hierarchy(self):
+                return '<node package="com.phoenix.read" text="\u5168144\u96c6" />'
+
+            def window_size(self):
+                return (900, 1600)
+
+        ops = HongguoOperations(DummyDevice())
+        assert ops.get_current_episode() == 0
+        assert ops.get_total_episodes() == 144
+
+    def test_get_current_episode_ignores_ad_page_total_hint(self):
+        class DummyDevice:
+            def app_current(self):
+                return {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                }
+
+            def dump_hierarchy(self):
+                return (
+                    '<node package="com.phoenix.read" text="\u4e0a\u6ed1\u7ee7\u7eed\u770b\u77ed\u5267" />'
+                    '<node package="com.phoenix.read" text="\u5168144\u96c6" />'
+                )
+
+            def window_size(self):
+                return (900, 1600)
+
+        ops = HongguoOperations(DummyDevice())
+        assert ops._ad_continue_visible() is True
+        assert ops.get_current_episode() == 0
+        assert ops.get_total_episodes() == 144
+
     def test_normalize_playback_speed_label(self):
         class DummyDevice:
             def dump_hierarchy(self):
@@ -729,6 +786,55 @@ class TestHongguoPlaybackHeuristics:
         assert ops._episode_range_label(30) == "1-30"
         assert ops._episode_range_label(31) == "31-60"
         assert ops._episode_range_label(60) == "31-60"
+
+    def test_click_episode_number_uses_content_desc_bounds(self):
+        class DummyDevice:
+            def __init__(self):
+                self.clicked = []
+
+            def dump_hierarchy(self):
+                return (
+                    '<node package="com.phoenix.read" text="" content-desc="21" '
+                    'bounds="[360,840][450,930]" />'
+                )
+
+            def window_size(self):
+                return (900, 1600)
+
+            def click(self, x, y):
+                self.clicked.append((x, y))
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        assert ops._click_episode_number_from_xml(21) is True
+        assert device.clicked == [(405, 885)]
+
+    def test_click_episode_number_scrolls_when_target_is_clipped(self):
+        class DummyDevice:
+            def __init__(self):
+                self.clicked = []
+                self.swipes = []
+
+            def dump_hierarchy(self):
+                return (
+                    '<node package="com.phoenix.read" text="21" '
+                    'bounds="[316,1541][439,1600]" />'
+                )
+
+            def window_size(self):
+                return (900, 1600)
+
+            def click(self, x, y):
+                self.clicked.append((x, y))
+
+            def swipe(self, x1, y1, x2, y2, duration=0.4):
+                self.swipes.append((x1, y1, x2, y2, duration))
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        assert ops._click_episode_number_from_xml(21) is False
+        assert device.clicked == []
+        assert device.swipes
 
     def test_open_comment_panel_falls_back_to_comment_bubble_coordinates(self):
         class DummySelector:
@@ -770,18 +876,660 @@ class TestHongguoPlaybackHeuristics:
 
         ops = HongguoOperations(DummyDevice())
         assert ops._is_title_candidate("12:54") is False
+        assert ops._is_title_candidate("8.9分") is False
+        assert ops._is_title_candidate("80集") is False
         assert ops._is_title_candidate("逆命谋臣：从赘婿到帝王") is True
 
     def test_extract_detail_title_skips_status_bar_time(self):
         class DummyDevice:
             def dump_hierarchy(self):
-                return 'text="12:54" bounds="[24,12][120,60]" text="逆命谋臣：从赘婿到帝王" bounds="[24,1320][650,1390]"'
+                return (
+                    '<node package="com.phoenix.read" text="12:54" bounds="[24,12][120,60]" />'
+                    '<node package="com.phoenix.read" text="逆命谋臣：从赘婿到帝王" bounds="[24,1320][650,1390]" />'
+                )
 
             def window_size(self):
                 return (1080, 1920)
 
         ops = HongguoOperations(DummyDevice())
         assert ops._extract_detail_title() == "逆命谋臣：从赘婿到帝王"
+
+    def test_extract_detail_title_prefers_expected_match_over_score(self):
+        class DummyDevice:
+            def dump_hierarchy(self):
+                return (
+                    '<node package="com.phoenix.read" text="8.9分" bounds="[24,120][180,170]" />'
+                    '<node package="com.phoenix.read" text="一品布衣2：烽火篇" bounds="[24,1320][650,1390]" />'
+                )
+
+            def window_size(self):
+                return (1080, 1920)
+
+        ops = HongguoOperations(DummyDevice())
+        assert ops._extract_detail_title("一品布衣2") == "一品布衣2：烽火篇"
+
+    def test_extract_detail_title_ignores_desktop_ad_banner(self):
+        class DummyDevice:
+            def dump_hierarchy(self):
+                return (
+                    '<node package="app.lawnchair" text="水墨山海，再启仙途，共庆半周年！" />'
+                    '<node package="com.phoenix.read" text="一品布衣2：烽火篇" bounds="[24,1320][650,1390]" />'
+                    '<node package="com.phoenix.read" text="全144集" />'
+                )
+
+            def window_size(self):
+                return (1080, 1920)
+
+        ops = HongguoOperations(DummyDevice())
+        assert ops._extract_detail_title("一品布衣2") == "一品布衣2：烽火篇"
+
+    def test_extract_detail_title_does_not_fallback_to_synopsis_when_expected_missing(self):
+        class DummyDevice:
+            def dump_hierarchy(self):
+                return (
+                    '<node package="com.phoenix.read" text="徐牧等人以异常残酷的方式打退…" bounds="[24,1320][650,1390]" />'
+                    '<node package="com.phoenix.read" text="全144集" />'
+                    '<node package="com.phoenix.read" text="剧情简介" />'
+                )
+
+            def window_size(self):
+                return (1080, 1920)
+
+        ops = HongguoOperations(DummyDevice())
+        assert ops._extract_detail_title("一品布衣2") == ""
+
+
+    def test_type_text_sends_whole_keyword_once(self):
+        class DummyDevice:
+            def __init__(self):
+                self.calls = []
+                self.text = ""
+
+            def send_keys(self, text):
+                self.calls.append(text)
+                self.text = text
+
+            def window_size(self):
+                return (1080, 1920)
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        ops._type_text("一品布衣")
+        assert device.calls == ["一品布衣"]
+        assert device.text == "一品布衣"
+
+    def test_set_input_text_rejects_stale_keyword(self):
+        class DummyInput:
+            info = {"text": "一品布衣4"}
+
+            def click(self):
+                pass
+
+            def set_text(self, text):
+                pass
+
+            def send_keys(self, text):
+                pass
+
+            def clear_text(self):
+                pass
+
+        class DummyDevice:
+            def send_keys(self, text):
+                pass
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def dump_hierarchy(self):
+                return '<node class="android.widget.EditText" text="一品布衣4" />'
+
+        ops = HongguoOperations(DummyDevice())
+        result = ops._set_input_text(DummyInput(), "一品布衣2")
+        assert result == {"success": False, "actual_text": "一品布衣4"}
+
+    def test_set_input_text_accepts_verified_keyword(self):
+        class DummyInput:
+            def __init__(self):
+                self.info = {"text": ""}
+
+            def click(self):
+                pass
+
+            def set_text(self, text):
+                self.info["text"] = text
+
+        class DummyDevice:
+            def __init__(self, input_el):
+                self.input_el = input_el
+
+            def __call__(self, **kwargs):
+                return self.input_el
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def dump_hierarchy(self):
+                return '<node package="com.phoenix.read" text="搜索" />'
+
+        inp = DummyInput()
+        ops = HongguoOperations(DummyDevice(inp))
+        result = ops._set_input_text(inp, "一品布衣2")
+        assert result == {"success": True, "actual_text": "一品布衣2"}
+
+    def test_search_drama_runs_real_atomic_flow(self):
+        ops = HongguoOperations(object())
+        with patch.object(ops, "open_search_page", return_value={"success": True}) as open_search:
+            with patch.object(ops, "input_search_keyword", return_value={"success": True, "input_text": "一品布衣2"}) as input_keyword:
+                with patch.object(
+                    ops,
+                    "submit_search",
+                    return_value={"success": True, "titles": ["一品布衣2：烽火篇"], "submit": {"action": "press_enter"}, "message": "搜索完成"},
+                ) as submit_search:
+                    result = ops.search_drama("一品布衣2")
+        assert result["success"] is True
+        assert result["input_text"] == "一品布衣2"
+        assert result["titles"] == ["一品布衣2：烽火篇"]
+        open_search.assert_called_once_with("一品布衣2")
+        input_keyword.assert_called_once_with("一品布衣2")
+        submit_search.assert_called_once_with("一品布衣2")
+
+    def test_submit_search_rejects_when_results_tabs_missing(self):
+        class DummySelector:
+            def exists(self, timeout=0):
+                return False
+
+        class DummyDevice:
+            def window_size(self):
+                return (1080, 1920)
+
+            def app_current(self):
+                return {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                }
+
+            def dump_hierarchy(self):
+                return '<node package="com.phoenix.read" text="一品布衣2" />'
+
+            def __call__(self, **kwargs):
+                return DummySelector()
+
+            def press(self, key):
+                pass
+
+            def shell(self, command):
+                pass
+
+            def click(self, x, y):
+                pass
+
+        ops = HongguoOperations(DummyDevice())
+        result = ops._submit_search("一品布衣2")
+        assert result["success"] is True
+        assert result["candidate_visible"] is True
+        assert result["message"] == "已展示搜索候选结果，可直接进入目标剧集"
+        assert result["actions"]
+
+    def test_search_results_visible_requires_tabs(self):
+        ops = HongguoOperations(object())
+        assert ops._search_results_visible(
+            '<node package="com.phoenix.read" text="综合" />'
+            '<node package="com.phoenix.read" text="短剧" />'
+            '<node package="com.phoenix.read" text="搜索" />'
+        ) is True
+        assert ops._search_results_visible('<node text="一品布衣2" /><node text="搜索" />') is False
+
+    def test_candidate_results_visible_accepts_matching_suggestion_without_tabs(self):
+        ops = HongguoOperations(object())
+        xml = '<node package="com.phoenix.read" text="一品布衣2：烽火篇" />'
+        with patch.object(ops, "_is_app_foreground", return_value=True):
+            assert ops._candidate_results_visible("一品布衣2", xml) is True
+
+    def test_search_results_visible_does_not_treat_candidate_page_as_tabs(self):
+        ops = HongguoOperations(object())
+        xml = '<node text="一品布衣2：烽火篇" /><node text="第2季" /><node text="历史古代" />'
+        assert ops._search_results_visible(xml) is False
+
+    def test_search_results_visible_ignores_desktop_tabs(self):
+        ops = HongguoOperations(object())
+        xml = (
+            '<node package="app.lawnchair" text="综合" />'
+            '<node package="app.lawnchair" text="短剧" />'
+            '<node package="app.lawnchair" text="搜索" />'
+            '<node package="com.phoenix.read" text="一品布衣2" />'
+        )
+        assert ops._search_results_visible(xml) is False
+
+    def test_extract_drama_titles_ignores_desktop_nodes(self):
+        ops = HongguoOperations(object())
+        xml = (
+            '<node package="app.lawnchair" text="小红书" />'
+            '<node package="app.lawnchair" text="Play 商店" />'
+            '<node package="com.phoenix.read" text="一品布衣2：烽火篇" />'
+        )
+        assert ops._extract_drama_titles_from_xml(xml) == ["一品布衣2：烽火篇"]
+
+    def test_app_foreground_requires_visible_hongguo_nodes(self):
+        class DummyDevice:
+            def app_current(self):
+                return {"package": "com.phoenix.read"}
+
+            def dump_hierarchy(self):
+                return '<node package="app.lawnchair" text="搜索" />'
+
+            def window_size(self):
+                return (1080, 1920)
+
+        assert HongguoOperations(DummyDevice())._is_app_foreground() is False
+
+    def test_app_foreground_accepts_mumu_overlay_with_hongguo_business_nodes(self):
+        class DummyDevice:
+            def app_current(self):
+                return {"package": "com.phoenix.read"}
+
+            def dump_hierarchy(self):
+                return (
+                    '<node package="app.lawnchair" text="Play 商店" />'
+                    '<node package="com.phoenix.read" text="一品布衣2：烽火篇" />'
+                    '<node package="com.phoenix.read" text="全144集" />'
+                    '<node package="com.phoenix.read" text="剧评 · 9091" />'
+                )
+
+            def window_size(self):
+                return (1080, 1920)
+
+        assert HongguoOperations(DummyDevice())._is_app_foreground() is True
+
+    def test_find_drama_rejects_unmatched_results(self):
+        ops = HongguoOperations(object())
+        with patch.object(ops, "search_drama", return_value={"success": True, "titles": ["时空猎人"]}):
+            with patch.object(ops, "select_drama") as select_drama:
+                result = ops.find_drama("一品布衣")
+        assert result["success"] is False
+        assert result["message"] == "没有匹配任务短剧名称的搜索结果"
+        select_drama.assert_not_called()
+
+    def test_find_drama_selects_matching_title_atomically(self):
+        ops = HongguoOperations(object())
+        search = {"success": True, "titles": ["一品布衣2", "一品布衣2：烽火篇"]}
+        selected = {"success": True, "playable": True, "drama_title": "一品布衣2：烽火篇"}
+        with patch.object(ops, "search_drama", return_value=search):
+            with patch.object(ops, "select_drama", return_value=selected) as select_drama:
+                result = ops.find_drama("一品布衣2")
+        assert result["success"] is True
+        assert result["selected_title"] == "一品布衣2：烽火篇"
+        assert result["drama_title"] == "一品布衣2：烽火篇"
+        select_drama.assert_called_once_with("一品布衣2：烽火篇", keyword="一品布衣2")
+
+    def test_title_matching_keeps_numbered_sequels_distinct(self):
+        ops = HongguoOperations(object())
+        assert ops._title_matches("一品布衣2", "一品布衣") is False
+        assert ops._title_matches("一品布衣2", "一品布衣20") is False
+        assert ops._title_matches("一品布衣2", "一品布衣2：烽火篇") is True
+
+    def test_choose_title_prefers_specific_full_title(self):
+        ops = HongguoOperations(object())
+        title = ops._choose_title("一品布衣2", ["一品布衣2", "一品布衣2：烽火篇", "一品布衣", "历史古代", "8.9分"])
+        assert title == "一品布衣2：烽火篇"
+
+    def test_choose_title_rejects_topic_video_result(self):
+        ops = HongguoOperations(object())
+        title = ops._choose_title(
+            "一品布衣2",
+            [
+                "一品布衣2《这四重仪式后，我不在是我：将军定妆全纪录》 #一品布衣 #一品布衣2 #赵青云 #杨彦明 #2025第三只眼看中国",
+                "一品布衣2",
+                "一品布衣2：烽火篇",
+            ],
+        )
+        assert title == "一品布衣2：烽火篇"
+
+    def test_select_drama_does_not_click_first_suggestion(self):
+        class DummySelector:
+            count = 0
+
+            def exists(self, timeout=0):
+                return False
+
+        class DummyDevice:
+            def window_size(self):
+                return (1080, 1920)
+
+            def app_current(self):
+                return {"package": "com.phoenix.read"}
+
+            def dump_hierarchy(self):
+                return '<node package="com.phoenix.read" text="搜索" />'
+
+            def __call__(self, **kwargs):
+                return DummySelector()
+
+        ops = HongguoOperations(DummyDevice())
+        with patch.object(ops, "_click_first_search_suggestion") as click_first:
+            result = ops.select_drama("一品布衣2", keyword="一品布衣2")
+        assert result["success"] is False
+        click_first.assert_not_called()
+
+    def test_select_drama_accepts_episode_picker_as_playable(self):
+        class DummySelector:
+            def exists(self, timeout=0):
+                return False
+
+        class DummyDevice:
+            def __init__(self):
+                self.clicked = []
+                self.detail = False
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def app_current(self):
+                return {"package": "com.phoenix.read"}
+
+            def dump_hierarchy(self):
+                if self.detail:
+                    return (
+                        '<node package="com.phoenix.read" text="一品布衣2：烽火篇" />'
+                        '<node package="com.phoenix.read" text="选集" />'
+                        '<node package="com.phoenix.read" text=" · 已完结 · 全144集" />'
+                        '<node package="com.phoenix.read" text="第3集" />'
+                        '<node package="app.lawnchair" text="Play 商店" />'
+                    )
+                return '<node package="com.phoenix.read" text="一品布衣2：烽火篇" bounds="[120,200][600,260]" />'
+
+            def click(self, x, y):
+                self.clicked.append((x, y))
+                self.detail = True
+
+            def __call__(self, **kwargs):
+                return DummySelector()
+
+        ops = HongguoOperations(DummyDevice())
+        with patch.object(ops, "_sleep"):
+            result = ops.select_drama("一品布衣2：烽火篇", keyword="一品布衣2")
+        assert result["success"] is True
+        assert result["playable"] is True
+        assert result["drama_title"] == "一品布衣2：烽火篇"
+
+    def test_select_drama_accepts_target_detail_without_play_button(self):
+        class DummySelector:
+            def exists(self, timeout=0):
+                return False
+
+        class DummyDevice:
+            def window_size(self):
+                return (1080, 1920)
+
+            def app_current(self):
+                return {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                }
+
+            def dump_hierarchy(self):
+                return (
+                    '<node package="com.phoenix.read" text="一品布衣2：烽火篇" />'
+                    '<node package="com.phoenix.read" text="全144集" />'
+                    '<node package="com.phoenix.read" text="剧情简介" />'
+                    '<node package="com.phoenix.read" text="剧评 · 9091" />'
+                )
+
+            def __call__(self, **kwargs):
+                return DummySelector()
+
+        ops = HongguoOperations(DummyDevice())
+        result = ops.select_drama("一品布衣2：烽火篇", keyword="一品布衣2")
+        assert result["success"] is True
+        assert result["playable"] is False
+        assert result["detail_visible"] is True
+
+    def test_select_drama_uses_clicked_title_when_detail_only_shows_synopsis(self):
+        class DummySelector:
+            def exists(self, timeout=0):
+                return False
+
+        class DummyDevice:
+            def __init__(self):
+                self.detail = False
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def app_current(self):
+                return {"package": "com.phoenix.read"}
+
+            def dump_hierarchy(self):
+                if self.detail:
+                    return (
+                        '<node package="com.phoenix.read" text="徐牧等人以异常残酷的方式打退…" bounds="[24,1320][650,1390]" />'
+                        '<node package="com.phoenix.read" text="全144集" />'
+                        '<node package="com.phoenix.read" text="选集" />'
+                    )
+                return '<node package="com.phoenix.read" text="一品布衣2：烽火篇" bounds="[120,200][600,260]" />'
+
+            def click(self, x, y):
+                self.detail = True
+
+            def __call__(self, **kwargs):
+                return DummySelector()
+
+        ops = HongguoOperations(DummyDevice())
+        with patch.object(ops, "_sleep"):
+            result = ops.select_drama("一品布衣2：烽火篇", keyword="一品布衣2")
+        assert result["success"] is True
+        assert result["drama_title"] == "一品布衣2：烽火篇"
+
+    def test_ad_continue_prompt_triggers_swipe(self):
+        class DummyDevice:
+            def __init__(self):
+                self.swipes = []
+                self.dumps = 0
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def dump_hierarchy(self):
+                self.dumps += 1
+                if self.dumps == 1:
+                    return '<node package="com.phoenix.read" text="上滑继续观看短剧" />'
+                return '<node package="com.phoenix.read" text="第2集" />'
+
+            def swipe(self, x1, y1, x2, y2, duration=0.4):
+                self.swipes.append((x1, y1, x2, y2, duration))
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        with patch("rpa.hongguo.operations.time.sleep"):
+            assert ops.skip_ad_if_present() is True
+        assert device.swipes
+        assert device.swipes[0][1] > device.swipes[0][3]
+
+    def test_ad_continue_short_prompt_triggers_swipe(self):
+        class DummyDevice:
+            def __init__(self):
+                self.swipes = []
+                self.dumps = 0
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def dump_hierarchy(self):
+                self.dumps += 1
+                if self.dumps == 1:
+                    return '<node package="com.phoenix.read" text="上滑继续看短剧" />'
+                return '<node package="com.phoenix.read" text="第4集" />'
+
+            def swipe(self, x1, y1, x2, y2, duration=0.4):
+                self.swipes.append((x1, y1, x2, y2, duration))
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        with patch("rpa.hongguo.operations.time.sleep"):
+            assert ops.skip_ad_if_present() is True
+        assert device.swipes
+        assert device.swipes[0][1] > device.swipes[0][3]
+
+    def test_ad_page_markers_with_continue_prompt_trigger_swipe(self):
+        class DummyDevice:
+            def __init__(self):
+                self.swipes = []
+                self.dumps = 0
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def dump_hierarchy(self):
+                self.dumps += 1
+                if self.dumps == 1:
+                    return (
+                        '<node package="com.phoenix.read" text="广告" />'
+                        '<node package="com.phoenix.read" text="免费演示" />'
+                        '<node package="com.phoenix.read" text="Kuaizi筷子科技" />'
+                        '<node package="com.phoenix.read" text="上滑继续观看短剧" />'
+                    )
+                return '<node package="com.phoenix.read" text="第5集" />'
+
+            def swipe(self, x1, y1, x2, y2, duration=0.4):
+                self.swipes.append((x1, y1, x2, y2, duration))
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        with patch("rpa.hongguo.operations.time.sleep"):
+            assert ops.skip_ad_if_present() is True
+        assert device.swipes
+        assert device.swipes[0][1] > device.swipes[0][3]
+
+    def test_ad_page_markers_without_swipe_prompt_do_not_trigger_swipe(self):
+        class DummyDevice:
+            def __init__(self):
+                self.swipes = []
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def dump_hierarchy(self):
+                return (
+                    '<node package="com.phoenix.read" text="第5集" />'
+                    '<node package="com.phoenix.read" text="短剧" />'
+                    '<node package="com.phoenix.read" text="广告" />'
+                    '<node package="com.phoenix.read" text="直播中" />'
+                    '<node package="com.phoenix.read" text="评论" />'
+                )
+
+            def swipe(self, x1, y1, x2, y2, duration=0.4):
+                self.swipes.append((x1, y1, x2, y2, duration))
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        assert ops.skip_ad_if_present() is False
+        assert device.swipes == []
+
+    def test_ad_carousel_on_playback_page_does_not_trigger_swipe(self):
+        class DummyDevice:
+            def __init__(self):
+                self.swipes = []
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def dump_hierarchy(self):
+                return (
+                    '<node package="com.phoenix.read" text="第19集" />'
+                    '<node package="com.phoenix.read" text="一品布衣2：烽火篇" />'
+                    '<node package="com.phoenix.read" text="选集 · 已完结 · 全144集" />'
+                    '<node package="com.phoenix.read" content-desc="广告轮播" />'
+                )
+
+            def swipe(self, x1, y1, x2, y2, duration=0.4):
+                self.swipes.append((x1, y1, x2, y2, duration))
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        assert ops.skip_ad_if_present() is False
+        assert device.swipes == []
+
+    def test_ad_skip_returns_false_when_prompt_remains(self):
+        class DummyDevice:
+            def __init__(self):
+                self.swipes = []
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def dump_hierarchy(self):
+                return '<node package="com.phoenix.read" text="上滑继续看短剧" />'
+
+            def swipe(self, x1, y1, x2, y2, duration=0.4):
+                self.swipes.append((x1, y1, x2, y2, duration))
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        with patch("rpa.hongguo.operations.time.sleep"):
+            assert ops.skip_ad_if_present(attempts=2) is False
+        assert len(device.swipes) == 2
+
+    def test_resume_playback_clicks_center_overlay_without_text(self):
+        class DummyDevice:
+            def __init__(self):
+                self.clicks = []
+
+            def window_size(self):
+                return (900, 1600)
+
+            def dump_hierarchy(self):
+                return (
+                    '<node package="com.phoenix.read" text="第3集" />'
+                    '<node package="com.phoenix.read" clickable="true" bounds="[386,680][514,808]" />'
+                )
+
+            def __call__(self, **kwargs):
+                class Selector:
+                    def exists(self, timeout=0):
+                        return False
+
+                return Selector()
+
+            def click(self, x, y):
+                self.clicks.append((x, y))
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        with patch("rpa.hongguo.operations.time.sleep"):
+            assert ops.resume_playback_if_paused() is True
+        assert device.clicks == [(450, 744)]
+
+    def test_exit_fullscreen_does_not_press_back_on_home_activity(self):
+        class DummySelector:
+            def exists(self, timeout=0):
+                return False
+
+        class DummyDevice:
+            def __init__(self):
+                self.presses = []
+
+            def window_size(self):
+                return (900, 1600)
+
+            def app_current(self):
+                return {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.pages.main.MainFragmentActivity",
+                }
+
+            def dump_hierarchy(self):
+                return '<node package="com.phoenix.read" text="第98集" />'
+
+            def __call__(self, **kwargs):
+                return DummySelector()
+
+            def press(self, key):
+                self.presses.append(key)
+
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        assert ops.exit_fullscreen() is False
+        assert device.presses == []
 
 
 class TestHongguoLoginDetails:
@@ -875,6 +1623,20 @@ class TestHongguoEngineWaits:
             ["逆命谋臣：从赘婿到帝王"],
         ) == "逆命谋臣：从赘婿到帝王"
 
+    def test_watch_episode_plan_starts_from_target_episode(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        assert engine._watch_episode_plan(6, 3) == [3, 4, 5, 6]
+        assert engine._watch_episode_plan(6, 99) == [6]
+
+    def test_watch_episode_plan_can_cover_full_drama_from_first_episode(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        assert engine._watch_episode_plan(6, 1) == [1, 2, 3, 4, 5, 6]
+
+    def test_comment_episode_plan_keeps_rule_start_episode(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        task = {"comment_mode": "specified", "start_episode": 3, "episode_interval": 2}
+        assert engine._comment_episode_plan(task, 8) == [3, 5, 7]
+
     def test_resume_playback_check_runs_once(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
         engine._resume_playback_check = True
@@ -923,6 +1685,90 @@ class TestHongguoEngineWaits:
                 return 1
 
         assert engine._wait_for_next_episode(DummyOps(), 2, {"comment_interval_sec": 1}) is False
+
+    def test_wait_for_next_episode_rejects_skip_ahead(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        logs = []
+        engine._log = lambda level, message: logs.append((level, message))
+
+        class DummyOps:
+            def skip_ad_if_present(self):
+                return False
+
+            def get_current_episode(self):
+                return 4
+
+            def _playback_visible(self):
+                return True
+
+        assert engine._wait_for_next_episode(DummyOps(), 2, {"comment_interval_sec": 1}) is False
+        assert any("目标下一集" in message for _, message in logs)
+
+    def test_wait_for_next_episode_skips_ad_before_resume(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        logs = []
+        engine._log = lambda level, message: logs.append((level, message))
+
+        class DummyOps:
+            def __init__(self):
+                self.skip_calls = 0
+
+            def skip_ad_if_present(self):
+                self.skip_calls += 1
+                return self.skip_calls == 1
+
+            def _is_app_foreground(self):
+                return True
+
+            def get_current_episode(self):
+                return 2
+
+            def _playback_visible(self):
+                return True
+
+        ops = DummyOps()
+        with patch("rpa.hongguo.engine.time.time", side_effect=[0, 1, 2, 3]):
+            with patch("rpa.hongguo.engine.time.sleep"):
+                assert engine._wait_for_next_episode(ops, 1, {"comment_interval_sec": 1}) is True
+        assert ops.skip_calls == 1
+        assert any("广告页" in message for _, message in logs)
+        assert any("广告后已进入第2集" in message for _, message in logs)
+
+    def test_wait_for_next_episode_does_not_resume_while_episode_is_playing(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+
+        class DummyOps:
+            def __init__(self):
+                self.resume_calls = 0
+
+            def skip_ad_if_present(self):
+                return False
+
+            def get_current_episode(self):
+                return 3
+
+            def _playback_visible(self):
+                return True
+
+            def resume_playback_if_paused(self, allow_center_fallback=False):
+                self.resume_calls += 1
+                return True
+
+        ops = DummyOps()
+        times = iter([0, 1, 1, 15, 15, 17, 17, 29, 29, 31, 31, 123])
+        last_time = [0]
+
+        def fake_time():
+            try:
+                last_time[0] = next(times)
+            except StopIteration:
+                last_time[0] += 2
+            return last_time[0]
+
+        with patch("rpa.hongguo.engine.time.time", side_effect=fake_time):
+            with patch("rpa.hongguo.engine.time.sleep"):
+                assert engine._wait_for_next_episode(ops, 3, {"comment_interval_sec": 1}) is False
+        assert ops.resume_calls == 0
 
     def test_safe_comment_window_caps_delay_for_fast_playback(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")

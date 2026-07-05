@@ -60,7 +60,7 @@
       show-icon
     >
       <template #title>
-        {{ loginStatus.logged_in ? '红果已登录' : '红果未确认登录' }}
+        {{ loginStatusTitle }}
       </template>
       <template #default>
         <div class="status-detail">
@@ -149,6 +149,14 @@ const loadingDevices = ref(false)
 const selectedDeviceAddr = ref('')
 const deviceOptions = ref([])
 const configuredDeviceOnline = ref(true)
+
+const loginStatusTitle = computed(() => {
+  if (!loginStatus.value) return ''
+  if (loginStatus.value.logged_in) return '红果已登录'
+  if (loginStatus.value.status === 'device_connect_failed') return '设备连接失败'
+  if (loginStatus.value.status === 'app_launch_failed') return '红果启动失败'
+  return '红果未确认登录'
+})
 
 const selectedDeviceHint = computed(() => {
   const selected = deviceOptions.value.find((item) => item.addr === selectedDeviceAddr.value)

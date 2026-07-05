@@ -29,7 +29,7 @@ from rpa.dashboard.routes_hongguo import router as hongguo_router
 _collector = None
 _alert_engine = None
 
-app = FastAPI(title="SuperClaw Dashboard", version="0.1.0")
+app = FastAPI(title="SuperClaw Dashboard", version="0.2.0")
 app.include_router(hongguo_router)
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))

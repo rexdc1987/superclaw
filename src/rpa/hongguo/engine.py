@@ -138,36 +138,35 @@ class TaskEngine:
 
             self._check_pause_stop()
             self._log("info", f"搜索关键词: {task['drama_name']}")
-            search = ops.search_drama(task["drama_name"])
-            self._log("info", search.get("message", "搜索完成"))
-            if not search.get("success"):
-                raise RuntimeError(search.get("message") or "搜索短剧失败")
+            found = ops.find_drama(task["drama_name"])
+            search = found.get("search") or {}
+            self._log("info", search.get("message", found.get("message", "搜索完成")))
+            if search.get("input_text") is not None:
+                self._log("info", f"搜索框实际输入: {search.get('input_text')}")
             ops.take_screenshot("search_results", self.screenshot_dir)
 
-            titles = search.get("titles") or []
+            titles = found.get("titles") or search.get("titles") or []
             self._log("info", f"搜索结果标题: {titles[:5]}")
-            selected_title = self._choose_title(task["drama_name"], titles)
-            if not selected_title:
-                raise RuntimeError(f"未找到匹配短剧: {task['drama_name']}")
-            selected = ops.select_drama(selected_title)
-            if not selected.get("success"):
-                raise RuntimeError(selected.get("message") or "选择短剧失败")
-            if not selected.get("playable"):
-                raise RuntimeError("短剧不可播放")
-            drama_title = selected.get("drama_title") or selected_title or task["drama_name"]
+            if not found.get("success"):
+                raise RuntimeError(found.get("message") or f"未找到匹配短剧: {task['drama_name']}")
+            drama_title = found.get("drama_title") or found.get("selected_title") or task["drama_name"]
             self._log("info", f"已选择短剧: {drama_title}")
             ops.take_screenshot("drama_detail", self.screenshot_dir)
 
+            rule_start_episode = max(1, int(task.get("start_episode") or 1))
+            watch_start_episode = 1
             total = ops.get_total_episodes()
             if total <= 0:
-                ops.play_episode(1)
+                ops.play_episode(watch_start_episode)
                 time.sleep(2)
                 ops.exit_fullscreen()
-                total = ops.get_total_episodes() or 1
+                total = ops.get_total_episodes() or watch_start_episode
             self._update_task(total_episodes=total)
             self._log("info", f"检测到总集数: {total}")
 
-            watch_episodes = self._watch_episode_plan(total)
+            watch_start_episode = min(watch_start_episode, max(1, total))
+            rule_start_episode = min(rule_start_episode, max(1, total))
+            watch_episodes = self._watch_episode_plan(total, watch_start_episode)
             comment_episodes = set(self._comment_episode_plan(task, total))
             done_episodes = self._completed_comment_episodes()
             if done_episodes:
@@ -183,20 +182,12 @@ class TaskEngine:
                     ensure_ascii=False,
                 )
             )
-            self._log("info", f"刷剧计划: 第1集到第{total}集")
+            self._log("info", f"刷剧计划: 第{watch_start_episode}集到第{total}集")
             self._log("info", f"评论集数计划: {sorted(comment_episodes)}")
+            if rule_start_episode != watch_start_episode:
+                self._log("info", f"评论规则起始集: 第{rule_start_episode}集，刷剧仍从第{watch_start_episode}集开始")
             if done_episodes:
                 self._log("info", f"已完成评论集数将跳过: {sorted(done_episodes)}")
-            current_episode = ops.get_current_episode()
-            if current_episode > 1:
-                self._log("info", f"检测到当前停留在第{current_episode}集，准备切回第1集")
-            if not ops.play_episode(1):
-                self._log("warn", "首集播放未确认，准备重试切换第1集")
-                time.sleep(2)
-                if not ops.play_episode(1):
-                    failure_shot = ops.take_screenshot("ep1_play_failed", self.screenshot_dir)
-                    self._save_record(1, "", "ai", "failed", screenshot_input=failure_shot, error_message="首集播放失败")
-                    raise RuntimeError("首集播放失败")
             desired_speed = str(task.get("playback_speed") or "1.0x")
             if desired_speed != "1.0x":
                 self._log("info", f"准备设置倍速: {desired_speed}")
@@ -204,9 +195,19 @@ class TaskEngine:
                     self._log("info", f"倍速已设置: {desired_speed}")
                 else:
                     self._log("warn", f"倍速设置失败，继续使用当前倍速: {desired_speed}")
-            self._log("info", "首集播放已触发，开始确认当前播放状态")
-            if not self._wait_for_episode(ops, 1, task):
-                self._log("warn", "首集播放状态确认不足，将继续观察自动跳集")
+            current_episode = ops.get_current_episode()
+            if current_episode > 0 and current_episode != watch_start_episode:
+                self._log("info", f"检测到当前停留在第{current_episode}集，准备切到第{watch_start_episode}集")
+            if not ops.play_episode(watch_start_episode):
+                self._log("warn", f"第{watch_start_episode}集播放未确认，准备重试切换")
+                time.sleep(2)
+                if not ops.play_episode(watch_start_episode):
+                    failure_shot = ops.take_screenshot(f"ep{watch_start_episode}_play_failed", self.screenshot_dir)
+                    self._save_record(watch_start_episode, "", "ai", "failed", screenshot_input=failure_shot, error_message=f"第{watch_start_episode}集播放失败")
+                    raise RuntimeError(f"第{watch_start_episode}集播放失败")
+            self._log("info", f"第{watch_start_episode}集播放已触发，开始确认当前播放状态")
+            if not self._wait_for_episode(ops, watch_start_episode, task):
+                self._log("warn", f"第{watch_start_episode}集播放状态确认不足，将继续观察自动跳集")
 
             for episode in watch_episodes:
                 self._check_pause_stop()
@@ -216,13 +217,31 @@ class TaskEngine:
                     failure_shot = ops.take_screenshot(f"ep{episode}_play_failed", self.screenshot_dir)
                     self._save_record(episode, "", "ai", "failed", screenshot_input=failure_shot, error_message="等待当前集播放失败")
                     self._log("error", f"第{episode}集播放状态未能确认")
-                    continue
+                    current = ops.get_current_episode()
+                    state = f"当前识别到第{current}集" if current else "当前集数无法识别"
+                    raise RuntimeError(f"第{episode}集播放状态未能确认，{state}，已停止以避免继续跳错")
 
                 if episode not in comment_episodes:
                     if episode < total and not self._wait_for_next_episode(ops, episode, task):
+                        target_episode = episode + 1
                         failure_shot = ops.take_screenshot(f"ep{episode}_next_failed", self.screenshot_dir)
-                        self._save_record(episode, "", "ai", "failed", screenshot_input=failure_shot, error_message="等待下一集失败")
-                        self._log("error", f"第{episode}集未能自动跳到下一集")
+                        self._save_record(
+                            episode,
+                            "",
+                            "ai",
+                            "failed",
+                            screenshot_input=failure_shot,
+                            error_message=f"等待第{target_episode}集失败",
+                        )
+                        self._log("error", f"第{episode}集未能自动跳到第{target_episode}集")
+                        if self._recover_episode_position(ops, target_episode, task):
+                            self._log("info", f"已恢复到第{target_episode}集，继续按顺序执行")
+                        else:
+                            current = ops.get_current_episode()
+                            state = f"当前识别到第{current}集" if current else "当前集数无法识别"
+                            raise RuntimeError(
+                                f"第{episode}集后无法确认第{target_episode}集，{state}，已停止以避免跳错短剧"
+                            )
                     else:
                         self._log("info", f"第{episode}集未命中评论规则，继续下一集")
                     continue
@@ -248,7 +267,13 @@ class TaskEngine:
                         error_message="评论前已跳出目标集，取消发布",
                     )
                     self._log("warn", f"第{episode}集评论窗口已错过，取消发布以避免发到错误集")
-                    self._recover_episode_position(ops, episode + 1, task)
+                    target_episode = episode + 1
+                    if not self._recover_episode_position(ops, target_episode, task):
+                        current = ops.get_current_episode()
+                        state = f"当前识别到第{current}集" if current else "当前集数无法识别"
+                        raise RuntimeError(
+                            f"第{episode}集评论窗口错过后无法确认第{target_episode}集，{state}，已停止以避免跳错短剧"
+                        )
                     continue
                 input_path = ops.take_screenshot(f"ep{episode}_before_comment", self.screenshot_dir)
                 post = ops.post_comment(content, episode)
@@ -284,8 +309,15 @@ class TaskEngine:
                 ops.ensure_playback_page(episode)
 
                 if episode < total and not self._wait_for_next_episode(ops, episode, task):
-                    self._recover_episode_position(ops, episode + 1, task)
-                    self._log("warn", f"第{episode}集评论后未能自动跳到下一集")
+                    target_episode = episode + 1
+                    if self._recover_episode_position(ops, target_episode, task):
+                        self._log("warn", f"第{episode}集评论后未能自动跳到下一集，已恢复到第{target_episode}集")
+                    else:
+                        current = ops.get_current_episode()
+                        state = f"当前识别到第{current}集" if current else "当前集数无法识别"
+                        raise RuntimeError(
+                            f"第{episode}集评论后无法确认第{target_episode}集，{state}，已停止以避免跳错短剧"
+                        )
 
             if self._stop_event.is_set():
                 self._update_task(status="stopped", completed_at=datetime.now())
@@ -370,14 +402,22 @@ class TaskEngine:
         except (TypeError, ValueError):
             return 1.0
 
-    def _watch_episode_plan(self, total: int) -> List[int]:
+    def _watch_episode_plan(self, total: int, start_episode: int = 1) -> List[int]:
         total = max(1, int(total or 1))
-        return list(range(1, total + 1))
+        start_episode = min(max(1, int(start_episode or 1)), total)
+        return list(range(start_episode, total + 1))
 
     def _wait_for_episode(self, ops: HongguoOperations, episode: int, task: Dict[str, Any]) -> bool:
         deadline = time.time() + max(40, int(task.get("comment_interval_sec") or 30) + 90)
         while time.time() < deadline:
             self._check_pause_stop()
+            if self._restore_foreground_if_needed(ops, episode):
+                time.sleep(2)
+                continue
+            if self._skip_ad_if_present(ops):
+                self._log("info", "检测到广告页，已上滑继续观看")
+                time.sleep(2)
+                continue
             self._resume_playback_if_needed(ops)
             current = ops.get_current_episode()
             if current == episode:
@@ -391,27 +431,64 @@ class TaskEngine:
         timeout = int(task.get("comment_interval_sec") or 30)
         deadline = time.time() + max(30, timeout + 90)
         target = episode + 1
-        same_episode_since: Optional[float] = None
-        resume_attempted = False
+        last_seen: Optional[int] = None
         while time.time() < deadline:
             self._check_pause_stop()
+            if self._restore_foreground_if_needed(ops, episode):
+                time.sleep(2)
+                continue
+            if self._skip_ad_if_present(ops):
+                self._log("info", f"第{episode}集后检测到广告页，已上滑继续观看")
+                time.sleep(3)
+                current_after_ad = ops.get_current_episode()
+                if current_after_ad == target:
+                    self._log("info", f"广告后已进入第{target}集")
+                    return True
+                if current_after_ad:
+                    last_seen = current_after_ad
+                    self._log("info", f"广告后当前识别为第{current_after_ad}集，目标第{target}集")
+                    if current_after_ad > target:
+                        self._log("warn", f"广告后检测到已跳到第{current_after_ad}集，目标下一集是第{target}集")
+                        return False
+                    if current_after_ad < episode:
+                        self._log("warn", f"广告后检测到回退到第{current_after_ad}集，当前应为第{episode}集")
+                        return False
+                else:
+                    self._log("warn", f"第{episode}集广告上滑后暂时无法识别当前集数")
+                continue
             self._resume_playback_if_needed(ops)
             current = ops.get_current_episode()
-            if current >= target:
+            if current != last_seen:
+                last_seen = current
+                if current:
+                    self._log("info", f"等待第{target}集，当前识别为第{current}集")
+                else:
+                    self._log("warn", f"等待第{target}集时暂时无法识别当前集数")
+            if current == target:
                 return True
+            if current and current > target:
+                self._log("warn", f"检测到已跳到第{current}集，目标下一集是第{target}集")
+                return False
             if current and current < episode:
                 return False
             if current == episode and ops._playback_visible():
-                if same_episode_since is None:
-                    same_episode_since = time.time()
-                elif not resume_attempted and time.time() - same_episode_since >= 20:
-                    if ops.resume_playback_if_paused(allow_center_fallback=True):
-                        self._log("warn", f"第{episode}集长时间未跳转，已尝试继续播放")
-                    resume_attempted = True
                 time.sleep(2)
                 continue
             time.sleep(2)
+        state = f"最后识别到第{last_seen}集" if last_seen else "始终未识别到当前集数"
+        self._log("error", f"等待第{target}集超时，{state}")
         return False
+
+    def _restore_foreground_if_needed(self, ops: HongguoOperations, episode: int) -> bool:
+        if ops._is_app_foreground():
+            return False
+        app = ops._safe_app_current()
+        first_package = ops._first_visible_package(ops._xml())
+        self._log("warn", f"第{episode}集观察时红果不在前台，当前={app.get('package') or '-'}，可见={first_package or '-'}，尝试拉回")
+        foreground = ops.bring_to_foreground()
+        resumed = ops.resume_playback_if_paused(allow_center_fallback=True)
+        self._log("info", f"红果前台恢复={foreground}，继续播放={resumed}")
+        return True
 
     def _resume_playback_if_needed(self, ops: HongguoOperations) -> None:
         if not self._resume_playback_check:
@@ -420,10 +497,19 @@ class TaskEngine:
         if ops.resume_playback_if_paused(allow_center_fallback=True):
             self._log("info", "恢复后已尝试继续播放")
 
+    def _skip_ad_if_present(self, ops: HongguoOperations) -> bool:
+        try:
+            return bool(ops.skip_ad_if_present())
+        except Exception:
+            return False
+
     def _recover_episode_position(self, ops: HongguoOperations, episode: int, task: Dict[str, Any]) -> bool:
         self._log("warn", f"尝试恢复到第{episode}集")
         for _ in range(2):
             self._check_pause_stop()
+            if self._skip_ad_if_present(ops):
+                self._log("info", "恢复前检测到广告页，已上滑继续观看")
+                time.sleep(2)
             if ops.ensure_playback_page(episode):
                 if self._wait_for_episode(ops, episode, task):
                     self._log("info", f"已恢复到第{episode}集")
