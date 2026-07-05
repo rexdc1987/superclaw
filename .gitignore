@@ -1,7 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
 *.so
 .Python
 venv/
@@ -9,6 +9,11 @@ env/
 *.egg-info/
 dist/
 build/
+
+# Node
+node_modules/
+.npm-cache/
+.npm/
 
 # IDE
 .vscode/
@@ -31,3 +36,17 @@ logs/
 # OS
 Thumbs.db
 .DS_Store
+
+# Screenshots (binary, not for git)
+screenshots/
+
+# Health reports / temp files
+health_report.json
+test_warnings.txt
+
+# Grafana dashboards
+grafana/
+
+# Cache
+.cache/
+*.cache

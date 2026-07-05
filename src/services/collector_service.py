@@ -1,6 +1,6 @@
 """Collector service with enhanced filtering"""
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
 from models.database import get_session
 from models.comment import Comment

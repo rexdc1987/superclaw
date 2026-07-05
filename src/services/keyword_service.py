@@ -20,7 +20,7 @@ class KeywordService:
     def update_group(self, group_id, data):
         session = get_session()
         try:
-            g = session.query(KeywordGroup).get(group_id)
+            g = session.get(KeywordGroup, group_id)
             if not g: return None
             if "keywords" in data and isinstance(data["keywords"], list):
                 data["keywords"] = json.dumps(data["keywords"], ensure_ascii=False)
@@ -35,7 +35,7 @@ class KeywordService:
     def delete_group(self, group_id) -> bool:
         session = get_session()
         try:
-            g = session.query(KeywordGroup).get(group_id)
+            g = session.get(KeywordGroup, group_id)
             if not g: return False
             session.delete(g)
             session.commit()
@@ -53,7 +53,7 @@ class KeywordService:
     def get_group_keywords(self, group_id) -> list:
         session = get_session()
         try:
-            g = session.query(KeywordGroup).get(group_id)
+            g = session.get(KeywordGroup, group_id)
             return json.loads(g.keywords) if g else []
         finally:
             session.close()
@@ -67,7 +67,7 @@ class KeywordService:
     def import_keywords(self, group_id, new_keywords) -> int:
         session = get_session()
         try:
-            g = session.query(KeywordGroup).get(group_id)
+            g = session.get(KeywordGroup, group_id)
             if not g: return 0
             existing = json.loads(g.keywords)
             merged = list(set(existing + new_keywords))

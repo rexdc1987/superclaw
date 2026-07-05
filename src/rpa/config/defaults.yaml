@@ -1,0 +1,68 @@
+# SuperClaw 默认配置
+# 优先级：defaults.yaml < 环境配置 < 环境变量 < 运行时覆盖
+
+app:
+  name: "SuperClaw"
+  version: "0.1.0"
+  env: "production"          # development / staging / production
+  debug: false
+  log_level: "INFO"          # DEBUG / INFO / WARNING / ERROR
+
+scheduler:
+  max_instances: 1
+  misfire_grace_time: 300    # 秒
+  persistent_store: true
+  db_path: "data/scheduler_jobs.db"
+
+queue:
+  type: "asyncio"            # asyncio / redis
+  redis_url: "redis://localhost:6379/0"
+  max_workers: 5
+  task_timeout: 600          # 秒
+
+rate_limit:
+  global_capacity: 100
+  global_refill_rate: 1.67   # 100/60，每秒
+  platforms:
+    douyin:
+      capacity: 50
+      refill_rate: 0.83      # 50/60
+    weibo:
+      capacity: 30
+      refill_rate: 0.5       # 30/60
+  actions:
+    comment:
+      capacity: 20
+      refill_rate: 0.33      # 20/60
+    follow:
+      capacity: 50
+      refill_rate: 0.014     # 50/3600
+    dm:
+      capacity: 20
+      refill_rate: 0.006     # 20/3600
+    search:
+      capacity: 10
+      refill_rate: 0.17      # 10/60
+
+retry:
+  max_retries: 3
+  base_delay: 5.0
+  max_delay: 300.0
+  retryable_errors:
+    - "TimeoutError"
+    - "ConnectionError"
+    - "OSError"
+
+database:
+  url: "sqlite:///data/superclaw.db"
+  echo: false
+
+monitoring:
+  enabled: true
+  metrics_port: 9090
+  alert_channel: "feishu"
+
+accounts:
+  strategy: "round_robin"    # round_robin / health_first / random / least_used
+  cooldown_seconds: 300
+  max_consecutive_fails: 3

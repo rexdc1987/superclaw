@@ -1,6 +1,6 @@
 """线索管理服务"""
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict
 from models.database import get_session
 from models.lead import Lead
@@ -23,7 +23,7 @@ class LeadService:
     def update_lead(self, lead_id, data):
         session = get_session()
         try:
-            lead = session.query(Lead).get(lead_id)
+            lead = session.get(Lead, lead_id)
             if not lead: return None
             for key, value in data.items():
                 if hasattr(lead, key): setattr(lead, key, value)
@@ -56,7 +56,7 @@ class LeadService:
                 score = 50.0
                 details = {"base": 50}
                 if lead.source_comment_id:
-                    comment = session.query(Comment).get(lead.source_comment_id)
+                    comment = session.get(Comment, lead.source_comment_id)
                     if comment and comment.content:
                         content = comment.content
                         if strong_keywords and any(w in content for w in strong_keywords):
@@ -84,7 +84,7 @@ class LeadService:
     def assign_lead(self, lead_id, assignee) -> bool:
         session = get_session()
         try:
-            lead = session.query(Lead).get(lead_id)
+            lead = session.get(Lead, lead_id)
             if not lead: return False
             lead.assigned_to = assignee
             session.commit()
@@ -95,7 +95,7 @@ class LeadService:
     def update_status(self, lead_id, status) -> bool:
         session = get_session()
         try:
-            lead = session.query(Lead).get(lead_id)
+            lead = session.get(Lead, lead_id)
             if not lead: return False
             lead.status = status
             if status == LeadStatus.CONTACTED.value:

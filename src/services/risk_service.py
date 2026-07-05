@@ -1,5 +1,5 @@
 """风控服务"""
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import List, Tuple
 from models.database import get_session
 from models.risk import RiskRule, SensitiveWord, Blacklist
@@ -32,7 +32,7 @@ class RiskService:
     def delete_risk_rule(self, rule_id) -> bool:
         session = get_session()
         try:
-            r = session.query(RiskRule).get(rule_id)
+            r = session.get(RiskRule, rule_id)
             if not r: return False
             session.delete(r)
             session.commit()
@@ -67,7 +67,7 @@ class RiskService:
     def delete_sensitive_word(self, word_id) -> bool:
         session = get_session()
         try:
-            sw = session.query(SensitiveWord).get(word_id)
+            sw = session.get(SensitiveWord, word_id)
             if not sw: return False
             session.delete(sw)
             session.commit()
@@ -105,7 +105,7 @@ class RiskService:
     def remove_from_blacklist(self, bl_id) -> bool:
         session = get_session()
         try:
-            bl = session.query(Blacklist).get(bl_id)
+            bl = session.get(Blacklist, bl_id)
             if not bl: return False
             session.delete(bl)
             session.commit()

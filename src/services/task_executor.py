@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from models.database import get_session
 from models.task import Task
@@ -112,7 +112,7 @@ class TaskExecutor:
     async def execute(self, task_id: int, adapter=None) -> Dict:
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task:
                 return {"success": False, "error": "Task not found"}
             if task.status != TaskStatus.RUNNING.value:
@@ -328,7 +328,7 @@ class TaskExecutor:
     def _update_state(self, task_id, status):
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if task:
                 task.status = status
                 session.commit()
@@ -365,7 +365,7 @@ class TaskExecutor:
     def _update_progress(self, task_id, done, total):
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if task:
                 task.progress_done = done
                 task.progress_total = total

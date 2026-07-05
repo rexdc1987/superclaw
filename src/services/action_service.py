@@ -1,5 +1,5 @@
 """Action service"""
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict
 from models.database import get_session
 from models.action import Action
@@ -25,7 +25,7 @@ class ActionService:
     def execute_action(self, action_id, success=True, error_message=""):
         session = get_session()
         try:
-            action = session.query(Action).get(action_id)
+            action = session.get(Action, action_id)
             if not action:
                 return None
             action.status = "completed" if success else "failed"

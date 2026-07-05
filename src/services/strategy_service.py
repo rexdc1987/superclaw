@@ -55,7 +55,7 @@ class StrategyService:
     def delete_strategy(self, strategy_id: int) -> bool:
         session = get_session()
         try:
-            st = session.query(Strategy).get(strategy_id)
+            st = session.get(Strategy, strategy_id)
             if not st:
                 return False
             session.delete(st)
@@ -72,7 +72,7 @@ class StrategyService:
         """
         session = get_session()
         try:
-            st = session.query(Strategy).get(strategy_id)
+            st = session.get(Strategy, strategy_id)
             if not st:
                 return None
             rules = json.loads(st.rules_json or "[]")
@@ -100,7 +100,7 @@ class StrategyService:
         """
         session = get_session()
         try:
-            st = session.query(Strategy).get(strategy_id)
+            st = session.get(Strategy, strategy_id)
             if not st:
                 return {"success": False, "error": "Strategy not found"}
             rules = json.loads(st.rules_json or "[]")

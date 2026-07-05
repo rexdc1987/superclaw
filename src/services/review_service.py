@@ -28,7 +28,7 @@ class ReviewService:
         try:
             count = 0
             for aid in action_ids:
-                action = session.query(Action).get(aid)
+                action = session.get(Action, aid)
                 if action and action.status == "pending":
                     action.status = "reviewing"
                     count += 1
@@ -43,7 +43,7 @@ class ReviewService:
         try:
             count = 0
             for aid in action_ids:
-                action = session.query(Action).get(aid)
+                action = session.get(Action, aid)
                 if action and action.status == "reviewing":
                     action.status = "approved"
                     # Log the review
@@ -66,7 +66,7 @@ class ReviewService:
         try:
             count = 0
             for aid in action_ids:
-                action = session.query(Action).get(aid)
+                action = session.get(Action, aid)
                 if action and action.status == "reviewing":
                     action.status = "rejected"
                     action.error_message = f"Rejected by {reviewer}: {reason}"

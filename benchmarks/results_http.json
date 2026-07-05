@@ -1,0 +1,35 @@
+{
+  "single_request": {
+    "test": "single_request_latency",
+    "iterations": 100,
+    "avg_ms": 0.78,
+    "min_ms": 0.0,
+    "max_ms": 47.0,
+    "p50_ms": 0.0,
+    "p95_ms": 0.0
+  },
+  "concurrent": {
+    "test": "concurrent_throughput",
+    "concurrency": 50,
+    "total_time_ms": 31.0,
+    "throughput_rps": 1612.9,
+    "avg_latency_ms": 16.3,
+    "p95_latency_ms": 16.0
+  },
+  "middleware_overhead": {
+    "test": "middleware_chain_overhead",
+    "iterations": 100,
+    "avg_ms": 250.47,
+    "min_ms": 0.0,
+    "max_ms": 516.0,
+    "total_ms": 25047.0
+  },
+  "middleware_vs_plain": {
+    "test": "middleware_vs_plain",
+    "iterations": 100,
+    "middleware_avg_ms": 0.0,
+    "plain_avg_ms": 0.0,
+    "overhead_ms": 0.0,
+    "overhead_pct": 0
+  }
+}

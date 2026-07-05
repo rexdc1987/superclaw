@@ -97,7 +97,7 @@ class PlaybookService:
     def delete_playbook(self, playbook_id: int) -> bool:
         session = get_session()
         try:
-            pb = session.query(Playbook).get(playbook_id)
+            pb = session.get(Playbook, playbook_id)
             if not pb:
                 return False
             session.delete(pb)
@@ -113,10 +113,10 @@ class PlaybookService:
         """将打法配置应用到已有任务"""
         session = get_session()
         try:
-            pb = session.query(Playbook).get(playbook_id)
+            pb = session.get(Playbook, playbook_id)
             if not pb:
                 raise ValueError(f"Playbook {playbook_id} not found")
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task:
                 raise ValueError(f"Task {task_id} not found")
             task.search_config_json = pb.search_config_json
@@ -135,7 +135,7 @@ class PlaybookService:
             raise ValueError(f"Unknown playbook type: {playbook_type}")
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task:
                 raise ValueError(f"Task {task_id} not found")
             task.search_config_json = json.dumps(preset["search_config"], ensure_ascii=False)

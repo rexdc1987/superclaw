@@ -50,7 +50,7 @@ class ExportService:
     def export_task_report(self, task_id, output_dir="data/exports") -> str:
         session = get_session()
         try:
-            task = session.query(Task).get(task_id)
+            task = session.get(Task, task_id)
             if not task:
                 return ""
             lc = session.query(Lead).filter(Lead.task_id == task_id).count()

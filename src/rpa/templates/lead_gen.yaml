@@ -1,0 +1,209 @@
+# ============================================================
+# 获客流程模板 - lead_generation
+# 版本: 1.0
+# 描述: 搜索→筛选→评论→私信 完整获客流程
+# 作者: 诸葛亮
+# 日期: 2026-06-18
+# ============================================================
+
+workflow:
+  id: lead_generation
+  name: 获客流程模板
+  version: "1.0"
+  description: |
+    完整获客流程：
+    1. 按关键词搜索目标用户
+    2. 筛选高价值用户
+    3. 根据用户价值走不同路径
+    4. 执行评论/私信互动
+    5. 记录结果并导出
+
+# ============================================================
+# 全局配置
+# ============================================================
+config:
+  max_concurrent: 5
+  default_timeout: 300
+  retry_policy:
+    max_retries: 3
+    backoff: exponential
+    base_delay: 2
+  rate_limit:
+    max_actions_per_hour: 30
+    min_delay_seconds: 1.5
+    max_delay_seconds: 4.0
+
+# ============================================================
+# 变量定义（运行时可覆盖）
+# ============================================================
+variables:
+  platform: "douyin"
+  keywords: []
+  min_user_score: 60
+  max_comments_per_hour: 20
+  max_dms_per_hour: 10
+  target_url: ""
+  export_path: "data/exports/"
+
+# ============================================================
+# 节点定义
+# ============================================================
+nodes:
+  # ---- 起始 ----
+  - id: start
+    type: start
+    name: 流程开始
+
+  # ---- 搜索阶段 ----
+  - id: search_keywords
+    type: loop
+    name: 搜索关键词
+    description: 遍历关键词列表，逐个搜索
+    iterator: "variables.keywords"
+    max_iterations: 50
+    body: search_single_keyword
+
+  - id: search_single_keyword
+    type: action
+    name: 搜索单个关键词
+    handler: handlers.search_keyword
+    config:
+      platform: "{{variables.platform}}"
+      keyword: "{{loop.item}}"
+      result_key: "raw_users"
+
+  # ---- 筛选阶段 ----
+  - id: filter_users
+    type: action
+    name: 筛选用户
+    handler: handlers.filter_users
+    config:
+      min_score: "{{variables.min_user_score}}"
+      exclude_blocked: true
+      exclude_no_avatar: true
+      input_key: "raw_users"
+      output_key: "filtered_users"
+
+  # ---- 判断用户价值 ----
+  - id: check_user_value
+    type: conditional
+    name: 判断用户价值
+    condition: "item.score >= 80"
+    true_branch: vip_engagement
+    false_branch: normal_engagement
+
+  # ---- VIP 路径 ----
+  - id: vip_engagement
+    type: subprocess
+    name: VIP获客路径
+    subworkflow: vip_engagement
+    input_mapping:
+      filtered_users: "users"
+      platform: "platform"
+    output_mapping:
+      engaged_users: "vip_results"
+
+  # ---- 标准路径 ----
+  - id: normal_engagement
+    type: action
+    name: 标准获客路径
+    handler: handlers.standard_engagement
+    config:
+      users: "{{filtered_users}}"
+      actions: ["comment", "follow"]
+      rate_limit_key: "standard"
+
+  # ---- 汇总 ----
+  - id: collect_results
+    type: action
+    name: 汇总结果
+    handler: handlers.collect_results
+    config:
+      sources:
+        - vip_results
+        - normal_results
+
+  # ---- 导出 ----
+  - id: export_leads
+    type: action
+    name: 导出线索
+    handler: handlers.export_leads
+    config:
+      format: csv
+      path: "{{variables.export_path}}"
+      filename: "leads_{{timestamp}}.csv"
+
+  # ---- 结束 ----
+  - id: end
+    type: end
+    name: 流程结束
+
+# ============================================================
+# 边定义（依赖关系）
+# ============================================================
+edges:
+  - from: start
+    to: search_keywords
+
+  - from: search_keywords
+    to: filter_users
+    description: 所有关键词搜索完成后筛选
+
+  - from: filter_users
+    to: check_user_value
+
+  - from: check_user_value
+    to: vip_engagement
+    condition: "item.score >= 80"
+
+  - from: check_user_value
+    to: normal_engagement
+    condition: "item.score < 80"
+
+  - from: vip_engagement
+    to: collect_results
+
+  - from: normal_engagement
+    to: collect_results
+
+  - from: collect_results
+    to: export_leads
+
+  - from: export_leads
+    to: end
+
+# ============================================================
+# 子流程定义
+# ============================================================
+subworkflows:
+  vip_engagement:
+    name: VIP获客路径
+    nodes:
+      - id: vip_comment
+        type: action
+        name: 评论互动
+        handler: handlers.post_comment
+        config:
+          template: "vip_comment"
+          delay: [2, 5]
+
+      - id: vip_dm
+        type: action
+        name: 私信互动
+        handler: handlers.send_dm
+        config:
+          template: "vip_dm"
+          delay: [5, 10]
+
+      - id: vip_follow
+        type: action
+        name: 关注用户
+        handler: handlers.follow_user
+        config:
+          delay: [1, 3]
+
+    edges:
+      - from: vip_comment
+        to: vip_dm
+      - from: vip_dm
+        to: vip_follow

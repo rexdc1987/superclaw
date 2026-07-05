@@ -1,0 +1,117 @@
+:root {
+  --bg-primary: #181825;
+  --bg-card: #1e1e2e;
+  --bg-card-hover: #252536;
+  --bg-sidebar: #11111b;
+  --bg-input: #313244;
+  --text-primary: #cdd6f4;
+  --text-secondary: #a6adc8;
+  --text-muted: #585b70;
+  --highlight: #89b4fa;
+  --highlight-hover: #74c7ec;
+  --success: #a6e3a1;
+  --warning: #f9e2af;
+  --danger: #f38ba8;
+  --border-color: #313244;
+  --sidebar-width: 240px;
+  --header-height: 60px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  width: 100%;
+  font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+/* Override Element Plus dark theme */
+html.dark {
+  --el-bg-color: var(--bg-card);
+  --el-bg-color-overlay: var(--bg-card);
+  --el-text-color-primary: var(--text-primary);
+  --el-text-color-regular: var(--text-secondary);
+  --el-border-color: var(--border-color);
+  --el-color-primary: var(--highlight);
+  --el-fill-color-blank: var(--bg-input);
+}
+
+/* Global Element Plus overrides */
+.el-table {
+  --el-table-bg-color: var(--bg-card) !important;
+  --el-table-tr-bg-color: var(--bg-card) !important;
+  --el-table-header-bg-color: var(--bg-sidebar) !important;
+  --el-table-row-hover-bg-color: var(--bg-card-hover) !important;
+  --el-table-border-color: var(--border-color) !important;
+  --el-table-text-color: var(--text-primary) !important;
+  --el-table-header-text-color: var(--text-secondary) !important;
+}
+
+.el-card {
+  --el-card-bg-color: var(--bg-card);
+  --el-card-border-color: var(--border-color);
+}
+
+.el-input__wrapper {
+  background-color: var(--bg-input) !important;
+  box-shadow: 0 0 0 1px var(--border-color) inset !important;
+}
+
+.el-input__inner {
+  color: var(--text-primary) !important;
+}
+
+.el-select .el-input__wrapper {
+  background-color: var(--bg-input) !important;
+}
+
+.el-dialog {
+  --el-dialog-bg-color: var(--bg-card);
+  --el-dialog-border-radius: 12px;
+}
+
+.el-menu {
+  border-right: none !important;
+}
+
+.el-pagination {
+  --el-pagination-bg-color: var(--bg-card);
+  --el-pagination-button-bg-color: var(--bg-input);
+  --el-pagination-hover-color: var(--highlight);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--text-muted);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
+}
+
+/* Page transitions */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.2s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}

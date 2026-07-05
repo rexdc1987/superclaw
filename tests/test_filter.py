@@ -1,6 +1,6 @@
 """Filter service 测试"""
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 
 class TestFilterService:
