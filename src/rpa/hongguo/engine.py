@@ -86,7 +86,471 @@ class TaskEngine:
         self._log("info", "任务已停止")
         return True
 
+    def _run_verified_flow(self) -> None:
+        Path(self.screenshot_dir).mkdir(parents=True, exist_ok=True)
+        try:
+            os.environ.pop("PYTHONPATH", None)
+            now = datetime.now()
+            self._update_task(
+                status="running",
+                started_at=now,
+                completed_at=None,
+                duration_seconds=None,
+                error_message=None,
+                current_episode=0,
+                comments_sent=0,
+                comments_verified=0,
+                updated_at=now,
+            )
+            self._log("info", "全流程v3: 开始执行，从打开红果到刷完整部短剧")
+            if not check_connection(self.device_addr):
+                raise RuntimeError(f"设备未连接: {self.device_addr}")
+
+            device = connect(self.device_addr)
+            ops = HongguoOperations(device)
+            task = self._load_task()
+            if not task:
+                raise RuntimeError("任务不存在")
+
+            prepare = self._prepare_verified_playback(ops, task)
+            total = int(prepare.get("total_episodes") or 0)
+            if total <= 0:
+                raise RuntimeError("未识别到短剧总集数")
+            drama_title = str(prepare.get("drama_title") or task.get("drama_name") or "")
+            comment_episodes = set(self._comment_episode_plan(task, total))
+            completed_episodes = self._completed_comment_episodes()
+            if completed_episodes:
+                comment_episodes -= completed_episodes
+
+            self._update_task(
+                current_episode=1,
+                total_episodes=total,
+                execution_plan_json=json.dumps(
+                    {
+                        "watch_episodes": list(range(1, total + 1)),
+                        "comment_episodes": sorted(comment_episodes),
+                        "skipped_comment_episodes": sorted(completed_episodes),
+                        "rule": self._task_rule_snapshot(task),
+                        "flow": "verified_v3_full",
+                    },
+                    ensure_ascii=False,
+                ),
+                updated_at=datetime.now(),
+            )
+            self._log("info", f"全流程v3: 准备完成，短剧={drama_title}，总集数={total}，评论集数={sorted(comment_episodes)}")
+            self._resume_if_paused(ops, 1)
+
+            for episode in range(1, total + 1):
+                self._check_pause_stop()
+                state = self._page_state(ops, task)
+                self._assert_target_playback(ops, task, state, total)
+                current = int(state.get("current_episode") or 0)
+                if current and current != episode:
+                    raise RuntimeError(f"全流程v3跳集异常: 期望第{episode}集，当前第{current}集")
+
+                self._update_task(current_episode=episode, updated_at=datetime.now())
+                self._log("info", f"全流程v3: 正在观察第{episode}集")
+                self._resume_if_paused(ops, episode)
+
+                if episode in comment_episodes:
+                    if self._comment_already_verified(episode):
+                        self._log("info", f"全流程v3: 第{episode}集已有成功评论记录，跳过重复评论")
+                    else:
+                        self._handle_verified_comment(ops, task, drama_title, episode, total)
+
+                if episode >= total:
+                    break
+                target = episode + 1
+                if not self._wait_for_next_episode_verified(ops, task, episode, target, total):
+                    shot = ops.take_screenshot(f"ep{episode}_next_timeout", self.screenshot_dir)
+                    raise RuntimeError(f"全流程v3: 第{episode}集后未自动进入第{target}集，已截图 {shot}")
+
+            completed_at = datetime.now()
+            self._update_task(
+                status="completed",
+                completed_at=completed_at,
+                duration_seconds=self._duration_seconds(completed_at),
+                error_message=None,
+                updated_at=completed_at,
+            )
+            self._log("info", "全流程v3: 任务执行完成")
+        except StopRequested:
+            completed_at = datetime.now()
+            self._update_task(
+                status="stopped",
+                completed_at=completed_at,
+                duration_seconds=self._duration_seconds(completed_at),
+                updated_at=completed_at,
+            )
+            self._log("info", "全流程v3: 任务已停止")
+        except Exception as exc:
+            completed_at = datetime.now()
+            self._update_task(
+                status="failed",
+                error_message=str(exc),
+                completed_at=completed_at,
+                duration_seconds=self._duration_seconds(completed_at),
+                updated_at=completed_at,
+            )
+            self._log("error", f"任务失败: {exc}")
+
+    def _prepare_verified_playback(self, ops: HongguoOperations, task: Dict[str, Any]) -> Dict[str, Any]:
+        keyword = str(task.get("drama_name") or "").strip()
+        if not keyword:
+            raise RuntimeError("任务短剧名称为空")
+
+        self._check_pause_stop()
+        self._log("info", "全流程v3: 打开红果APP")
+        if not ops.launch_app():
+            raise RuntimeError("红果启动未确认")
+
+        login = self._check_login(ops)
+        self._log("info", f"全流程v3: 登录检测 - {login.get('message') or login.get('status')}")
+        if not login.get("logged_in"):
+            raise RuntimeError(login.get("message") or "登录检测失败")
+
+        self._check_pause_stop()
+        opened = ops.open_search_page(keyword)
+        self._log("info", opened.get("message") or "全流程v3: 已进入搜索框")
+        if not opened.get("success"):
+            raise RuntimeError(opened.get("message") or "进入搜索框失败")
+
+        input_result = ops.input_search_keyword(keyword)
+        self._log("info", input_result.get("message") or f"全流程v3: 已填入搜索词 {keyword}")
+        if not input_result.get("success"):
+            raise RuntimeError(input_result.get("message") or "关键词填入失败")
+
+        search = ops.submit_search(keyword)
+        self._log("info", search.get("message") or "全流程v3: 搜索完成")
+        if not search.get("success"):
+            raise RuntimeError(search.get("message") or "提交搜索失败")
+
+        titles = ops._extract_drama_titles()
+        selected_title = ops._choose_title(keyword, titles)
+        self._log("info", f"全流程v3: 搜索结果={titles[:5]}，命中={selected_title or '-'}")
+        if not selected_title:
+            raise RuntimeError("没有匹配任务短剧名称的搜索结果")
+
+        selected = ops.select_drama(selected_title, keyword=keyword)
+        drama_title = selected.get("drama_title") or selected_title
+        self._log("info", selected.get("message") or f"全流程v3: 已进入目标剧集 {drama_title}")
+        if not selected.get("success"):
+            raise RuntimeError(selected.get("message") or "进入目标剧集失败")
+
+        playback_speed = str(task.get("playback_speed") or "1.0x")
+        if playback_speed != "1.0x":
+            speed_set = ops.set_playback_speed(playback_speed)
+            self._log("info" if speed_set else "warn", f"全流程v3: 倍速设置 {playback_speed} = {speed_set}")
+            if not speed_set:
+                raise RuntimeError(f"倍速设置失败: {playback_speed}")
+
+        task_total = int(task.get("total_episodes") or 0)
+        total_before = int(ops.get_total_episodes() or task_total or 0)
+        self._log("info", f"全流程v3: 切换到第1集，当前识别总集数={total_before or 0}")
+        if not ops.play_episode(1):
+            self._log("warn", "全流程v3: 第1集播放触发未确认，继续等待页面识别")
+        if not self._wait_for_episode_verified(ops, task, 1, max(total_before, 1), timeout=90):
+            shot = ops.take_screenshot("ep1_play_failed", self.screenshot_dir)
+            raise RuntimeError(f"首集播放失败，已截图 {shot}")
+
+        state = self._page_state(ops, task)
+        total = int(state.get("total_episodes") or total_before or task_total or 0)
+        self._assert_target_playback(ops, task, state, max(total, 1))
+        return {
+            "drama_title": drama_title,
+            "total_episodes": total,
+            "current_episode": int(state.get("current_episode") or 1),
+        }
+
+    def _handle_verified_comment(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        drama_title: str,
+        episode: int,
+        expected_total: int,
+    ) -> None:
+        generator = CommentGenerator(self._current_ai_config())
+        content, source, usage = generator.generate_with_usage(
+            drama_title,
+            task.get("content_source", "ai"),
+            self._templates(task),
+        )
+        if usage:
+            record_usage(usage, context=f"task:{self.task_id}:episode:{episode}")
+
+        paused = ops.pause_playback_if_playing()
+        self._log("info", f"全流程v3: 第{episode}集命中评论规则，暂停播放={paused}，准备评论")
+        input_path = ops.take_screenshot(f"ep{episode}_before_comment", self.screenshot_dir)
+        post = ops.post_comment(content, episode)
+        if not post.get("success"):
+            failed_path = ops.take_screenshot(f"ep{episode}_post_failed", self.screenshot_dir)
+            self._save_record(episode, content, source, "failed", input_path, failed_path, post.get("message") or "评论发送失败")
+            self._log("error", f"全流程v3: 第{episode}集评论发送失败 - {post.get('message')}")
+            ops.ensure_playback_page(episode)
+            self._resume_if_paused(ops, episode)
+            return
+
+        self._increment_counter("sent")
+        verify = ops.verify_comment(content, episode, self.screenshot_dir)
+        verify_path = verify.get("screenshot_path") or ops.take_screenshot(
+            f"ep{episode}_{'verified' if verify.get('verified') else 'not_found'}",
+            self.screenshot_dir,
+        )
+        status = "success" if verify.get("verified") else "failed"
+        error = None if verify.get("verified") else verify.get("message", "评论验证失败")
+        self._save_record(episode, content, source, status, input_path, verify_path, error)
+        if status == "success":
+            self._increment_counter("verified")
+        self._log(
+            "info" if status == "success" else "error",
+            f"全流程v3: 第{episode}集评论{'验证成功' if status == 'success' else '验证失败'}，截图 {verify_path}",
+        )
+
+        ops.ensure_playback_page(episode)
+        state = self._page_state(ops, task)
+        self._assert_target_playback(ops, task, state, expected_total)
+        self._resume_if_paused(ops, episode)
+
+    def _wait_for_episode_verified(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        target: int,
+        expected_total: int,
+        timeout: int = 60,
+    ) -> bool:
+        deadline = time.time() + max(20, timeout)
+        last_log_at = 0.0
+        while time.time() < deadline:
+            self._check_pause_stop()
+            state = self._page_state(ops, task)
+            app = state.get("app") or {}
+            current = int(state.get("current_episode") or 0)
+            if app.get("package") != "com.phoenix.read":
+                raise RuntimeError(f"切集时红果不在前台，当前 package={app.get('package') or '-'}")
+            if state.get("ad_visible"):
+                shot = ops.take_screenshot(f"seek_ep{target}_ad", self.screenshot_dir)
+                skipped = ops.skip_ad_if_present(attempts=3)
+                if not skipped:
+                    ops._swipe_up_continue_ad()
+                self._log("warn", f"全流程v3: 切第{target}集时遇到广告，已截图 {shot}，上滑继续观看")
+                time.sleep(3)
+                continue
+            if app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
+                raise RuntimeError(f"切集时未停留在短剧播放页，当前 activity={app.get('activity') or '-'}")
+            total = int(state.get("total_episodes") or 0)
+            if self._total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current, target=target):
+                raise RuntimeError(f"切集时短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
+            if current == target:
+                return True
+            now = time.time()
+            if now - last_log_at >= 10:
+                self._log("info", f"全流程v3: 正在确认第{target}集，当前识别第{current or 0}集")
+                last_log_at = now
+            self._safe_resume_playback(ops, current or target, "切集确认中")
+            time.sleep(2)
+        return False
+
+    def _wait_for_next_episode_verified(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        episode: int,
+        target: int,
+        expected_total: int,
+    ) -> bool:
+        deadline = time.time() + max(300, int(task.get("comment_interval_sec") or 30) + 240)
+        last_log_at = 0.0
+        same_episode_since = 0.0
+        forced_target = False
+        while time.time() < deadline:
+            self._check_pause_stop()
+            state = self._page_state(ops, task)
+            app = state.get("app") or {}
+            current = int(state.get("current_episode") or 0)
+
+            if app.get("package") != "com.phoenix.read":
+                raise RuntimeError(f"第{episode}集后红果不在前台，当前 package={app.get('package') or '-'}")
+            if state.get("ad_visible"):
+                shot = ops.take_screenshot(f"ep{episode}_ad", self.screenshot_dir)
+                skipped = ops.skip_ad_if_present(attempts=3)
+                if not skipped:
+                    ops._swipe_up_continue_ad()
+                    self._log("warn", f"全流程v3: 第{episode}集后出现广告，常规跳过未确认成功，已截图 {shot}，执行兜底上滑")
+                else:
+                    self._log("info", f"全流程v3: 第{episode}集后出现广告，已截图 {shot}，上滑继续观看")
+                time.sleep(3)
+                continue
+            if app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
+                total = int(state.get("total_episodes") or 0)
+                raise RuntimeError(
+                    f"第{episode}集后已离开目标短剧播放页，当前 activity={app.get('activity') or '-'}，识别总集数={total or 0}"
+                )
+            total = int(state.get("total_episodes") or 0)
+            if current == 0 and total == 0:
+                shot = ops.take_screenshot(f"ep{episode}_unknown_ad_overlay", self.screenshot_dir)
+                self._log("warn", f"全流程v3: 第{episode}集后播放页集数不可见，按广告/遮罩页处理，已截图 {shot}，上滑继续观看")
+                ops._swipe_up_continue_ad()
+                time.sleep(3)
+                continue
+            if self._total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current, target=target):
+                raise RuntimeError(f"第{episode}集后跳到其他短剧: 期望总集数 {expected_total}，实际 {total}")
+
+            if current == target:
+                self._log("info", f"全流程v3: 已自动进入第{target}集")
+                return True
+            if current == episode:
+                now = time.time()
+                if same_episode_since <= 0:
+                    same_episode_since = now
+                if now - last_log_at >= 30:
+                    self._log("info", f"全流程v3: 仍在第{episode}集，等待自动播放第{target}集")
+                    self._safe_resume_playback(ops, episode, "仍停留当前集，检查是否暂停")
+                    last_log_at = now
+                if not forced_target and now - same_episode_since >= 150:
+                    shot = ops.take_screenshot(f"ep{episode}_stale_force_target", self.screenshot_dir)
+                    forced_target = ops.play_episode(target)
+                    self._log("warn", f"全流程v3: 第{episode}集停留超过150秒，已截图 {shot}，强制切第{target}集={forced_target}")
+                    time.sleep(3)
+            elif current == 0:
+                now = time.time()
+                same_episode_since = 0.0
+                if now - last_log_at >= 20:
+                    self._log("warn", f"全流程v3: 第{episode}集后暂未识别到集数，继续观察播放页")
+                    self._safe_resume_playback(ops, episode, "集数暂未识别，检查是否暂停")
+                    last_log_at = now
+            else:
+                same_episode_since = 0.0
+            if current > target:
+                raise RuntimeError(f"跳过目标集: 目标第{target}集，当前第{current}集")
+            if current < episode:
+                raise RuntimeError(f"回退异常: 上一集第{episode}集，当前第{current}集")
+            time.sleep(2)
+        return False
+
+    def _page_state(self, ops: HongguoOperations, task: Dict[str, Any]) -> Dict[str, Any]:
+        keyword = str(task.get("drama_name") or "").strip()
+        xml = ops._xml()
+        return {
+            "device": ops.get_device_info(),
+            "app": ops._safe_app_current(),
+            "app_foreground": ops._is_app_foreground(),
+            "launcher_visible": ops._launcher_visible(xml),
+            "first_visible_package": ops._first_visible_package(xml),
+            "hongguo_visible_area_ratio": ops._hongguo_visible_area_ratio(xml),
+            "current_episode": ops.get_current_episode(),
+            "total_episodes": ops.get_total_episodes(),
+            "playback_visible": ops._playback_visible(xml),
+            "playback_paused": ops.is_playback_paused(),
+            "ad_visible": ops._ad_continue_visible(xml),
+            "detail_title": ops._extract_detail_title(keyword),
+            "playing_title": ops._current_playing_title(),
+        }
+
+    def _check_login(self, ops: HongguoOperations) -> Dict[str, Any]:
+        result = ops.check_login()
+        account = ops.get_account_info()
+        if account.get("logged_in") and not result.get("logged_in"):
+            result = {
+                **result,
+                "logged_in": True,
+                "status": "logged_in",
+                "message": account.get("message") or "已登录",
+            }
+        if result.get("logged_in") and not account.get("logged_in"):
+            account = {**account, "logged_in": True}
+        return {**result, "account": account}
+
+    def _assert_target_playback(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        state: Dict[str, Any],
+        expected_total: int,
+    ) -> None:
+        app = state.get("app") or {}
+        if app.get("package") != "com.phoenix.read":
+            raise RuntimeError(f"未停留在红果APP，当前 package={app.get('package') or '-'}")
+        if app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
+            raise RuntimeError(f"未停留在目标短剧播放页，当前 activity={app.get('activity') or '-'}")
+        total = int(state.get("total_episodes") or 0)
+        current = int(state.get("current_episode") or 0)
+        if self._total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current):
+            raise RuntimeError(f"检测到短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
+        if not current:
+            raise RuntimeError("未识别到当前集数")
+        if not ops._playback_visible():
+            raise RuntimeError("未检测到播放控件")
+
+    def _total_mismatch_is_fatal(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        state: Dict[str, Any],
+        expected_total: int,
+        total: int,
+        current: int = 0,
+        target: int = 0,
+    ) -> bool:
+        if not expected_total or not total or total == expected_total:
+            return False
+
+        keyword = str(task.get("drama_name") or "").strip()
+        detail_title = str(state.get("detail_title") or "").strip()
+        title_matches = bool(detail_title and keyword and ops._title_matches(keyword, detail_title))
+        if title_matches and total < expected_total:
+            observed_floor = max(current, target)
+            if observed_floor and total >= observed_floor:
+                return False
+            if expected_total - total <= 1:
+                return False
+        return True
+
+    def _resume_if_paused(self, ops: HongguoOperations, episode: int) -> bool:
+        if not ops.is_playback_paused():
+            return False
+        resumed = ops.resume_playback_if_paused(allow_center_fallback=True)
+        still_paused = ops.is_playback_paused()
+        ok = bool(resumed and not still_paused)
+        self._log("info" if ok else "warn", f"全流程v3: 第{episode}集检测到暂停，恢复播放={resumed}，仍暂停={still_paused}")
+        return ok
+
+    def _safe_resume_playback(self, ops: HongguoOperations, episode: int, reason: str) -> bool:
+        resumed = ops.resume_playback_safely()
+        still_paused = ops.is_playback_paused()
+        ok = bool(resumed and not still_paused)
+        self._log("info" if ok else "warn", f"全流程v3: 第{episode}集{reason}，安全播放={resumed}，仍暂停={still_paused}")
+        return ok
+
+    def _comment_already_verified(self, episode: int) -> bool:
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM hongguo_comment_records
+                    WHERE task_id=%s AND episode_number=%s AND status='success'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (self.task_id, episode),
+                )
+                return cur.fetchone() is not None
+
+    def _duration_seconds(self, completed_at: datetime) -> Optional[int]:
+        task = self._load_task()
+        started_at = task.get("started_at") if task else None
+        if not started_at:
+            return None
+        try:
+            return max(0, int((completed_at - started_at).total_seconds()))
+        except Exception:
+            return None
+
     def _run(self) -> None:
+        self._run_verified_flow()
+        return
         Path(self.screenshot_dir).mkdir(parents=True, exist_ok=True)
         try:
             os.environ.pop("PYTHONPATH", None)
