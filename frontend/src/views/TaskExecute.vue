@@ -533,9 +533,12 @@ onUnmounted(() => {
 .detail-grid {
   margin-top: 18px;
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
   align-items: start;
+}
+.detail-grid > :nth-child(2) {
+  display: none;
 }
 .log-scroll {
   max-height: 420px;

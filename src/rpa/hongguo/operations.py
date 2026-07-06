@@ -370,10 +370,10 @@ class HongguoOperations:
                 return {"success": False, "drama_title": title, "playable": False, "message": "红果不在前台，取消选择短剧"}
             current_title = self._current_playing_title()
             expected = keyword or title
-            if current_title and self._title_matches(expected, current_title):
+            if current_title and self._strict_title_matches(expected, current_title):
                 return {"success": True, "drama_title": current_title, "playable": True}
             detail_title = self._extract_detail_title(expected)
-            if detail_title and self._title_matches(expected, detail_title) and self._detail_markers_visible():
+            if detail_title and self._strict_title_matches(expected, detail_title) and self._detail_markers_visible():
                 return self._drama_detail_result(detail_title, expected)
             clicked = False
             if title:
@@ -390,8 +390,15 @@ class HongguoOperations:
             self._sleep(3, 5)
             if not self._is_app_foreground():
                 return {"success": False, "drama_title": title, "playable": False, "message": "选择后离开红果 App，已取消"}
-            drama_title = self._extract_detail_title(expected) or title
-            if expected and not self._title_matches(expected, drama_title):
+            drama_title = self._extract_detail_title(expected)
+            if expected and not drama_title:
+                return {
+                    "success": False,
+                    "drama_title": title,
+                    "playable": False,
+                    "message": f"未确认进入目标短剧详情: 期望 {expected}",
+                }
+            if expected and not self._strict_title_matches(expected, drama_title):
                 return {
                     "success": False,
                     "drama_title": drama_title,
@@ -1497,6 +1504,11 @@ class HongguoOperations:
             text_match = re.search(r'text="([^"]{2,30})"', node)
             if not text_match:
                 continue
+            bounds = self._node_bounds(node)
+            if bounds and bounds[3] <= self.height * 0.12:
+                continue
+            if 'class="android.widget.EditText"' in node:
+                continue
             text = html.unescape(text_match.group(1)).strip()
             if self._is_title_candidate(text) and text not in seen:
                 titles.append(text)
@@ -1619,11 +1631,32 @@ class HongguoOperations:
                 return False
             return True
         season = self._season_marker(keyword_key)
-        if season and self._season_marker(title_key) != season:
-            return False
+        if season:
+            if self._season_marker(title_key) != season:
+                return False
+            return self._season_stem_matches(keyword_key, title_key)
         if self._has_variant_marker(keyword_key) and not self._has_variant_marker(title_key):
             return False
         return title_key in keyword_key and len(title_key) >= 4
+
+    def _strict_title_matches(self, keyword: str, title: str) -> bool:
+        if self._looks_like_non_drama_result(title):
+            return False
+        keyword_key = self._normalize_title_key(keyword)
+        title_key = self._normalize_title_key(title)
+        if not keyword_key or not title_key:
+            return False
+        if self._season_marker(keyword_key):
+            return self._title_matches(keyword, title)
+        if self._has_variant_marker(keyword_key):
+            if title_key == keyword_key:
+                return True
+            if title_key.startswith(keyword_key):
+                if keyword_key[-1:].isdigit() and title_key[len(keyword_key) : len(keyword_key) + 1].isdigit():
+                    return False
+                return True
+            return False
+        return self._title_matches(keyword, title)
 
     def _normalize_title_key(self, value: str) -> str:
         return re.sub(r"[\s《》<>:：·,，。.!！?？\-_/\\]+", "", str(value or "").lower())
@@ -1649,7 +1682,45 @@ class HongguoOperations:
 
     def _season_marker(self, value: str) -> str:
         match = re.search(r"第([一二三四五六七八九十\d]+)季", value)
-        return match.group(1) if match else ""
+        return self._canonical_season_number(match.group(1)) if match else ""
+
+    def _season_stem_matches(self, keyword_key: str, title_key: str) -> bool:
+        keyword_stem = re.sub(r"第[一二三四五六七八九十\d]+季", "", keyword_key)
+        title_stem = re.sub(r"第[一二三四五六七八九十\d]+季", "", title_key)
+        if not keyword_stem or not title_stem:
+            return False
+        return keyword_stem in title_stem or title_stem in keyword_stem
+
+    def _canonical_season_number(self, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.isdigit():
+            return str(int(text))
+        digits = {
+            "零": 0,
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+        }
+        if text == "十":
+            return "10"
+        if text.startswith("十") and len(text) == 2:
+            return str(10 + digits.get(text[1], 0))
+        if text.endswith("十") and len(text) == 2:
+            return str(digits.get(text[0], 0) * 10)
+        if "十" in text and len(text) == 3:
+            return str(digits.get(text[0], 0) * 10 + digits.get(text[2], 0))
+        if len(text) == 1 and text in digits:
+            return str(digits[text])
+        return text
 
     def _has_variant_marker(self, value: str) -> bool:
         return bool(re.search(r"\d+|第[一二三四五六七八九十\d]+[季部篇]|[上下续前后]篇", value))

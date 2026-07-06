@@ -287,8 +287,10 @@ class TaskEngine:
             failed_path = ops.take_screenshot(f"ep{episode}_post_failed", self.screenshot_dir)
             self._save_record(episode, content, source, "failed", input_path, failed_path, post.get("message") or "评论发送失败")
             self._log("error", f"全流程v3: 第{episode}集评论发送失败 - {post.get('message')}")
-            ops.ensure_playback_page(episode)
-            self._resume_if_paused(ops, episode)
+            try:
+                self._restore_playback_after_comment(ops, task, episode, expected_total)
+            except RuntimeError as exc:
+                self._log("warn", f"全流程v3: 第{episode}集评论失败后恢复播放异常: {exc}")
             return
 
         self._increment_counter("sent")
@@ -307,10 +309,7 @@ class TaskEngine:
             f"全流程v3: 第{episode}集评论{'验证成功' if status == 'success' else '验证失败'}，截图 {verify_path}",
         )
 
-        ops.ensure_playback_page(episode)
-        state = self._page_state(ops, task)
-        self._assert_target_playback(ops, task, state, expected_total)
-        self._resume_if_paused(ops, episode)
+        self._restore_playback_after_comment(ops, task, episode, expected_total)
 
     def _wait_for_episode_verified(
         self,
@@ -478,6 +477,14 @@ class TaskEngine:
         current = int(state.get("current_episode") or 0)
         if self._total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current):
             raise RuntimeError(f"检测到短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
+        keyword = str(task.get("drama_name") or "").strip()
+        title_signals = [
+            str(state.get("playing_title") or "").strip(),
+            str(state.get("detail_title") or "").strip(),
+        ]
+        reliable_titles = [title for title in title_signals if self._reliable_title_signal(keyword, title)]
+        if keyword and reliable_titles and not any(self._strict_title_matches(keyword, title) for title in reliable_titles):
+            raise RuntimeError(f"检测到短剧标题不匹配: 期望 {keyword}，实际 {reliable_titles[0]}")
         if not current:
             raise RuntimeError("未识别到当前集数")
         if not ops._playback_visible():
@@ -516,6 +523,47 @@ class TaskEngine:
         self._log("info" if ok else "warn", f"全流程v3: 第{episode}集检测到暂停，恢复播放={resumed}，仍暂停={still_paused}")
         return ok
 
+    def _restore_playback_after_comment(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        episode: int,
+        expected_total: int,
+    ) -> bool:
+        back_to_playback = ops.ensure_playback_page(episode)
+        if not back_to_playback:
+            self._log("warn", f"全流程v3: 第{episode}集评论后未直接确认回到播放页，继续读取页面状态")
+        time.sleep(1)
+
+        state = self._page_state(ops, task)
+        if state.get("ad_visible"):
+            shot = ops.take_screenshot(f"ep{episode}_after_comment_ad", self.screenshot_dir)
+            skipped = ops.skip_ad_if_present(attempts=3)
+            if not skipped:
+                ops._swipe_up_continue_ad()
+            self._log(
+                "info" if skipped else "warn",
+                f"全流程v3: 第{episode}集评论后遇到广告，已截图 {shot}，跳过广告={skipped}",
+            )
+            time.sleep(3)
+            state = self._page_state(ops, task)
+
+        self._assert_target_playback(ops, task, state, expected_total)
+        was_paused = bool(state.get("playback_paused") or ops.is_playback_paused())
+        resumed = ops.resume_playback_safely()
+        time.sleep(1)
+        still_paused = ops.is_playback_paused()
+        if still_paused:
+            resumed = ops.resume_playback_if_paused(allow_center_fallback=True) or resumed
+            time.sleep(1)
+            still_paused = ops.is_playback_paused()
+        ok = bool(resumed and not still_paused)
+        self._log(
+            "info" if ok else "warn",
+            f"全流程v3: 第{episode}集评论后恢复播放，回播放页={back_to_playback}，原暂停={was_paused}，恢复={resumed}，仍暂停={still_paused}",
+        )
+        return ok
+
     def _safe_resume_playback(self, ops: HongguoOperations, episode: int, reason: str) -> bool:
         resumed = ops.resume_playback_safely()
         still_paused = ops.is_playback_paused()
@@ -524,17 +572,23 @@ class TaskEngine:
         return ok
 
     def _comment_already_verified(self, episode: int) -> bool:
+        task = self._load_task()
+        started_at = task.get("started_at") if task else None
+        run_filter = "AND created_at >= %s" if started_at else ""
+        params: List[Any] = [self.task_id, episode]
+        if started_at:
+            params.append(started_at)
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT id
                     FROM hongguo_comment_records
-                    WHERE task_id=%s AND episode_number=%s AND status='success'
+                    WHERE task_id=%s AND episode_number=%s AND status='success' {run_filter}
                     ORDER BY id DESC
                     LIMIT 1
                     """,
-                    (self.task_id, episode),
+                    params,
                 )
                 return cur.fetchone() is not None
 
@@ -1019,16 +1073,93 @@ class TaskEngine:
         if keyword_key in title_key:
             return True
         season = self._season_marker(keyword_key)
-        if season and self._season_marker(title_key) != season:
-            return False
+        if season:
+            if self._season_marker(title_key) != season:
+                return False
+            return self._season_stem_matches(keyword_key, title_key)
         return title_key in keyword_key and len(title_key) >= 4
+
+    def _strict_title_matches(self, keyword: str, title: str) -> bool:
+        keyword_key = self._normalize_title_key(keyword)
+        title_key = self._normalize_title_key(title)
+        if not keyword_key or not title_key:
+            return False
+        if self._season_marker(keyword_key):
+            return self._title_matches(keyword, title)
+        if self._has_variant_marker(keyword_key):
+            if title_key == keyword_key:
+                return True
+            if title_key.startswith(keyword_key):
+                if keyword_key[-1:].isdigit() and title_key[len(keyword_key) : len(keyword_key) + 1].isdigit():
+                    return False
+                return True
+            return False
+        return self._title_matches(keyword, title)
+
+    def _reliable_title_signal(self, keyword: str, title: str) -> bool:
+        keyword_key = self._normalize_title_key(keyword)
+        title_key = self._normalize_title_key(title)
+        if not keyword_key or not title_key:
+            return False
+        if self._strict_title_matches(keyword, title):
+            return True
+        if self._season_marker(title_key):
+            return True
+        if self._has_variant_marker(title_key):
+            return True
+        keyword_stem = self._title_stem(keyword_key)
+        return bool(keyword_stem and keyword_stem in title_key)
 
     def _normalize_title_key(self, value: str) -> str:
         return re.sub(r"[\s《》<>:：·,，。.!！?？\-_/\\]+", "", str(value or "").lower())
 
     def _season_marker(self, value: str) -> str:
         match = re.search(r"第([一二三四五六七八九十\d]+)季", value)
-        return match.group(1) if match else ""
+        return self._canonical_season_number(match.group(1)) if match else ""
+
+    def _season_stem_matches(self, keyword_key: str, title_key: str) -> bool:
+        keyword_stem = self._title_stem(keyword_key)
+        title_stem = self._title_stem(title_key)
+        if not keyword_stem or not title_stem:
+            return False
+        return keyword_stem in title_stem or title_stem in keyword_stem
+
+    def _title_stem(self, value: str) -> str:
+        return re.sub(r"第[一二三四五六七八九十\d]+季", "", value)
+
+    def _canonical_season_number(self, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.isdigit():
+            return str(int(text))
+        digits = {
+            "零": 0,
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+        }
+        if text == "十":
+            return "10"
+        if text.startswith("十") and len(text) == 2:
+            return str(10 + digits.get(text[1], 0))
+        if text.endswith("十") and len(text) == 2:
+            return str(digits.get(text[0], 0) * 10)
+        if "十" in text and len(text) == 3:
+            return str(digits.get(text[0], 0) * 10 + digits.get(text[2], 0))
+        if len(text) == 1 and text in digits:
+            return str(digits[text])
+        return text
+
+    def _has_variant_marker(self, value: str) -> bool:
+        return bool(re.search(r"\d+|第?[一二三四五六七八九十\d]+[季部篇]|[上下续前后]篇", value))
 
     def _templates(self, task: Dict[str, Any]) -> List[str]:
         value = task.get("templates_json")
@@ -1044,15 +1175,21 @@ class TaskEngine:
 
     def _completed_comment_episodes(self) -> set[int]:
         episodes: set[int] = set()
+        task = self._load_task()
+        started_at = task.get("started_at") if task else None
+        run_filter = "AND created_at >= %s" if started_at else ""
+        params: List[Any] = [self.task_id]
+        if started_at:
+            params.append(started_at)
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT episode_number
                     FROM hongguo_comment_records
-                    WHERE task_id=%s AND status='success'
+                    WHERE task_id=%s AND status='success' {run_filter}
                     """,
-                    (self.task_id,),
+                    params,
                 )
                 for row in cur.fetchall():
                     episode = row.get("episode_number")

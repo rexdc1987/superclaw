@@ -2094,18 +2094,24 @@ async def stop_task(task_id: int):
 async def list_records(
     task_id: int,
     status: Optional[str] = Query(default=None),
+    current_run_only: bool = Query(default=True),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
     if status is not None and status not in RECORD_STATUSES:
         raise HTTPException(status_code=400, detail="Invalid record status")
-    where = "AND status=%s" if status else ""
+    where_clauses: List[str] = []
     params: List[Any] = [task_id]
     if status:
+        where_clauses.append("status=%s")
         params.append(status)
-    params.extend([limit, offset])
     with _connection() as conn:
-        _fetch_one_or_404(conn, task_id)
+        task = _fetch_one_or_404(conn, task_id)
+        if current_run_only and task.get("started_at"):
+            where_clauses.append("created_at >= %s")
+            params.append(task["started_at"])
+        where = f"AND {' AND '.join(where_clauses)}" if where_clauses else ""
+        params.extend([limit, offset])
         with conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -2128,18 +2134,24 @@ async def list_records(
 async def list_logs(
     task_id: int,
     level: Optional[str] = Query(default=None),
+    current_run_only: bool = Query(default=True),
     limit: int = Query(default=200, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
 ):
     if level is not None and level not in LOG_LEVELS:
         raise HTTPException(status_code=400, detail="Invalid log level")
-    where = "AND level=%s" if level else ""
+    where_clauses: List[str] = []
     params: List[Any] = [task_id]
     if level:
+        where_clauses.append("level=%s")
         params.append(level)
-    params.extend([limit, offset])
     with _connection() as conn:
-        _fetch_one_or_404(conn, task_id)
+        task = _fetch_one_or_404(conn, task_id)
+        if current_run_only and task.get("started_at"):
+            where_clauses.append("created_at >= %s")
+            params.append(task["started_at"])
+        where = f"AND {' AND '.join(where_clauses)}" if where_clauses else ""
+        params.extend([limit, offset])
         with conn.cursor() as cur:
             cur.execute(
                 f"""
