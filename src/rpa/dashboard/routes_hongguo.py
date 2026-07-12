@@ -25,9 +25,18 @@ from pymysql.cursors import DictCursor
 
 from rpa.hongguo.ai_usage import load_usage_stats, record_usage, reset_usage_stats
 from rpa.hongguo.comment_gen import CommentGenerator
-from rpa.hongguo.device import DEFAULT_ADDR, connect, connect_exact, discover_addrs
+from rpa.hongguo.device import (
+    DEFAULT_ADDR,
+    call_with_timeout,
+    connect,
+    connect_exact,
+    discover_addrs,
+    discover_mumu_instances,
+    discover_online_addrs,
+    launch_mumu_app,
+)
 from rpa.hongguo.engine import DEFAULT_SCREENSHOT_ROOT, TaskEngineManager
-from rpa.hongguo.operations import HongguoOperations
+from rpa.hongguo.operations import APP_PACKAGE, HongguoOperations
 from services.ai_config_service import (
     ai_config,
     app_config,
@@ -171,6 +180,13 @@ def _normalize_playback_speed(value: Optional[str]) -> str:
 
 def _ensure_task_schema(conn) -> None:
     db_name = _db_config()["database"]
+    managed_columns = {
+        "playback_speed",
+        "execution_plan_json",
+        "device_addr",
+        "device_label",
+        "multi_run_id",
+    }
     with conn.cursor() as cur:
         existing: set[str] = set()
         cur.execute(
@@ -179,9 +195,9 @@ def _ensure_task_schema(conn) -> None:
             FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA=%s
               AND TABLE_NAME='hongguo_comment_tasks'
-              AND COLUMN_NAME IN ('playback_speed', 'execution_plan_json')
+              AND COLUMN_NAME IN (%s, %s, %s, %s, %s)
             """,
-            (db_name,),
+            (db_name, *sorted(managed_columns)),
         )
         for row in cur.fetchall() or []:
             name = row.get("COLUMN_NAME")
@@ -208,6 +224,30 @@ def _ensure_task_schema(conn) -> None:
                 ALTER TABLE hongguo_comment_tasks
                 ADD COLUMN execution_plan_json TEXT DEFAULT NULL
                 AFTER playback_speed
+                """
+            )
+        if "device_addr" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN device_addr VARCHAR(80) DEFAULT NULL
+                AFTER execution_plan_json
+                """
+            )
+        if "device_label" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN device_label VARCHAR(200) DEFAULT NULL
+                AFTER device_addr
+                """
+            )
+        if "multi_run_id" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN multi_run_id VARCHAR(64) DEFAULT NULL
+                AFTER device_label
                 """
             )
 
@@ -334,6 +374,34 @@ class TaskCreate(TaskBase):
     pass
 
 
+class MultiDeviceSelection(BaseModel):
+    addr: str = Field(max_length=80)
+    label: Optional[str] = Field(default=None, max_length=200)
+
+    @field_validator("addr")
+    @classmethod
+    def validate_addr(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("addr is required")
+        return value
+
+
+class MultiTaskCreate(TaskBase):
+    devices: List[MultiDeviceSelection] = Field(min_length=1)
+    run_name: Optional[str] = Field(default=None, max_length=120)
+
+    @field_validator("devices")
+    @classmethod
+    def validate_unique_devices(cls, value: List[MultiDeviceSelection]) -> List[MultiDeviceSelection]:
+        seen: set[str] = set()
+        for item in value:
+            if item.addr in seen:
+                raise ValueError(f"duplicate device: {item.addr}")
+            seen.add(item.addr)
+        return value
+
+
 class AISettingsUpdate(BaseModel):
     enabled: bool = True
     provider: str = "openai_compatible"
@@ -442,38 +510,61 @@ class TemplateUpdate(BaseModel):
         return value
 
 
+def _task_insert_values(payload: TaskBase) -> tuple[Any, ...]:
+    return (
+        payload.drama_name,
+        payload.comment_mode,
+        payload.content_source,
+        payload.start_episode,
+        payload.episode_interval,
+        payload.comment_interval_sec,
+        payload.random_comment_count,
+        payload.random_min_interval,
+        payload.random_max_interval,
+        _json_dumps(payload.templates),
+        payload.playback_speed,
+    )
+
+
+def _insert_task_record(
+    conn,
+    payload: TaskBase,
+    *,
+    status: str = "pending",
+    device_addr: Optional[str] = None,
+    device_label: Optional[str] = None,
+    multi_run_id: Optional[str] = None,
+) -> int:
+    now = datetime.now()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO hongguo_comment_tasks (
+                drama_name, comment_mode, content_source,
+                start_episode, episode_interval, comment_interval_sec,
+                random_comment_count, random_min_interval, random_max_interval,
+                templates_json, playback_speed, status,
+                device_addr, device_label, multi_run_id,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                *_task_insert_values(payload),
+                status,
+                device_addr,
+                device_label,
+                multi_run_id,
+                now,
+                now,
+            ),
+        )
+        return int(cur.lastrowid)
+
+
 @router.post("/tasks")
 async def create_task(payload: TaskCreate):
-    now = datetime.now()
     with _connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO hongguo_comment_tasks (
-                    drama_name, comment_mode, content_source,
-                    start_episode, episode_interval, comment_interval_sec,
-                    random_comment_count, random_min_interval, random_max_interval,
-                    templates_json, playback_speed, status, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    payload.drama_name,
-                    payload.comment_mode,
-                    payload.content_source,
-                    payload.start_episode,
-                    payload.episode_interval,
-                    payload.comment_interval_sec,
-                    payload.random_comment_count,
-                    payload.random_min_interval,
-                    payload.random_max_interval,
-                    _json_dumps(payload.templates),
-                    payload.playback_speed,
-                    "pending",
-                    now,
-                    now,
-                ),
-            )
-            task_id = cur.lastrowid
+        task_id = _insert_task_record(conn, payload)
         _insert_log(conn, task_id, "任务已创建")
         return _serialize_task(_fetch_one_or_404(conn, task_id))
 
@@ -537,6 +628,9 @@ async def update_task(task_id: int, payload: TaskUpdate):
         "comments_sent",
         "comments_verified",
         "error_message",
+        "device_addr",
+        "device_label",
+        "multi_run_id",
     }
     assignments = []
     values = []
@@ -682,15 +776,30 @@ def _check_hongguo_login(ops: HongguoOperations) -> Dict[str, Any]:
     result = ops.check_login()
     device_info = ops.get_device_info()
     account = ops.get_account_info()
-    if account.get("logged_in") and not result.get("logged_in"):
+    if not account.get("logged_in") and result.get("logged_in"):
+        for _ in range(2):
+            time.sleep(2)
+            retry_result = ops.check_login()
+            retry_account = ops.get_account_info()
+            if retry_result.get("logged_in"):
+                result = retry_result
+            if retry_account.get("logged_in"):
+                account = retry_account
+                break
+    if account.get("logged_in"):
         result = {
             **result,
             "logged_in": True,
             "status": "logged_in",
             "message": account.get("message") or "已登录",
         }
-    if result.get("logged_in") and not account.get("logged_in"):
-        account = {**account, "logged_in": True}
+    if not account.get("logged_in"):
+        result = {
+            **result,
+            "logged_in": False,
+            "status": account.get("status") or "not_logged_in",
+            "message": account.get("message") or "请先在当前红果实例登录账号",
+        }
     return {**result, "device": device_info, "account": account}
 
 
@@ -2028,9 +2137,19 @@ async def reset_ai_usage():
 
 @router.post("/tasks/{task_id}/start")
 async def start_task(task_id: int):
+    return _start_task_on_device(task_id)
+
+
+def _start_task_on_device(task_id: int, device_addr: Optional[str] = None) -> Dict[str, Any]:
     with _connection() as conn:
         current = _fetch_one_or_404(conn, task_id)
-        now = datetime.now()
+    manager = _engine_manager()
+    stale_running = current.get("status") == "running" and not manager.is_running(task_id)
+    if not stale_running:
+        _validate_transition(current.get("status"), "running")
+    effective_device_addr = device_addr or current.get("device_addr") or _hongguo_device_addr()
+    now = datetime.now()
+    with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -2043,14 +2162,28 @@ async def start_task(task_id: int):
                     current_episode=0,
                     comments_sent=0,
                     comments_verified=0,
+                    device_addr=%s,
                     updated_at=%s
                 WHERE id=%s
                 """,
-                ("running", now, now, task_id),
+                ("running", now, effective_device_addr, now, task_id),
             )
-    _validate_transition(current.get("status"), "running")
-    started = _engine_manager().start_task(task_id)
+        if stale_running:
+            _insert_log(conn, task_id, "检测到旧的运行中状态但当前服务没有执行线程，按重启任务处理", "warn")
+        _insert_log(conn, task_id, f"任务启动，设备={effective_device_addr}")
+    started = manager.start_task(task_id, device_addr=effective_device_addr)
     if not started:
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE hongguo_comment_tasks
+                    SET status=%s, error_message=%s, updated_at=%s
+                    WHERE id=%s
+                    """,
+                    ("failed", f"设备正在执行其他任务或任务已运行: {effective_device_addr}", datetime.now(), task_id),
+                )
+            _insert_log(conn, task_id, f"任务启动失败，设备忙或任务已运行: {effective_device_addr}", "error")
         raise HTTPException(status_code=409, detail="Task is already running")
     with _connection() as conn:
         return _serialize_task(_fetch_one_or_404(conn, task_id))
@@ -2304,6 +2437,360 @@ def list_devices():
         "settings": public_hongguo_settings(_hongguo_config()),
         "devices": devices,
     }
+
+
+def _device_label(addr: str, info: Optional[Dict[str, Any]] = None, mumu: Optional[Dict[str, Any]] = None) -> str:
+    info = info or {}
+    mumu = mumu or {}
+    if mumu:
+        parts = [
+            f"MuMu #{mumu.get('index')}",
+            mumu.get("name"),
+            f"Android {mumu.get('android_version')}" if mumu.get("android_version") else "",
+            addr,
+        ]
+    else:
+        parts = [info.get("emulator"), info.get("model"), addr]
+    return " / ".join(str(item) for item in parts if item)
+
+
+def _mumu_pending_entry(instance: Dict[str, Any]) -> Dict[str, Any]:
+    index = str(instance.get("index") or "")
+    label = _device_label("", {}, instance)
+    status = "adb_not_ready" if instance.get("is_process_started") else "not_started"
+    message = instance.get("adb_message") or "实例已启动，ADB 未就绪"
+    if not instance.get("is_process_started"):
+        message = "MuMu 实例未启动"
+    launch_attempt = instance.get("app_launch_attempt") or {}
+    if launch_attempt:
+        data = launch_attempt.get("data")
+        launched = launch_attempt.get("success") and (
+            not isinstance(data, dict) or int(data.get("errcode") or 0) == 0
+        )
+        if launched:
+            message = f"{message}；已尝试通过 MuMu RPC 启动红果 APP"
+        else:
+            detail = launch_attempt.get("message") or launch_attempt.get("stderr") or launch_attempt.get("stdout") or ""
+            message = f"{message}；尝试启动红果 APP 失败 {detail}".strip()
+    return {
+        "serial": f"mumu:{index}",
+        "addr": "",
+        "label": label,
+        "online": False,
+        "logged_in": False,
+        "device": {
+            "serial": "",
+            "emulator": "MuMu 模拟器",
+            "model": instance.get("name") or "",
+            "android_version": instance.get("android_version") or "",
+            "current_package": "",
+            "current_activity": "",
+        },
+        "account": {"logged_in": False, "nickname": "", "hongguo_id": ""},
+        "status": status,
+        "message": message,
+        "mumu_instance": instance,
+    }
+
+
+def _check_login_for_device(addr: str, mumu: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "serial": addr,
+        "addr": addr,
+        "label": _device_label(addr, {}, mumu),
+        "online": False,
+        "logged_in": False,
+        "device": {},
+        "account": {"logged_in": False, "nickname": "", "hongguo_id": ""},
+        "status": "device_connect_failed",
+        "message": "",
+    }
+    if mumu:
+        entry["mumu_instance"] = mumu
+    try:
+        device = connect_exact(addr)
+        ops = HongguoOperations(device)
+        info = ops.get_device_info()
+        if mumu:
+            info["emulator"] = "MuMu 模拟器"
+            info["mumu_index"] = mumu.get("index")
+            info["mumu_name"] = mumu.get("name")
+        entry.update(
+            {
+                "serial": info.get("serial") or addr,
+                "addr": info.get("serial") or addr,
+                "label": _device_label(info.get("serial") or addr, info, mumu),
+                "online": True,
+                "device": info,
+            }
+        )
+        if not mumu and not _is_mumu_multi_device(entry):
+            entry.update(
+                {
+                    "ignored": True,
+                    "ignore_reason": "非 MuMu/模拟器实例，已从红果多开检测结果中过滤",
+                    "status": "ignored",
+                    "message": "非 MuMu/模拟器实例，已忽略",
+                }
+            )
+            return entry
+        launched = True if info.get("current_package") == APP_PACKAGE else ops.launch_app()
+        info = ops.get_device_info()
+        if mumu:
+            info["emulator"] = "MuMu 模拟器"
+            info["mumu_index"] = mumu.get("index")
+            info["mumu_name"] = mumu.get("name")
+        entry["device"] = info
+        if not launched and info.get("current_package") != "com.phoenix.read":
+            entry.update(
+                {
+                    "status": "app_launch_failed",
+                    "message": "红果短剧启动失败",
+                }
+            )
+            return entry
+        login = _check_hongguo_login(ops)
+        login_device = login.pop("device", {}) if isinstance(login.get("device"), dict) else {}
+        merged_device = {**login_device, **info}
+        entry.update(
+            {
+                **login,
+                "label": _device_label(info.get("serial") or addr, info, mumu),
+                "online": True,
+                "device": merged_device,
+            }
+        )
+        return entry
+    except Exception as exc:
+        entry["message"] = f"设备连接失败: {exc}"
+        return entry
+
+
+def _safe_check_login_for_device(addr: str, mumu: Optional[Dict[str, Any]] = None, timeout: float = 30) -> Dict[str, Any]:
+    try:
+        return call_with_timeout(lambda: _check_login_for_device(addr, mumu=mumu), timeout, f"login check {addr}")
+    except Exception as exc:
+        info = {
+            "serial": addr,
+            "emulator": "MuMu 模拟器" if mumu else "",
+            "model": (mumu or {}).get("name") or "",
+            "android_version": (mumu or {}).get("android_version") or "",
+            "current_package": "",
+            "current_activity": "",
+        }
+        return {
+            "serial": addr,
+            "addr": addr,
+            "label": _device_label(addr, info, mumu),
+            "online": bool(addr),
+            "logged_in": False,
+            "device": info,
+            "account": {"logged_in": False, "nickname": "", "hongguo_id": ""},
+            "status": "login_check_timeout",
+            "message": f"登录检测超时: {exc}",
+            "mumu_instance": mumu or {},
+        }
+
+
+def _is_mumu_multi_device(entry: Dict[str, Any]) -> bool:
+    if entry.get("mumu_instance"):
+        return True
+    info = entry.get("device") or {}
+    addr = str(entry.get("addr") or entry.get("serial") or "").lower()
+    emulator = str(info.get("emulator") or "").lower()
+    model = str(info.get("model") or "").lower()
+    product = str(info.get("product") or "").lower()
+    brand = str(info.get("brand") or "").lower()
+    text = " ".join([addr, emulator, model, product, brand])
+
+    if "真机/网络" in str(info.get("emulator") or ""):
+        return False
+    if addr.startswith("127.0.0.1:") or addr.startswith("emulator-"):
+        return True
+    if any(marker in text for marker in ("mumu", "nemu", "netease")):
+        return True
+    if "模拟器" in str(info.get("emulator") or "") and "未识别" not in str(info.get("emulator") or ""):
+        return True
+    return False
+
+
+def _serialize_multi_run(run_id: str, tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    serialized = [_serialize_task(task) for task in tasks]
+    statuses = {status: 0 for status in TASK_STATUSES}
+    for task in serialized:
+        if not task:
+            continue
+        statuses[task["status"]] = statuses.get(task["status"], 0) + 1
+    return {
+        "run_id": run_id,
+        "task_count": len(serialized),
+        "running_count": statuses.get("running", 0),
+        "completed_count": statuses.get("completed", 0),
+        "failed_count": statuses.get("failed", 0),
+        "stopped_count": statuses.get("stopped", 0),
+        "comments_sent": sum(int(task.get("comments_sent") or 0) for task in serialized if task),
+        "comments_verified": sum(int(task.get("comments_verified") or 0) for task in serialized if task),
+        "tasks": serialized,
+    }
+
+
+def _fetch_multi_run_tasks(conn, run_id: str) -> List[Dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM hongguo_comment_tasks
+            WHERE multi_run_id=%s
+            ORDER BY id ASC
+            """,
+            (run_id,),
+        )
+        return list(cur.fetchall() or [])
+
+
+def _mark_task_waiting_login(task_id: int, message: str) -> Dict[str, Any]:
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE hongguo_comment_tasks
+                SET status=%s, error_message=%s, updated_at=%s
+                WHERE id=%s
+                """,
+                ("waiting_login", message, datetime.now(), task_id),
+            )
+        _insert_log(conn, task_id, message, "warn")
+        return _serialize_task(_fetch_one_or_404(conn, task_id))
+
+
+@router.get("/multi/devices")
+def list_multi_devices():
+    devices = []
+    ignored_devices = []
+    seen_addrs = set()
+    mumu_instances = discover_mumu_instances(connect_adb=True)
+    for instance in mumu_instances:
+        addr = str(instance.get("addr") or "").strip()
+        if not addr:
+            if instance.get("is_process_started") and instance.get("is_android_started"):
+                instance["app_launch_attempt"] = launch_mumu_app(str(instance.get("index") or ""), APP_PACKAGE)
+            devices.append(_mumu_pending_entry(instance))
+            continue
+        seen_addrs.add(addr)
+        result = _safe_check_login_for_device(addr, mumu=instance, timeout=60)
+        devices.append(result)
+
+    for addr in discover_online_addrs():
+        if addr in seen_addrs:
+            continue
+        result = _safe_check_login_for_device(addr, timeout=20)
+        if result.get("online"):
+            result["ignored"] = True
+            result["ignore_reason"] = "非 MuMu/模拟器实例，已从红果多开检测结果中过滤"
+            ignored_devices.append(result)
+    return {
+        "success": True,
+        "devices": devices,
+        "ignored_devices": ignored_devices,
+        "online_count": sum(1 for item in devices if item.get("online")),
+        "logged_in_count": sum(1 for item in devices if item.get("logged_in")),
+    }
+
+
+@router.post("/multi/tasks")
+async def create_multi_tasks(payload: MultiTaskCreate):
+    run_id = f"multi-{datetime.now().strftime('%Y%m%d%H%M%S')}-{int(time.time() * 1000) % 100000}"
+    created: List[Dict[str, Any]] = []
+    with _connection() as conn:
+        for item in payload.devices:
+            task_id = _insert_task_record(
+                conn,
+                payload,
+                device_addr=item.addr,
+                device_label=item.label or item.addr,
+                multi_run_id=run_id,
+            )
+            _insert_log(conn, task_id, f"多开批次任务已创建，批次={run_id}，设备={item.addr}")
+            created.append(_serialize_task(_fetch_one_or_404(conn, task_id)))
+    return {
+        "success": True,
+        "run_id": run_id,
+        "run_name": payload.run_name or payload.drama_name,
+        "tasks": created,
+    }
+
+
+@router.get("/multi/runs")
+def list_multi_runs(limit: int = Query(default=20, ge=1, le=100)):
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT multi_run_id
+                FROM hongguo_comment_tasks
+                WHERE multi_run_id IS NOT NULL AND multi_run_id <> ''
+                GROUP BY multi_run_id
+                ORDER BY MAX(created_at) DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            run_ids = [row["multi_run_id"] for row in cur.fetchall() or []]
+        runs = [_serialize_multi_run(run_id, _fetch_multi_run_tasks(conn, run_id)) for run_id in run_ids]
+    return {"success": True, "runs": runs}
+
+
+@router.get("/multi/runs/{run_id}")
+def get_multi_run(run_id: str):
+    with _connection() as conn:
+        tasks = _fetch_multi_run_tasks(conn, run_id)
+    if not tasks:
+        raise HTTPException(status_code=404, detail="Multi run not found")
+    return {"success": True, **_serialize_multi_run(run_id, tasks)}
+
+
+@router.post("/multi/runs/{run_id}/start")
+def start_multi_run(run_id: str):
+    with _connection() as conn:
+        tasks = _fetch_multi_run_tasks(conn, run_id)
+    if not tasks:
+        raise HTTPException(status_code=404, detail="Multi run not found")
+    started: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for task in tasks:
+        task_id = int(task["id"])
+        device_addr = task.get("device_addr")
+        try:
+            started.append(_start_task_on_device(task_id, device_addr=device_addr))
+        except HTTPException as exc:
+            failed.append({"task_id": task_id, "device_addr": device_addr, "message": str(exc.detail)})
+    with _connection() as conn:
+        latest = _fetch_multi_run_tasks(conn, run_id)
+    return {
+        "success": not failed,
+        "started_count": len(started),
+        "failed": failed,
+        **_serialize_multi_run(run_id, latest),
+    }
+
+
+@router.post("/multi/runs/{run_id}/stop")
+def stop_multi_run(run_id: str):
+    with _connection() as conn:
+        tasks = _fetch_multi_run_tasks(conn, run_id)
+    if not tasks:
+        raise HTTPException(status_code=404, detail="Multi run not found")
+    stopped = []
+    for task in tasks:
+        task_id = int(task["id"])
+        try:
+            _engine_manager().stop_task(task_id)
+            stopped.append(_set_task_status(task_id, "stopped", "多开批次任务已停止"))
+        except Exception as exc:
+            stopped.append({"id": task_id, "error_message": str(exc)})
+    with _connection() as conn:
+        latest = _fetch_multi_run_tasks(conn, run_id)
+    return {"success": True, "stopped": stopped, **_serialize_multi_run(run_id, latest)}
 
 
 @router.get("/templates")

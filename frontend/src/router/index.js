@@ -84,6 +84,12 @@ const routes = [
     meta: { title: '红果任务', icon: 'VideoPlay' }
   },
   {
+    path: '/hongguo/multi',
+    name: 'HongguoMulti',
+    component: () => import('@/views/HongguoMulti.vue'),
+    meta: { title: '红果多开', icon: 'Operation' }
+  },
+  {
     path: '/hongguo/create',
     name: 'HongguoCreate',
     component: () => import('@/views/TaskCreate.vue'),

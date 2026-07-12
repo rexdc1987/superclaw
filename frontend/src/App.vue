@@ -70,6 +70,7 @@ const menuItems = [
   { path: '/review', title: '审核队列', icon: 'ChatDotRound' },
   { path: '/douyin-comment', title: '抖音评论', icon: 'ChatDotRound' },
   { path: '/hongguo', title: '红果短剧', icon: 'VideoPlay' },
+  { path: '/hongguo/multi', title: '红果多开', icon: 'Operation' },
   { path: '/hongguo/templates', title: '红果模板', icon: 'Document' },
   { path: '/hongguo/settings', title: 'AI配置', icon: 'Setting' },
   { path: '/risk', title: '风控中心', icon: 'Shield' },

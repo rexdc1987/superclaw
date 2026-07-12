@@ -87,6 +87,16 @@
       <el-table :data="tasks" v-loading="loading" style="width: 100%">
         <el-table-column prop="id" label="ID" width="70" />
         <el-table-column prop="drama_name" label="短剧名称" min-width="180" show-overflow-tooltip />
+        <el-table-column label="实例ID" min-width="150" show-overflow-tooltip>
+          <template #default="{ row }">
+            {{ formatInstanceId(row) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="实例名称" min-width="210" show-overflow-tooltip>
+          <template #default="{ row }">
+            {{ formatInstanceName(row) }}
+          </template>
+        </el-table-column>
         <el-table-column prop="comment_mode" label="模式" width="110">
           <template #default="{ row }">
             <el-tag :type="row.comment_mode === 'random' ? 'warning' : 'success'">
@@ -312,6 +322,19 @@ function deviceOptionLabel(item) {
   parts.push(item.addr || item.serial)
   if (device.model) parts.push(device.model)
   return parts.filter(Boolean).join(' / ')
+}
+
+function formatInstanceId(row) {
+  return row?.device_addr || '未记录'
+}
+
+function formatInstanceName(row) {
+  const label = row?.device_label || ''
+  const addr = row?.device_addr || ''
+  if (!label && !addr) return '默认设备'
+  if (!label) return addr
+  if (addr && label.endsWith(' / ' + addr)) return label.slice(0, -addr.length - 3)
+  return label
 }
 
 function formatTime(value) {
