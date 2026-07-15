@@ -138,6 +138,10 @@ def _hongguo_device_addr() -> str:
     return str(_hongguo_config().get("device_addr") or DEFAULT_ADDR).strip() or DEFAULT_ADDR
 
 
+def _task_device_addr(task: Dict[str, Any]) -> str:
+    return str(task.get("device_addr") or _hongguo_device_addr()).strip() or DEFAULT_ADDR
+
+
 def _save_app_config(cfg: Dict[str, Any]) -> None:
     save_app_config(cfg)
 
@@ -777,7 +781,7 @@ def _check_hongguo_login(ops: HongguoOperations) -> Dict[str, Any]:
     device_info = ops.get_device_info()
     account = ops.get_account_info()
     if not account.get("logged_in") and result.get("logged_in"):
-        for _ in range(2):
+        for _ in range(1):
             time.sleep(2)
             retry_result = ops.check_login()
             retry_account = ops.get_account_info()
@@ -862,7 +866,7 @@ def _run_prepare_flow(task_id: int, task: Dict[str, Any], update_task: bool = Tr
     if not keyword:
         raise RuntimeError("任务短剧名称为空")
 
-    device = connect(_hongguo_device_addr())
+    device = connect(_task_device_addr(task))
     ops = HongguoOperations(device)
     steps: List[Dict[str, Any]] = []
     data: Dict[str, Any] = {
@@ -987,7 +991,7 @@ def _run_stage_task(task_id: int, start_episode: int, end_episode: int) -> None:
                     (start_episode, datetime.now(), task_id),
                 )
 
-        device = connect(_hongguo_device_addr())
+        device = connect(_task_device_addr(task))
         ops = HongguoOperations(device)
         task_snapshot = dict(task)
 
@@ -1337,9 +1341,13 @@ def _stage_assert_target_playback(
 def _stage_resume_if_paused(task_id: int, ops: HongguoOperations, episode: int) -> bool:
     if not ops.is_playback_paused():
         return False
-    resumed = ops.resume_playback_if_paused(allow_center_fallback=True)
+    resumed = ops.resume_playback_safely()
     still_paused = ops.is_playback_paused()
-    ok = bool(resumed and not still_paused)
+    if still_paused:
+        resumed = ops.resume_playback_if_paused(allow_center_fallback=True) or resumed
+        time.sleep(0.8)
+        still_paused = ops.is_playback_paused()
+    ok = not still_paused
     _stage_log(
         task_id,
         f"阶段测试v3: 第{episode}集检测到暂停，已尝试恢复播放={resumed}，仍暂停={still_paused}",
@@ -1351,7 +1359,11 @@ def _stage_resume_if_paused(task_id: int, ops: HongguoOperations, episode: int) 
 def _stage_safe_resume_playback(task_id: int, ops: HongguoOperations, episode: int, reason: str) -> bool:
     resumed = ops.resume_playback_safely()
     still_paused = ops.is_playback_paused()
-    ok = bool(resumed and not still_paused)
+    if still_paused:
+        resumed = ops.resume_playback_if_paused(allow_center_fallback=True) or resumed
+        time.sleep(0.8)
+        still_paused = ops.is_playback_paused()
+    ok = not still_paused
     _stage_log(
         task_id,
         f"阶段测试v3: 第{episode}集{reason}，发送安全播放指令={resumed}，仍暂停={still_paused}",
@@ -1378,10 +1390,12 @@ def _stage_wait_for_episode(
             raise RuntimeError(f"阶段测试切集时红果不在前台，当前 package={app.get('package') or '-'}")
         if state.get("ad_visible"):
             shot = _debug_screenshot(ops, task_id, f"stage_seek_ep{target}_ad")
-            skipped = ops.skip_ad_if_present(attempts=3)
-            if not skipped:
-                ops._swipe_up_continue_ad()
-            _stage_log(task_id, f"阶段测试: 切第{target}集时遇到广告，已截图 {shot}，上滑继续观看", "warn")
+            skipped = ops.skip_ad_if_present()
+            _stage_log(
+                task_id,
+                f"阶段测试: 切第{target}集时遇到广告，已截图 {shot}，单次上滑后已离开广告={skipped}",
+                "info" if skipped else "warn",
+            )
             time.sleep(3)
             continue
         if app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
@@ -1415,10 +1429,12 @@ def _stage_seek_start_episode(
             return
         if state.get("ad_visible"):
             shot = _debug_screenshot(ops, task_id, f"stage_seek_ep{start_episode}_ad")
-            skipped = ops.skip_ad_if_present(attempts=3)
-            if not skipped:
-                ops._swipe_up_continue_ad()
-            _stage_log(task_id, f"阶段测试v3: 切第{start_episode}集前遇到广告，已截图 {shot}，上滑继续观看", "warn")
+            skipped = ops.skip_ad_if_present()
+            _stage_log(
+                task_id,
+                f"阶段测试v3: 切第{start_episode}集前遇到广告，已截图 {shot}，单次上滑后已离开广告={skipped}",
+                "info" if skipped else "warn",
+            )
             time.sleep(3)
             continue
         app = state.get("app") or {}
@@ -1537,16 +1553,12 @@ def _stage_wait_for_next_episode(
             raise RuntimeError(f"阶段测试第{episode}集后红果不在前台，当前 package={app.get('package') or '-'}")
         if ad_visible:
             shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_ad")
-            skipped = ops.skip_ad_if_present(attempts=3)
-            if not skipped:
-                ops._swipe_up_continue_ad()
-                _stage_log(
-                    task_id,
-                    f"阶段测试: 第{episode}集后出现广告，常规跳过未确认成功，已截图 {shot}，执行兜底上滑",
-                    "warn",
-                )
-            else:
-                _stage_log(task_id, f"阶段测试: 第{episode}集后出现广告，已截图 {shot}，上滑继续观看")
+            skipped = ops.skip_ad_if_present()
+            _stage_log(
+                task_id,
+                f"阶段测试: 第{episode}集后出现广告，已截图 {shot}，单次上滑后已离开广告={skipped}",
+                "info" if skipped else "warn",
+            )
             time.sleep(3)
             continue
         if app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
@@ -1559,10 +1571,9 @@ def _stage_wait_for_next_episode(
             shot = _debug_screenshot(ops, task_id, f"stage_ep{episode}_unknown_ad_overlay")
             _stage_log(
                 task_id,
-                f"阶段测试: 第{episode}集后播放页集数不可见，按广告/遮罩页处理，已截图 {shot}，上滑继续观看",
+                f"阶段测试: 第{episode}集后播放页集数不可见，已截图 {shot}，继续观察且不执行上滑",
                 "warn",
             )
-            ops._swipe_up_continue_ad()
             time.sleep(3)
             continue
         if _stage_total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current, target=target):
@@ -1623,11 +1634,21 @@ def _run_stage_task_v2(task_id: int, start_episode: int, end_episode: int) -> No
                     (start_episode, datetime.now(), task_id),
                 )
 
-        device = connect(_hongguo_device_addr())
+        device = connect(_task_device_addr(task))
         ops = HongguoOperations(device)
         task_snapshot = dict(task)
 
         stage_state = _debug_page_state(ops, task_snapshot)
+        if stage_state.get("ad_visible"):
+            shot = _debug_screenshot(ops, task_id, f"stage_{start_episode}_{end_episode}_entry_ad")
+            skipped = ops.skip_ad_if_present()
+            _stage_log(
+                task_id,
+                f"阶段测试v3: 入口遇到广告，已截图 {shot}，单次上滑后已离开广告={skipped}",
+                "info" if skipped else "warn",
+            )
+            time.sleep(3)
+            stage_state = _debug_page_state(ops, task_snapshot)
         expected_total = _stage_expected_total(task_snapshot, stage_state, end_episode)
         _stage_assert_target_playback(ops, task_snapshot, stage_state, expected_total)
         current_episode = int(stage_state.get("current_episode") or 0)
@@ -1722,7 +1743,7 @@ async def debug_task_step(task_id: int, step: str):
         _insert_log(conn, task_id, f"分步测试: 开始 {step}")
 
     try:
-        device = connect(_hongguo_device_addr())
+        device = connect(_task_device_addr(task))
         ops = HongguoOperations(device)
         data: Dict[str, Any] = {"device": ops.get_device_info()}
         screenshot_path = ""
@@ -2025,7 +2046,7 @@ async def run_prepare_task(task_id: int):
         data = _run_prepare_flow(task_id, dict(task))
         shot = ""
         try:
-            device = connect(_hongguo_device_addr())
+            device = connect(_task_device_addr(task))
             shot = _debug_screenshot(HongguoOperations(device), task_id, "prepare")
         except Exception:
             shot = ""
@@ -2040,7 +2061,7 @@ async def run_prepare_task(task_id: int):
     except Exception as exc:
         shot = ""
         try:
-            device = connect(_hongguo_device_addr())
+            device = connect(_task_device_addr(task))
             shot = _debug_screenshot(HongguoOperations(device), task_id, "prepare_failed")
         except Exception:
             shot = ""

@@ -15,7 +15,7 @@ import sys
 import time
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 # 添加 src 到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -39,6 +39,14 @@ def test_check_connection_accepts_online_adb_device_without_device_info():
         with patch.object(device_module, "connect") as connect_device:
             assert device_module.check_connection("192.168.3.209:5555") is True
     connect_device.assert_not_called()
+
+
+def test_hongguo_task_device_addr_prefers_bound_instance():
+    from rpa.dashboard import routes_hongguo
+
+    with patch.object(routes_hongguo, "_hongguo_device_addr", return_value="192.168.3.134:5555"):
+        assert routes_hongguo._task_device_addr({"device_addr": "127.0.0.1:16480"}) == "127.0.0.1:16480"
+        assert routes_hongguo._task_device_addr({}) == "192.168.3.134:5555"
 
 from rpa.actions import ActionRegistry, get_registry, init_registry
 from rpa.actions.builtin import (
@@ -751,6 +759,8 @@ class TestHongguoPlaybackHeuristics:
         assert ops.get_total_episodes() == 144
 
     def test_get_current_episode_ignores_ad_page_total_hint(self):
+        from PIL import Image, ImageDraw
+
         class DummyDevice:
             def app_current(self):
                 return {
@@ -766,6 +776,11 @@ class TestHongguoPlaybackHeuristics:
 
             def window_size(self):
                 return (900, 1600)
+
+            def screenshot(self):
+                image = Image.new("RGB", (900, 1600), (8, 8, 8))
+                ImageDraw.Draw(image).rectangle((380, 1520, 520, 1535), fill=(230, 230, 230))
+                return image
 
         ops = HongguoOperations(DummyDevice())
         assert ops._ad_continue_visible() is True
@@ -923,6 +938,20 @@ class TestHongguoPlaybackHeuristics:
         with patch("rpa.hongguo.operations.time.sleep"):
             assert ops._open_comment_panel(0) is True
         assert device.clicked == [(846, 1072)]
+
+    def test_open_comment_panel_retries_surface_coordinate_until_panel_is_visible(self):
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 900, 1600
+        device = MagicMock()
+        ops.d = device
+        panel_states = iter([False] * 5 + [True])
+        with patch.object(ops, "_recover_anr_dialog"):
+            with patch.object(ops, "_comment_panel_open", side_effect=lambda: next(panel_states)):
+                with patch.object(ops, "_exists", return_value=False):
+                    with patch.object(ops, "_playback_visible", return_value=True):
+                        with patch("rpa.hongguo.operations.time.sleep"):
+                            assert ops._open_comment_panel(0) is True
+        assert device.click.call_count == 2
 
     def test_open_comment_panel_waits_for_anr_and_reuses_open_panel(self):
         ops = HongguoOperations(object())
@@ -1577,6 +1606,27 @@ class TestHongguoPlaybackHeuristics:
         assert result["success"] is True
         assert result["drama_title"] == selected_title
 
+    def test_select_drama_prefers_matching_result_card_click(self):
+        ops = HongguoOperations(object())
+        selected_title = "yunmiao2 target"
+        with patch.object(ops, "_is_app_foreground", return_value=True):
+            with patch.object(ops, "_verified_detail_title", side_effect=["", selected_title]):
+                with patch.object(ops, "_xml", return_value="results"):
+                    with patch.object(ops, "_search_candidate_page_visible", return_value=False):
+                        with patch.object(ops, "_click_matching_result_card", return_value=True) as card_click:
+                            with patch.object(ops, "_click_matching_title", return_value=True) as title_click:
+                                with patch.object(ops, "_sleep"):
+                                    with patch.object(ops, "_still_on_search_selection_page", return_value=False):
+                                        with patch.object(
+                                            ops,
+                                            "_drama_detail_result",
+                                            return_value={"success": True, "drama_title": selected_title},
+                                        ):
+                                            result = ops.select_drama(selected_title, keyword="yunmiao2")
+        assert result["success"] is True
+        card_click.assert_called_once_with(selected_title, "yunmiao2")
+        title_click.assert_not_called()
+
     def test_wait_selected_drama_title_retries_transient_surface_metadata(self):
         ops = HongguoOperations(object())
         selected_title = "云渺1：我修仙多年强亿点怎么了"
@@ -1588,6 +1638,24 @@ class TestHongguoPlaybackHeuristics:
                             result = ops._wait_selected_drama_title("云渺", selected_title)
         assert result == selected_title
         sleep.assert_called_once()
+
+    def test_wait_selected_drama_title_rejects_observed_wrong_series(self):
+        ops = HongguoOperations(object())
+        selected_title = "yunmiao2 target"
+        with patch.object(ops, "_verified_detail_title", return_value=""):
+            with patch.object(ops, "_extract_detail_title", return_value="yunmiao3 wrong"):
+                with patch.object(
+                    ops,
+                    "_safe_app_current",
+                    return_value={
+                        "package": "com.phoenix.read",
+                        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                    },
+                ):
+                    with patch.object(ops, "get_current_episode", return_value=4):
+                        with patch.object(ops, "get_total_episodes", return_value=77):
+                            result = ops._wait_selected_drama_title("yunmiao2", selected_title)
+        assert result == ""
 
     def test_select_drama_keeps_healthy_device_session_after_click(self):
         ops = HongguoOperations(object())
@@ -1642,7 +1710,14 @@ class TestHongguoPlaybackHeuristics:
     def test_open_main_activity_uses_hongguo_main_component(self):
         ops = HongguoOperations(object())
         with patch.object(ops, "d") as device:
-            with patch.object(ops, "_wait_app_foreground", return_value=True):
+            with patch.object(
+                ops,
+                "_safe_app_current",
+                return_value={
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.pages.main.MainFragmentActivity",
+                },
+            ):
                 with patch("rpa.hongguo.operations.time.sleep"):
                     assert ops._open_main_activity() is True
         command = device.shell.call_args.args[0]
@@ -1680,7 +1755,31 @@ class TestHongguoPlaybackHeuristics:
         device = DummyDevice()
         ops = HongguoOperations(device)
         assert ops._click_matching_title("剑归", "剑归") is True
-        assert device.clicked == [(256, 630)]
+        assert device.clicked == [(100, 1025)]
+
+    def test_click_matching_result_card_prefers_associated_poster(self):
+        class DummyDevice:
+            def __init__(self):
+                self.clicked = []
+
+            def window_size(self):
+                return (1080, 1920)
+
+            def click(self, x, y):
+                self.clicked.append((x, y))
+
+        xml = (
+            '<node package="com.phoenix.read" class="android.widget.ImageView" bounds="[12,280][500,980]" />'
+            '<node package="com.phoenix.read" text="yunmiao2 target" bounds="[30,1000][420,1050]" />'
+            '<node package="com.phoenix.read" class="android.widget.ImageView" bounds="[540,280][1028,980]" />'
+            '<node package="com.phoenix.read" text="yunmiao3 wrong" bounds="[558,1000][920,1050]" />'
+        )
+        device = DummyDevice()
+        ops = HongguoOperations(device)
+        with patch.object(ops, "_xml", side_effect=[xml, ""]):
+            with patch.object(ops, "_search_results_visible", return_value=False):
+                assert ops._click_matching_result_card("yunmiao2 target", "yunmiao2") is True
+        assert device.clicked == [(256, 595)]
 
     def test_ad_continue_prompt_triggers_swipe(self):
         class DummyDevice:
@@ -1702,8 +1801,9 @@ class TestHongguoPlaybackHeuristics:
 
         device = DummyDevice()
         ops = HongguoOperations(device)
-        with patch("rpa.hongguo.operations.time.sleep"):
-            assert ops.skip_ad_if_present() is True
+        with patch.object(ops, "_ad_continue_visible", side_effect=[True, True, False]):
+            with patch("rpa.hongguo.operations.time.sleep"):
+                assert ops.skip_ad_if_present() is True
         assert device.swipes
         assert device.swipes[0][1] > device.swipes[0][3]
 
@@ -1727,10 +1827,31 @@ class TestHongguoPlaybackHeuristics:
 
         device = DummyDevice()
         ops = HongguoOperations(device)
-        with patch("rpa.hongguo.operations.time.sleep"):
-            assert ops.skip_ad_if_present() is True
+        with patch.object(ops, "_ad_continue_visible", side_effect=[True, True, False]):
+            with patch("rpa.hongguo.operations.time.sleep"):
+                assert ops.skip_ad_if_present() is True
         assert device.swipes
         assert device.swipes[0][1] > device.swipes[0][3]
+
+    def test_ad_continue_rejects_episode_panel_even_when_visual_matches(self):
+        ops = HongguoOperations(object())
+        xml = (
+            '<node package="com.phoenix.read" text="简介" />'
+            '<node package="com.phoenix.read" text="选集" />'
+            '<node package="com.phoenix.read" text="31-60" bounds="[32,950][120,1010]" />'
+            '<node package="com.phoenix.read" text="31" bounds="[32,1130][155,1250]" />'
+            '<node package="com.phoenix.read" text="32" bounds="[175,1130][298,1250]" />'
+            '<node package="com.phoenix.read" text="33" bounds="[318,1130][441,1250]" />'
+            '<node package="com.phoenix.read" text="34" bounds="[458,1130][581,1250]" />'
+            '<node package="com.phoenix.read" text="35" bounds="[601,1130][724,1250]" />'
+            '<node package="com.phoenix.read" text="36" bounds="[742,1130][865,1250]" />'
+            '<node package="com.phoenix.read" text="37" bounds="[32,1270][155,1390]" />'
+            '<node package="com.phoenix.read" text="38" bounds="[175,1270][298,1390]" />'
+        )
+        with patch.object(ops, "_short_series_activity_active", return_value=True):
+            with patch.object(ops, "_ad_continue_visual_visible", return_value=True) as visual:
+                assert ops._ad_continue_visible(xml) is False
+        visual.assert_not_called()
 
     def test_ad_page_markers_with_continue_prompt_trigger_swipe(self):
         class DummyDevice:
@@ -1757,8 +1878,9 @@ class TestHongguoPlaybackHeuristics:
 
         device = DummyDevice()
         ops = HongguoOperations(device)
-        with patch("rpa.hongguo.operations.time.sleep"):
-            assert ops.skip_ad_if_present() is True
+        with patch.object(ops, "_ad_continue_visible", side_effect=[True, True, False]):
+            with patch("rpa.hongguo.operations.time.sleep"):
+                assert ops.skip_ad_if_present() is True
         assert device.swipes
         assert device.swipes[0][1] > device.swipes[0][3]
 
@@ -1803,7 +1925,7 @@ class TestHongguoPlaybackHeuristics:
 
         assert HongguoOperations(DummyDevice())._ad_continue_visible() is False
 
-    def test_surface_ad_prompt_is_detected_when_hierarchy_shows_launcher(self):
+    def test_surface_ad_visual_without_prompt_does_not_trigger_swipe(self):
         from PIL import Image, ImageDraw
 
         class DummyDevice:
@@ -1825,7 +1947,7 @@ class TestHongguoPlaybackHeuristics:
                 draw.rectangle((280, 1480, 620, 1530), fill=(190, 190, 190))
                 return image
 
-        assert HongguoOperations(DummyDevice())._ad_continue_visible() is True
+        assert HongguoOperations(DummyDevice())._ad_continue_visible() is False
 
     def test_ad_carousel_on_playback_page_does_not_trigger_swipe(self):
         class DummyDevice:
@@ -1867,9 +1989,20 @@ class TestHongguoPlaybackHeuristics:
 
         device = DummyDevice()
         ops = HongguoOperations(device)
-        with patch("rpa.hongguo.operations.time.sleep"):
-            assert ops.skip_ad_if_present(attempts=2) is False
-        assert len(device.swipes) == 2
+        with patch.object(ops, "_ad_continue_visible", return_value=True):
+            with patch("rpa.hongguo.operations.time.sleep"):
+                assert ops.skip_ad_if_present() is False
+                assert ops.skip_ad_if_present() is False
+        assert len(device.swipes) == 1
+
+    def test_ad_skip_does_not_swipe_when_ad_disappears_during_readiness_wait(self):
+        device = MagicMock()
+        device.window_size.return_value = (720, 1280)
+        ops = HongguoOperations(device)
+        with patch.object(ops, "_ad_continue_visible", side_effect=[True, False]):
+            with patch("rpa.hongguo.operations.time.sleep"):
+                assert ops.skip_ad_if_present() is True
+        device.swipe.assert_not_called()
 
     def test_resume_playback_clicks_center_overlay_without_text(self):
         class DummyDevice:
@@ -1986,15 +2119,29 @@ class TestHongguoPlaybackHeuristics:
                 assert ops.play_episode(1) is True
         assert device.presses == []
 
-    def test_play_episode_one_does_not_close_episode_panel_when_already_active(self):
+    def test_play_episode_one_closes_episode_panel_when_already_active(self):
         ops = HongguoOperations(object())
         with patch.object(ops, "_xml", return_value=""):
             with patch.object(ops, "_launcher_visible", return_value=False):
                 with patch.object(ops, "get_current_episode", return_value=1):
                     with patch.object(ops, "_episode_list_panel_open", return_value=True):
-                        with patch.object(ops, "_close_episode_list_panel") as close_panel:
+                        with patch.object(ops, "_close_episode_list_panel", return_value=True) as close_panel:
                             assert ops.play_episode(1) is True
-        close_panel.assert_not_called()
+        close_panel.assert_called_once_with(1)
+
+    def test_play_episode_clicks_target_when_episode_panel_already_open(self):
+        ops = HongguoOperations(object())
+        with patch.object(ops, "_xml", return_value="episode panel"):
+            with patch.object(ops, "_launcher_visible", return_value=False):
+                with patch.object(ops, "get_current_episode", return_value=19):
+                    with patch.object(ops, "_episode_list_panel_open", return_value=True):
+                        with patch.object(ops, "_click_episode_number", return_value=True) as click_episode:
+                            with patch.object(ops, "_episode_is_confirmed", return_value=True):
+                                with patch.object(ops, "_close_episode_list_panel", return_value=True) as close_panel:
+                                    with patch("rpa.hongguo.operations.time.sleep"):
+                                        assert ops.play_episode(17) is True
+        click_episode.assert_called_once_with(17)
+        close_panel.assert_called_once_with(17)
 
     def test_play_episode_allows_launcher_nodes_behind_short_series_surface(self):
         ops = HongguoOperations(object())
@@ -2149,11 +2296,40 @@ class TestHongguoPlaybackHeuristics:
                             with patch.object(ops, "get_total_episodes", return_value=77):
                                 assert ops.ensure_playback_page(1) is True
 
+    def test_ensure_playback_page_closes_live_lite_ad_before_confirming_episode(self):
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 900, 1600
+        ops.d = MagicMock()
+        states = iter(
+            [
+                {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.biz.impl.live.ui.LiveLiteActivity",
+                },
+                {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                },
+            ]
+        )
+
+        with patch.object(ops, "_safe_app_current", side_effect=lambda: next(states)):
+            with patch.object(ops, "_xml", return_value='text="第17集" text="选集"'):
+                with patch.object(ops, "_comment_panel_open", return_value=False):
+                    with patch.object(ops, "_launcher_visible", return_value=False):
+                        with patch.object(ops, "get_current_episode", return_value=17):
+                            with patch.object(ops, "_playback_visible", return_value=True):
+                                with patch.object(ops, "_episode_list_panel_open", return_value=False):
+                                    with patch("rpa.hongguo.operations.time.sleep"):
+                                        assert ops.ensure_playback_page(17) is True
+
+        ops.d.click.assert_called_with(846, 64)
+
 
 class TestHongguoLoginDetails:
     def test_check_login_accepts_foreground_app_without_login_prompt(self):
         ops = HongguoOperations(object())
-        with patch.object(ops, "_close_popups"):
+        with patch.object(ops, "_close_popups_quick"):
             with patch.object(ops, "_xml", return_value="surface"):
                 with patch.object(ops, "_playback_visible", return_value=False):
                     with patch.object(ops, "_exists", return_value=False):
@@ -2165,7 +2341,7 @@ class TestHongguoLoginDetails:
 
     def test_check_login_still_rejects_explicit_login_prompt(self):
         ops = HongguoOperations(object())
-        with patch.object(ops, "_close_popups"):
+        with patch.object(ops, "_close_popups_quick"):
             with patch.object(ops, "_xml", side_effect=["surface", "登录 手机号"]):
                 with patch.object(ops, "_playback_visible", return_value=False):
                     with patch.object(ops, "_exists", return_value=False):
@@ -2270,6 +2446,505 @@ class TestHongguoLoginDetails:
         assert account["logged_in"] is True
         assert account["nickname"] == "姜维测试号"
         assert account["hongguo_id"] == "HG123456"
+
+    def test_get_account_info_accepts_new_profile_without_visible_hongguo_id(self):
+        class DummyDevice:
+            def window_size(self):
+                return (720, 1280)
+
+            def dump_hierarchy(self):
+                return (
+                    'text="用户名86662668" text="订单" text="消息" '
+                    'text="15.63元" text="提现" text="历史" text="收藏"'
+                )
+
+        ops = HongguoOperations(DummyDevice())
+        with patch.object(ops, "_open_profile_tab", return_value=True):
+            account = ops.get_account_info()
+        assert account["logged_in"] is True
+        assert account["nickname"] == "用户名86662668"
+        assert account["hongguo_id"] == ""
+
+    def test_hongguo_id_does_not_parse_resource_id_attribute(self):
+        ops = HongguoOperations(object())
+        xml = '<node resource-id="com.phoenix.read:id/e_container" text="用户名86662668" />'
+        assert ops._extract_hongguo_id(["用户名86662668"], xml) == ""
+
+    def test_dismisses_launcher_widget_dialog_after_selecting_drama(self):
+        ops = HongguoOperations(object())
+        ops.d = MagicMock()
+        cancel = MagicMock()
+        with patch.object(ops, "_xml", return_value="红果免费短剧 添加到主屏幕 取消"):
+            with patch.object(ops, "_exists", return_value=True):
+                ops.d.return_value = cancel
+                with patch("rpa.hongguo.operations.time.sleep"):
+                    assert ops._dismiss_launcher_widget_dialog() is True
+        cancel.click.assert_called_once()
+
+    def test_ad_continue_requires_prompt_instead_of_visual_only_match(self):
+        ops = HongguoOperations(object())
+        with patch.object(ops, "_safe_app_current", return_value={"package": "com.phoenix.read"}):
+            with patch.object(ops, "_short_series_activity_active", return_value=True):
+                with patch.object(ops, "_ad_continue_visual_visible", return_value=True):
+                    assert ops._ad_continue_visible('<node package="com.phoenix.read" />') is False
+
+    def test_ad_continue_accepts_muted_surface_prompt_without_hierarchy_text(self):
+        ops = HongguoOperations(object())
+        with patch.object(ops, "_short_series_activity_active", return_value=True):
+            with patch.object(ops, "_has_hongguo_business_nodes", return_value=False):
+                with patch.object(ops, "_surface_ad_prompt_visual_visible", return_value=True):
+                    assert ops._ad_continue_visible('<node package="com.phoenix.read" />') is True
+
+    def test_normal_episode_hierarchy_overrides_ad_visual_match(self):
+        ops = HongguoOperations(object())
+        with patch.object(ops, "_short_series_activity_active", return_value=True):
+            with patch.object(ops, "_ad_continue_visual_visible", return_value=True):
+                assert ops._ad_continue_visible('text="第6集" text="选集"') is False
+
+    def test_short_series_live_ad_text_triggers_without_visual_match(self):
+        ops = HongguoOperations(object())
+        xml = (
+            '<node package="com.phoenix.read" text="直播中" />'
+            '<node package="com.phoenix.read" text="点击进入直播间" />'
+            '<node package="com.phoenix.read" text="上滑继续看短剧" />'
+        )
+        with patch.object(ops, "_short_series_activity_active", return_value=True):
+            with patch.object(ops, "_ad_continue_visual_visible", return_value=False):
+                assert ops._ad_continue_visible(xml) is True
+
+    def test_short_series_exact_ad_badge_triggers_without_surface_prompt(self):
+        ops = HongguoOperations(object())
+        xml = (
+            '<node package="com.phoenix.read" text="广告" />'
+            '<node package="com.phoenix.read" text="拼多多" />'
+        )
+        with patch.object(ops, "_short_series_activity_active", return_value=True):
+            assert ops._ad_continue_visible(xml) is True
+
+    def test_ad_carousel_text_alone_is_not_an_exact_ad_badge(self):
+        ops = HongguoOperations(object())
+        xml = '<node package="com.phoenix.read" content-desc="广告轮播" />'
+        with patch.object(ops, "_short_series_activity_active", return_value=True):
+            with patch.object(ops, "_surface_ad_prompt_visual_visible", return_value=False):
+                assert ops._ad_continue_visible(xml) is False
+
+
+def test_surface_live_ad_visual_detects_dimmed_ad_with_footer_prompt():
+    from PIL import Image, ImageDraw
+
+    class DummyDevice:
+        def window_size(self):
+            return (900, 1600)
+
+        def app_current(self):
+            return {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            }
+
+        def screenshot(self):
+            image = Image.new("RGB", (900, 1600), (48, 48, 48))
+            ImageDraw.Draw(image).rectangle((0, int(1600 * 0.93), 900, 1600), fill=(8, 8, 8))
+            ImageDraw.Draw(image).rectangle((390, 1520, 510, 1535), fill=(220, 220, 220))
+            return image
+
+    assert HongguoOperations(DummyDevice())._ad_continue_visual_visible() is True
+
+
+def test_surface_live_ad_visual_rejects_normal_dark_player_chrome():
+    from PIL import Image
+
+    class DummyDevice:
+        def window_size(self):
+            return (720, 1280)
+
+        def app_current(self):
+            return {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            }
+
+        def screenshot(self):
+            return Image.new("RGB", (720, 1280), (25, 30, 34))
+
+    assert HongguoOperations(DummyDevice())._ad_continue_visual_visible() is False
+
+
+def test_surface_live_ad_visual_rejects_normal_video_with_episode_footer():
+    from PIL import Image, ImageDraw
+
+    class DummyDevice:
+        def window_size(self):
+            return (900, 1600)
+
+        def app_current(self):
+            return {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            }
+
+        def screenshot(self):
+            image = Image.new("RGB", (900, 1600), (110, 135, 145))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((0, int(1600 * 0.93), 900, 1600), fill=(8, 8, 8))
+            draw.rectangle((60, 1520, 360, 1535), fill=(220, 220, 220))
+            return image
+
+    assert HongguoOperations(DummyDevice())._ad_continue_visual_visible() is False
+
+
+def test_surface_ad_prompt_visual_detects_muted_gray_footer_text():
+    from PIL import Image, ImageDraw
+
+    class DummyDevice:
+        def window_size(self):
+            return (720, 1280)
+
+        def app_current(self):
+            return {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            }
+
+        def screenshot(self):
+            image = Image.new("RGB", (720, 1280), (105, 105, 105))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((0, int(1280 * 0.88), 720, 1280), fill=(8, 8, 8))
+            draw.rectangle((260, 1220, 460, 1230), fill=(150, 150, 150))
+            return image
+
+    assert HongguoOperations(DummyDevice())._surface_ad_prompt_visual_visible() is True
+
+
+def test_surface_ad_prompt_visual_rejects_bright_episode_footer_text():
+    from PIL import Image, ImageDraw
+
+    class DummyDevice:
+        def window_size(self):
+            return (720, 1280)
+
+        def app_current(self):
+            return {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            }
+
+        def screenshot(self):
+            image = Image.new("RGB", (720, 1280), (105, 105, 105))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((0, int(1280 * 0.88), 720, 1280), fill=(8, 8, 8))
+            draw.rectangle((180, 1220, 540, 1230), fill=(230, 230, 230))
+            return image
+
+    assert HongguoOperations(DummyDevice())._surface_ad_prompt_visual_visible() is False
+
+
+def test_open_profile_tab_leaves_short_series_before_tapping_bottom_nav():
+    ops = HongguoOperations(object())
+    ops.d = MagicMock()
+    profile = MagicMock()
+    with patch.object(ops, "_close_popups"):
+        with patch.object(ops, "_profile_visible", side_effect=[False, True]):
+            with patch.object(ops, "_short_series_activity_active", return_value=True):
+                with patch.object(ops, "_open_main_activity", return_value=True) as open_main:
+                    with patch.object(ops, "_xml", return_value=""):
+                        with patch.object(ops, "_exists", return_value=True):
+                            ops.d.return_value = profile
+                            with patch("rpa.hongguo.operations.time.sleep"):
+                                assert ops._open_profile_tab() is True
+    open_main.assert_called_once()
+
+
+def test_close_popups_dismisses_favorite_prompt():
+    ops = HongguoOperations(object())
+    dismiss = MagicMock()
+    selectors = {}
+
+    def select(**kwargs):
+        key = tuple(kwargs.items())
+        selectors[key] = dismiss if kwargs.get("textContains") == "暂不加入" else MagicMock()
+        return selectors[key]
+
+    ops.d = MagicMock(side_effect=select)
+    with patch.object(ops, "_recover_anr_dialog", return_value=False):
+        with patch.object(ops, "_exists", side_effect=lambda selector, timeout=0: selector is dismiss):
+            with patch.object(ops, "_anr_dialog_visible", return_value=False):
+                with patch("rpa.hongguo.operations.time.sleep"):
+                    ops._close_popups()
+    assert any(call.kwargs == {"textContains": "暂不加入"} for call in ops.d.call_args_list)
+    dismiss.click.assert_called()
+
+
+def test_stale_surface_ad_prompt_text_does_not_override_normal_episode():
+    ops = HongguoOperations(object())
+    with patch.object(ops, "_short_series_activity_active", return_value=True):
+        with patch.object(ops, "_ad_continue_visual_visible", return_value=False):
+            xml = 'text="第1集" text="选集" text="上滑继续观看短剧"'
+            assert ops._ad_continue_visible(xml) is False
+
+
+def test_unknown_foreground_does_not_restore_stale_ad_text_after_normal_visual():
+    ops = HongguoOperations(object())
+    with patch.object(ops, "_short_series_activity_active", return_value=False):
+        with patch.object(ops, "_ad_continue_visual_visible", return_value=False):
+            with patch.object(ops, "_safe_app_current", return_value={}):
+                assert ops._ad_continue_visible('text="上滑继续观看短剧"') is False
+
+
+def test_surface_live_ad_visual_detects_dark_page_with_small_footer_prompt():
+    from PIL import Image, ImageDraw
+
+    class DummyDevice:
+        def window_size(self):
+            return (720, 1280)
+
+        def app_current(self):
+            return {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            }
+
+        def screenshot(self):
+            image = Image.new("RGB", (720, 1280), (8, 8, 8))
+            ImageDraw.Draw(image).rectangle((300, 1210, 420, 1220), fill=(230, 230, 230))
+            return image
+
+    assert HongguoOperations(DummyDevice())._ad_continue_visual_visible() is True
+
+
+def test_surface_live_ad_visual_allows_unknown_foreground_during_adb_timeout():
+    from PIL import Image, ImageDraw
+
+    class DummyDevice:
+        def window_size(self):
+            return (900, 1600)
+
+        def app_current(self):
+            return {}
+
+        def screenshot(self):
+            image = Image.new("RGB", (900, 1600), (8, 8, 8))
+            ImageDraw.Draw(image).rectangle((380, 1520, 520, 1535), fill=(230, 230, 230))
+            return image
+
+    assert HongguoOperations(DummyDevice())._ad_continue_visual_visible() is True
+
+
+def test_paused_ad_play_overlay_is_detected_before_swipe():
+    from PIL import Image, ImageDraw
+
+    class DummyDevice:
+        def window_size(self):
+            return (900, 1600)
+
+        def screenshot(self):
+            image = Image.new("RGB", (900, 1600), (5, 5, 5))
+            ImageDraw.Draw(image).polygon([(420, 680), (420, 800), (500, 740)], fill=(255, 255, 255))
+            return image
+
+    assert HongguoOperations(DummyDevice())._ad_play_overlay_visual_visible() is True
+
+
+def test_ad_continue_swipe_uses_long_bottom_to_top_gesture():
+    ops = HongguoOperations(object())
+    ops.width, ops.height = 900, 1600
+    ops.d = MagicMock()
+    with patch("rpa.hongguo.operations.random.randint", return_value=0):
+        ops._swipe_up_continue_ad()
+    ops.d.swipe.assert_called_once_with(450, 1536, 450, 288, duration=0.75)
+
+
+def test_prepare_comment_window_opens_panel_before_comment_generation():
+    ops = HongguoOperations(object())
+    with patch.object(ops, "_open_comment_panel", return_value=True) as open_panel:
+        assert ops.prepare_comment_window(21) is True
+    open_panel.assert_called_once_with(0.5, prefer_coordinate=True)
+
+
+def test_comment_panel_toggles_layout_when_reward_overlay_blocks_button():
+    ops = HongguoOperations(object())
+    ops.width, ops.height = 720, 1280
+    ops.d = MagicMock()
+    with patch.object(ops, "_comment_button_obstructed", return_value=True):
+        with patch.object(ops, "_comment_panel_open", return_value=True):
+            with patch("rpa.hongguo.operations.time.sleep"):
+                assert ops._open_comment_panel_by_coordinate() is True
+
+    assert ops.d.click.call_args_list == [
+        call(662, 1222),
+        call(662, 1222),
+        call(666, 768),
+    ]
+
+
+def test_comment_button_obstruction_detects_reward_compose_layer():
+    ops = HongguoOperations(object())
+    ops.width, ops.height = 720, 1280
+    xml = (
+        '<node class="androidx.compose.ui.viewinterop.ViewFactoryHolder" '
+        'bounds="[552,502][720,856]" />'
+    )
+    assert ops._comment_button_obstructed(xml) is True
+
+
+def test_comment_panel_failure_resumes_playback_before_task_fails():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    ops = MagicMock()
+    ops.pause_playback_if_playing.return_value = True
+    ops.prepare_comment_window.return_value = False
+    ops.resume_playback_safely.return_value = True
+    ops.is_playback_paused.return_value = False
+
+    with pytest.raises(RuntimeError, match="评论面板打开失败"):
+        engine._handle_verified_comment(ops, {}, "云渺3", 9, 77)
+
+    ops.resume_playback_safely.assert_called_once_with()
+
+
+def test_resume_if_paused_uses_safe_then_coordinate_fallback():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops.is_playback_paused.side_effect = [True, True, False]
+    ops.resume_playback_safely.return_value = False
+    ops.resume_playback_if_paused.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._resume_if_paused(ops, 9) is True
+
+    ops.resume_playback_safely.assert_called_once_with()
+    ops.resume_playback_if_paused.assert_called_once_with(allow_center_fallback=True)
+
+
+def test_safe_resume_uses_final_playback_state_when_command_returns_false():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops.resume_playback_safely.return_value = False
+    ops.is_playback_paused.return_value = False
+
+    assert engine._safe_resume_playback(ops, 4, "检查是否暂停") is True
+
+    ops.resume_playback_if_paused.assert_not_called()
+
+
+def test_verified_wait_throttles_persistent_ad_after_single_swipe():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ad_state = {
+        "current_episode": 0,
+        "total_episodes": 0,
+        "ad_visible": True,
+        "playback_visible": True,
+        "app": {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        },
+    }
+    target_state = {
+        **ad_state,
+        "current_episode": 10,
+        "total_episodes": 67,
+        "ad_visible": False,
+    }
+    engine._page_state = MagicMock(side_effect=[ad_state, ad_state, target_state])
+    engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+    ops = MagicMock()
+    ops._ad_swipe_pending = False
+    ops.take_screenshot.return_value = "C:/tmp/ep9_ad.png"
+
+    def skip_once():
+        ops._ad_swipe_pending = True
+        return False
+
+    ops.skip_ad_if_present.side_effect = skip_once
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._wait_for_next_episode_verified(ops, {}, 9, 10, 67) is True
+
+    ops.take_screenshot.assert_called_once_with("ep9_ad", "C:/tmp")
+    ops.skip_ad_if_present.assert_called_once_with()
+
+
+def test_open_search_page_returns_to_main_when_playback_is_visually_detected():
+    ops = HongguoOperations(object())
+    ops.d = MagicMock()
+    with patch.object(ops, "_close_popups"):
+        with patch.object(ops, "_wait_app_foreground", return_value=True):
+            with patch.object(ops, "_short_series_activity_active", return_value=False):
+                with patch.object(ops, "_playback_visible", return_value=True):
+                    with patch.object(ops, "_open_main_activity", return_value=True) as open_main:
+                        with patch.object(ops, "_current_playing_title", return_value=""):
+                            with patch.object(ops, "_open_theater"):
+                                with patch.object(ops, "_open_search", return_value=True):
+                                    with patch.object(ops, "_exists", return_value=True):
+                                        with patch.object(ops, "_sleep"):
+                                            result = ops.open_search_page("云渺2")
+    assert result["success"] is True
+    open_main.assert_called_once()
+
+
+def test_pending_comment_episodes_between_ignores_verified_comments():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    task = {"execution_plan_json": json.dumps({"comment_episodes": [7, 17, 24]})}
+    with patch.object(engine, "_comment_already_verified", side_effect=lambda episode: episode == 17):
+        assert engine._pending_comment_episodes_between(task, 10, 25) == [24]
+
+
+def test_pending_comment_episodes_between_uses_latest_in_memory_plan():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    task = {"execution_plan_json": json.dumps({"comment_episodes": []})}
+    latest_plan = {"comment_episodes": [5, 20, 39, 40, 48, 53, 77, 85]}
+    task["execution_plan_json"] = json.dumps(latest_plan, ensure_ascii=False)
+    with patch.object(engine, "_comment_already_verified", return_value=False):
+        assert engine._pending_comment_episodes_between(task, 39, 41) == [39, 40]
+
+
+def test_select_drama_skips_preroll_ad_before_title_verification():
+    ops = HongguoOperations(object())
+    ops.d = MagicMock()
+    with patch.object(ops, "_is_app_foreground", return_value=True):
+        with patch.object(ops, "_verified_detail_title", return_value=""):
+            with patch.object(ops, "_xml", return_value=""):
+                with patch.object(ops, "_search_candidate_page_visible", return_value=False):
+                    with patch.object(ops, "_click_matching_title", return_value=True):
+                        with patch.object(ops, "_sleep"):
+                            with patch.object(ops, "_dismiss_launcher_widget_dialog"):
+                                with patch.object(ops, "_safe_app_current", return_value={}):
+                                    with patch.object(ops, "_still_on_search_selection_page", return_value=False):
+                                        with patch.object(ops, "_ad_continue_visible", side_effect=[True, False]):
+                                            with patch.object(ops, "skip_ad_if_present", return_value=True) as skip_ad:
+                                                with patch.object(ops, "_wait_selected_drama_title", return_value="云渺2"):
+                                                    with patch.object(
+                                                        ops,
+                                                        "_drama_detail_result",
+                                                        return_value={"success": True},
+                                                    ):
+                                                        with patch("rpa.hongguo.operations.time.sleep"):
+                                                            result = ops.select_drama("云渺2", keyword="云渺2")
+    assert result["success"] is True
+    skip_ad.assert_called_once_with()
+
+
+def test_open_main_activity_cold_starts_when_android_reuses_player_task():
+    ops = HongguoOperations(object())
+    ops.d = MagicMock()
+    with patch("rpa.hongguo.operations.call_with_timeout"):
+        with patch.object(
+            ops,
+            "_safe_app_current",
+            side_effect=[
+                {"package": "com.phoenix.read", "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity"},
+                {"package": "com.phoenix.read", "activity": "com.dragon.read.pages.main.MainFragmentActivity"},
+            ],
+        ):
+            with patch.object(ops, "_stop_app") as stop_app:
+                with patch.object(ops, "_start_app") as start_app:
+                    with patch("rpa.hongguo.operations.time.sleep"):
+                        assert ops._open_main_activity() is True
+    stop_app.assert_called_once()
+    start_app.assert_called_once()
 
 
 class TestHongguoCommentGeneration:
@@ -2409,6 +3084,32 @@ class TestHongguoEngineWaits:
                 with patch.object(engine, "_log"):
                     with patch("rpa.hongguo.engine.time.sleep"):
                         assert engine._wait_for_episode_verified(object(), {}, 1, 77, timeout=20) is True
+
+    def test_wait_for_episode_verified_reseeks_when_autoplay_passes_target(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        current_two = {
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+            "app_foreground": True,
+            "launcher_visible": False,
+            "playback_visible": True,
+            "ad_visible": False,
+            "current_episode": 2,
+            "total_episodes": 77,
+        }
+        current_one = {**current_two, "current_episode": 1}
+        ops = MagicMock()
+        ops.play_episode.return_value = True
+        with patch.object(engine, "_page_state", side_effect=[current_two, current_one]):
+            with patch.object(engine, "_check_pause_stop"):
+                with patch.object(engine, "_comment_already_verified", return_value=False):
+                    with patch.object(engine, "_log"):
+                        with patch("rpa.hongguo.engine.time.sleep"):
+                            task = {"execution_plan_json": json.dumps({"comment_episodes": [1]})}
+                            assert engine._wait_for_episode_verified(ops, task, 1, 77, timeout=20) is True
+        ops.play_episode.assert_called_once_with(1)
 
     def test_page_state_with_empty_retry_returns_next_readable_state(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
@@ -2593,6 +3294,226 @@ class TestHongguoEngineWaits:
                 assert engine._wait_for_next_episode(ops, 3, {"comment_interval_sec": 1}) is False
         assert ops.resume_calls == 0
 
+    def test_verified_next_episode_accepts_marker_that_updates_after_timeout(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._page_state = MagicMock(
+            return_value={
+                "current_episode": 41,
+                "total_episodes": 77,
+                "app": {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                },
+            }
+        )
+        engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+        with patch("rpa.hongguo.engine.time.time", side_effect=[0, 301]):
+            with patch("rpa.hongguo.engine.time.sleep"):
+                assert engine._wait_for_next_episode_verified(MagicMock(), {}, 40, 41, 77) is True
+
+    def test_verified_next_episode_does_not_force_skip_while_normally_playing(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._has_playback_context = MagicMock(return_value=True)
+        engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+        engine._safe_resume_playback = MagicMock(return_value=True)
+        engine._page_state = MagicMock(
+            return_value={
+                "current_episode": 2,
+                "total_episodes": 86,
+                "playback_visible": True,
+                "playback_paused": False,
+                "ad_visible": False,
+                "app": {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                },
+            }
+        )
+        ops = MagicMock()
+        ops.take_screenshot.return_value = "C:/tmp/ep2_stale_observe.png"
+
+        clock = {"value": -31}
+
+        def fake_time():
+            clock["value"] += 31
+            return clock["value"]
+
+        with patch("rpa.hongguo.engine.time.time", side_effect=fake_time):
+            with patch("rpa.hongguo.engine.time.sleep"):
+                assert engine._wait_for_next_episode_verified(ops, {"comment_interval_sec": 1}, 2, 3, 86) is False
+
+        ops.play_episode.assert_not_called()
+        engine._safe_resume_playback.assert_not_called()
+
+    def test_verified_wait_for_episode_accepts_skip_ahead_without_pending_comments(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._page_state = MagicMock(
+            return_value={
+                "current_episode": 13,
+                "total_episodes": 86,
+                "playback_visible": True,
+                "app": {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                },
+            }
+        )
+        engine._has_playback_context = MagicMock(return_value=True)
+        engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+        engine._pending_comment_episodes_between = MagicMock(return_value=[])
+        assert engine._wait_for_episode_verified(MagicMock(), {}, 10, 86, timeout=20) is True
+
+    def test_verified_wait_for_episode_recovers_when_unskipped_ad_is_wrong_drama(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        wrong_state = {
+            "current_episode": 12,
+            "total_episodes": 198,
+            "ad_visible": True,
+            "playback_visible": True,
+            "app_foreground": True,
+            "launcher_visible": False,
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+        }
+        engine._log = MagicMock()
+        engine._page_state = MagicMock(return_value=wrong_state)
+        engine._total_mismatch_is_fatal = MagicMock(return_value=True)
+        engine._recover_to_verified_episode = MagicMock(return_value=True)
+        ops = MagicMock()
+        ops.take_screenshot.return_value = "C:/tmp/seek_ep1_ad.png"
+        ops.skip_ad_if_present.return_value = False
+
+        with patch("rpa.hongguo.engine.time.time", side_effect=[0, 1, 2, 3]):
+            assert engine._wait_for_episode_verified(ops, {"drama_name": "云渺2"}, 1, 86, timeout=20) is True
+
+        engine._recover_to_verified_episode.assert_called_once()
+
+    def test_verified_next_episode_recovers_after_ad_opens_other_drama(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        state = {
+            "current_episode": 1,
+            "total_episodes": 77,
+            "playback_visible": True,
+            "app_foreground": True,
+            "launcher_visible": False,
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+        }
+        engine._page_state = MagicMock(return_value=state)
+        engine._total_mismatch_is_fatal = MagicMock(return_value=True)
+        engine._recover_to_verified_episode = MagicMock(return_value=True)
+        engine._log = MagicMock()
+        with patch("rpa.hongguo.engine.time.time", side_effect=[0, 1]):
+            assert engine._wait_for_next_episode_verified(MagicMock(), {}, 84, 85, 86) is True
+        engine._recover_to_verified_episode.assert_called_once()
+
+    def test_restore_after_comment_recovers_wrong_drama_before_resuming(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        wrong_state = {
+            "current_episode": 83,
+            "total_episodes": 371,
+            "playback_visible": True,
+            "playback_paused": False,
+            "app_foreground": True,
+            "launcher_visible": False,
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+        }
+        recovered_state = {
+            **wrong_state,
+            "total_episodes": 86,
+        }
+        engine._page_state = MagicMock(side_effect=[wrong_state, recovered_state])
+        engine._assert_target_playback = MagicMock(side_effect=[RuntimeError("total mismatch"), None])
+        engine._recover_to_verified_episode = MagicMock(return_value=True)
+
+        ops = MagicMock()
+        ops.ensure_playback_page.return_value = True
+        ops.is_playback_paused.return_value = False
+        ops.resume_playback_safely.return_value = True
+
+        with patch("rpa.hongguo.engine.time.sleep"):
+            assert engine._restore_playback_after_comment(
+                ops,
+                {"drama_name": "云渺2"},
+                episode=83,
+                expected_total=86,
+            ) is True
+
+        engine._recover_to_verified_episode.assert_called_once()
+        assert engine._assert_target_playback.call_count == 2
+
+    def test_resume_playback_safely_waits_for_delayed_pause_overlay(self):
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 900, 1600
+        ops.d = MagicMock()
+        states = iter([False, False, True, True, False])
+        with patch.object(ops, "_short_series_activity_active", return_value=True):
+            with patch.object(ops, "skip_ad_if_present", return_value=False):
+                with patch.object(ops, "_center_play_overlay_visible", side_effect=lambda: next(states)):
+                    with patch("rpa.hongguo.operations.time.sleep"):
+                        assert ops.resume_playback_safely() is True
+        ops.d.click.assert_called_once_with(450, 672)
+
+    def test_center_play_overlay_detects_surface_play_button_without_xml_node(self):
+        from PIL import Image, ImageDraw
+
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 900, 1600
+        ops.d = MagicMock()
+        image = Image.new("RGB", (900, 1600), (30, 30, 30))
+        draw = ImageDraw.Draw(image)
+        draw.polygon([(420, 710), (420, 790), (500, 750)], fill=(255, 255, 255))
+        ops.d.screenshot.return_value = image
+
+        assert ops._center_play_overlay_visible('<node package="com.phoenix.read" />') is True
+
+    def test_center_play_overlay_falls_back_when_center_clickable_is_search_chip(self):
+        from PIL import Image, ImageDraw
+
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 900, 1600
+        ops.d = MagicMock()
+        image = Image.new("RGB", (900, 1600), (30, 30, 30))
+        draw = ImageDraw.Draw(image)
+        draw.polygon([(420, 710), (420, 790), (500, 750)], fill=(255, 255, 255))
+        ops.d.screenshot.return_value = image
+        xml = (
+            '<node package="com.phoenix.read" clickable="true" '
+            'text="搜同款毛呢大衣" bounds="[300,850][600,930]" />'
+        )
+
+        assert ops._center_play_overlay_visible(xml) is True
+
+    def test_click_play_overlay_falls_back_to_visual_center_button(self):
+        from PIL import Image, ImageDraw
+
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 900, 1600
+        ops.d = MagicMock()
+        image = Image.new("RGB", (900, 1600), (30, 30, 30))
+        draw = ImageDraw.Draw(image)
+        draw.polygon([(420, 710), (420, 790), (500, 750)], fill=(255, 255, 255))
+        ops.d.screenshot.return_value = image
+        xml = (
+            '<node package="com.phoenix.read" clickable="true" '
+            'text="搜同款毛呢大衣" bounds="[300,850][600,930]" />'
+        )
+        with patch.object(ops, "_xml", return_value=xml):
+            assert ops._click_play_overlay() is True
+
+        ops.d.click.assert_called_once_with(450, 736)
+
     def test_safe_comment_window_caps_delay_for_fast_playback(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
 
@@ -2649,6 +3570,38 @@ class TestHongguoEngineWaits:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
+
+
+def test_click_matching_title_ignores_hidden_stale_nodes():
+    class DummyDevice:
+        def __init__(self):
+            self.clicked = []
+
+        def window_size(self):
+            return (1080, 1920)
+
+        def dump_hierarchy(self):
+            return (
+                '<node package="com.phoenix.read" text="鍓戝綊" visible-to-user="false" bounds="[30,1000][170,1050]" />'
+                '<node package="com.phoenix.read" class="android.widget.ImageView" visible-to-user="false" bounds="[12,280][500,980]" />'
+                '<node package="com.phoenix.read" class="android.widget.ImageView" bounds="[540,280][1028,980]" />'
+                '<node package="com.phoenix.read" text="鍓戝綊" bounds="[558,1000][720,1050]" />'
+            )
+
+        def click(self, x, y):
+            self.clicked.append((x, y))
+
+    device = DummyDevice()
+    ops = HongguoOperations(device)
+    assert ops._click_matching_title("鍓戝綊", "鍓戝綊") is True
+    assert device.clicked == [(639, 1025)]
+
+
+def test_extract_detail_title_reads_quoted_playing_title():
+    ops = HongguoOperations(object())
+    xml = '<node package="com.phoenix.read" text="第3集 | 《伪装者》第3集 明台被迫入学" bounds="[32,1440][780,1490]" />'
+    with patch.object(ops, "_current_playing_title", return_value=""):
+        assert ops._extract_detail_title(xml=xml) == "伪装者"
 
 
 # TASK_COMPLETE: phase2_rpa_engine

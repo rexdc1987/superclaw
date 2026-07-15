@@ -134,21 +134,21 @@ class TaskEngine:
             if completed_episodes:
                 comment_episodes -= completed_episodes
 
+            execution_plan = {
+                "watch_episodes": list(range(1, total + 1)),
+                "comment_episodes": sorted(comment_episodes),
+                "skipped_comment_episodes": sorted(completed_episodes),
+                "rule": self._task_rule_snapshot(task),
+                "flow": "verified_v3_full",
+            }
+            execution_plan_json = json.dumps(execution_plan, ensure_ascii=False)
             self._update_task(
                 current_episode=1,
                 total_episodes=total,
-                execution_plan_json=json.dumps(
-                    {
-                        "watch_episodes": list(range(1, total + 1)),
-                        "comment_episodes": sorted(comment_episodes),
-                        "skipped_comment_episodes": sorted(completed_episodes),
-                        "rule": self._task_rule_snapshot(task),
-                        "flow": "verified_v3_full",
-                    },
-                    ensure_ascii=False,
-                ),
+                execution_plan_json=execution_plan_json,
                 updated_at=datetime.now(),
             )
+            task["execution_plan_json"] = execution_plan_json
             self._log("info", f"全流程v3: 准备完成，短剧={drama_title}，总集数={total}，评论集数={sorted(comment_episodes)}")
             self._resume_if_paused(ops, 1)
 
@@ -170,7 +170,7 @@ class TaskEngine:
                 self._assert_target_playback(ops, task, state, total)
                 current = int(state.get("current_episode") or 0)
                 if current and current != episode:
-                    if current > episode and not any(ep in comment_episodes for ep in range(episode, current)):
+                    if current > episode and not self._pending_comment_episodes_between(task, episode, current):
                         self._log(
                             "info",
                             f"全流程v3: 第{episode}集已自然播放越过到第{current}集，未命中评论规则，顺延观察",
@@ -180,7 +180,7 @@ class TaskEngine:
                     if self._recover_to_verified_episode(ops, task, episode, total, f"主循环集数偏移，当前第{current}集"):
                         state = self._page_state(ops, task)
                         current = int(state.get("current_episode") or 0)
-                    if current > episode and not any(ep in comment_episodes for ep in range(episode, current)):
+                    if current > episode and not self._pending_comment_episodes_between(task, episode, current):
                         self._log(
                             "info",
                             f"全流程v3: 恢复确认时已播放到第{current}集，跳过的集数未命中评论规则，顺延观察",
@@ -292,9 +292,18 @@ class TaskEngine:
         selected = ops.select_drama(selected_title, keyword=keyword)
         drama_title = selected.get("drama_title") or selected_title
         self._log("info", selected.get("message") or f"全流程v3: 已进入目标剧集 {drama_title}")
+        task_total = int(task.get("total_episodes") or 0)
         if not selected.get("success"):
             shot = ops.take_screenshot("select_drama_failed", self.screenshot_dir)
-            raise RuntimeError(f"{selected.get('message') or '进入目标剧集失败'}，已截图 {shot}")
+            self._log(
+                "warn",
+                f"全流程v3: 首次选剧失败，已截图 {shot}，尝试强制重搜目标短剧",
+            )
+            if task_total and self._retry_reopen_target_from_main(ops, keyword, 1, task_total, task):
+                drama_title = keyword
+                selected = {"success": True, "drama_title": drama_title}
+            else:
+                raise RuntimeError(f"{selected.get('message') or '进入目标剧集失败'}，已截图 {shot}")
 
         playback_speed = str(task.get("playback_speed") or "1.0x")
         if playback_speed != "1.0x":
@@ -303,17 +312,23 @@ class TaskEngine:
             if not speed_set:
                 raise RuntimeError(f"倍速设置失败: {playback_speed}")
 
-        if ops.skip_ad_if_present(attempts=3):
+        if ops.skip_ad_if_present():
             self._log("info", "全流程v3: 切第1集前检测到广告，已上滑继续观看")
             time.sleep(2)
 
-        task_total = int(task.get("total_episodes") or 0)
         total_before = int(ops.get_total_episodes() or 0)
         if task_total and total_before and task_total != total_before:
             shot = ops.take_screenshot("select_drama_total_mismatch", self.screenshot_dir)
-            raise RuntimeError(
-                f"进入短剧总集数不匹配: 期望 {task_total}，实际 {total_before}，已截图 {shot}"
+            self._log(
+                "warn",
+                f"全流程v3: 进入短剧总集数不匹配，期望 {task_total}，实际 {total_before}，已截图 {shot}，尝试重新进入目标短剧",
             )
+            if self._recover_to_verified_episode(ops, task, 1, task_total, f"选剧后总集数不匹配，实际{total_before}"):
+                total_before = task_total
+            else:
+                raise RuntimeError(
+                    f"进入短剧总集数不匹配: 期望 {task_total}，实际 {total_before}，已截图 {shot}"
+                )
         total_before = total_before or task_total
         self._log("info", f"全流程v3: 切换到第1集，当前识别总集数={total_before or 0}")
         pre_seek_xml = ops._xml()
@@ -327,13 +342,13 @@ class TaskEngine:
             self._log("info" if foreground else "warn", f"全流程v3: 切第1集前拉回红果前台={foreground}")
         if not ops.play_episode(1):
             self._log("warn", "全流程v3: 第1集播放触发未确认，继续等待页面识别")
-        if not self._wait_for_episode_verified(ops, task, 1, max(total_before, 1), timeout=90):
+        if not self._wait_for_episode_verified(ops, task, 1, total_before, timeout=90):
             shot = ops.take_screenshot("ep1_play_failed", self.screenshot_dir)
             raise RuntimeError(f"首集播放失败，已截图 {shot}")
 
         state = self._page_state_with_empty_retry(ops, task)
         total = int(state.get("total_episodes") or total_before or task_total or 0)
-        self._assert_target_playback(ops, task, state, max(total, 1))
+        self._assert_target_playback(ops, task, state, total)
         return {
             "drama_title": drama_title,
             "total_episodes": total,
@@ -349,7 +364,35 @@ class TaskEngine:
         expected_total: int,
     ) -> None:
         paused = ops.pause_playback_if_playing()
-        self._log("info", f"全流程v3: 第{episode}集命中评论规则，暂停播放={paused}，准备生成评论")
+        panel_ready = ops.prepare_comment_window(episode)
+        self._log(
+            "info" if panel_ready else "warn",
+            f"全流程v3: 第{episode}集命中评论规则，暂停播放={paused}，评论面板={panel_ready}",
+        )
+        if not panel_ready:
+            if not self._recover_to_verified_episode(
+                ops,
+                task,
+                episode,
+                expected_total,
+                "评论前未能立即打开评论面板",
+            ):
+                raise RuntimeError(f"第{episode}集评论前无法恢复播放页")
+            paused = ops.pause_playback_if_playing()
+            panel_ready = ops.prepare_comment_window(episode)
+            self._log(
+                "info" if panel_ready else "error",
+                f"全流程v3: 第{episode}集恢复后准备评论，暂停播放={paused}，评论面板={panel_ready}",
+            )
+            if not panel_ready:
+                resumed = ops.resume_playback_safely()
+                still_paused = ops.is_playback_paused()
+                self._log(
+                    "info" if not still_paused else "warn",
+                    f"全流程v3: 第{episode}集评论面板打开失败，退出前恢复播放={resumed}，仍暂停={still_paused}",
+                )
+                raise RuntimeError(f"第{episode}集评论面板打开失败")
+
         generator = CommentGenerator(self._current_ai_config())
         content, source, usage = generator.generate_with_usage(
             drama_title,
@@ -391,6 +434,19 @@ class TaskEngine:
 
         self._increment_counter("sent")
         verify = self._verify_comment_with_retry(ops, task, content, episode, expected_total)
+        if not verify.get("verified"):
+            self._log("warn", f"全流程v3: 第{episode}集评论验证仍未通过，准备回到目标集重发一次")
+            try:
+                if self._recover_to_verified_episode(ops, task, episode, expected_total, "评论验证失败后重发"):
+                    retry_post = ops.post_comment(content, episode)
+                    if retry_post.get("success"):
+                        verify = self._verify_comment_with_retry(ops, task, content, episode, expected_total)
+                    else:
+                        self._log("warn", f"全流程v3: 第{episode}集评论重发失败 - {retry_post.get('message')}")
+                else:
+                    self._log("warn", f"全流程v3: 第{episode}集评论重发前恢复目标集失败")
+            except Exception as exc:
+                self._log("warn", f"全流程v3: 第{episode}集评论重发异常: {exc}")
         verify_path = verify.get("screenshot_path") or ops.take_screenshot(
             f"ep{episode}_{'verified' if verify.get('verified') else 'not_found'}",
             self.screenshot_dir,
@@ -424,7 +480,7 @@ class TaskEngine:
         )
         try:
             if not ops.ensure_playback_page(episode):
-                self._recover_to_verified_episode(ops, task, episode, expected_total, "评论验证前未回到目标播放页", allow_reopen=False)
+                self._recover_to_verified_episode(ops, task, episode, expected_total, "评论验证前未回到目标播放页")
             time.sleep(2)
             retry = ops.verify_comment(content, episode, self.screenshot_dir)
             if retry.get("verified"):
@@ -447,6 +503,8 @@ class TaskEngine:
     ) -> bool:
         deadline = time.time() + max(20, timeout)
         last_log_at = 0.0
+        reseek_attempts = 0
+        max_reseek_attempts = 8
         while time.time() < deadline:
             self._check_pause_stop()
             state = self._page_state(ops, task)
@@ -473,12 +531,50 @@ class TaskEngine:
                     f"切第{target}集失败: {self._playback_state_summary(state)}，截图={shot or '失败'}"
                 )
             if state.get("ad_visible"):
+                if getattr(ops, "_ad_swipe_pending", False) is True:
+                    now = time.time()
+                    if now - last_log_at >= 30:
+                        self._log(
+                            "info",
+                            f"全流程v3: 切第{target}集时广告仍在展示，已执行单次上滑，继续等待",
+                        )
+                        last_log_at = now
+                    time.sleep(3)
+                    continue
                 shot = ops.take_screenshot(f"seek_ep{target}_ad", self.screenshot_dir)
-                skipped = ops.skip_ad_if_present(attempts=3)
+                skipped = ops.skip_ad_if_present()
+                deadline = max(deadline, time.time() + 45)
                 self._log(
                     "info" if skipped else "warn",
                     f"全流程v3: 切第{target}集时遇到广告，已截图 {shot}，跳过广告={skipped}",
                 )
+                last_log_at = time.time()
+                if not skipped:
+                    ad_state = self._page_state(ops, task)
+                    ad_current = int(ad_state.get("current_episode") or 0)
+                    ad_total = int(ad_state.get("total_episodes") or 0)
+                    if self._total_mismatch_is_fatal(
+                        ops,
+                        task,
+                        ad_state,
+                        expected_total,
+                        ad_total,
+                        current=ad_current,
+                        target=target,
+                    ):
+                        self._log(
+                            "warn",
+                            f"全流程v3: 切第{target}集时广告跳过失败且总集数不匹配，期望 {expected_total}，实际 {ad_total}，尝试重新进入目标短剧",
+                        )
+                        if allow_reopen and self._recover_to_verified_episode(
+                            ops,
+                            task,
+                            target,
+                            expected_total,
+                            f"切集广告跳过失败后总集数不匹配，实际{ad_total}",
+                            allow_reopen=True,
+                        ):
+                            return True
                 time.sleep(3)
                 continue
             if app.get("activity") and app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
@@ -509,6 +605,23 @@ class TaskEngine:
                 raise RuntimeError(f"切集时短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
             if current == target:
                 return True
+            if current > target and not self._pending_comment_episodes_between(task, target, current):
+                self._log(
+                    "info",
+                    f"全流程v3: 确认第{target}集时已自然播放到第{current}集，区间无待评论任务，顺延观察",
+                )
+                return True
+            if current > target and reseek_attempts < max_reseek_attempts:
+                reseek_attempts += 1
+                replayed = ops.play_episode(target)
+                deadline = max(deadline, time.time() + 45)
+                self._log(
+                    "warn",
+                    f"全流程v3: 确认第{target}集时已自动播放到第{current}集，"
+                    f"重新切回目标集，尝试{reseek_attempts}/{max_reseek_attempts}，切集={replayed}",
+                )
+                time.sleep(3)
+                continue
             safe_playback: Optional[bool] = None
             if target == 1 and not current:
                 safe_playback = self._safe_resume_playback(ops, target, "首集Surface确认中")
@@ -542,7 +655,7 @@ class TaskEngine:
         target: int,
         expected_total: int,
     ) -> bool:
-        deadline = time.time() + max(300, int(task.get("comment_interval_sec") or 30) + 240)
+        deadline = time.time() + max(900, int(task.get("comment_interval_sec") or 30) + 600)
         last_log_at = 0.0
         same_episode_since = 0.0
         forced_target = False
@@ -575,12 +688,23 @@ class TaskEngine:
                     return True
                 raise RuntimeError(f"第{episode}集后红果不在前台，当前 package={app.get('package') or '-'}")
             if state.get("ad_visible"):
+                if getattr(ops, "_ad_swipe_pending", False) is True:
+                    now = time.time()
+                    if now - last_log_at >= 30:
+                        self._log(
+                            "info",
+                            f"全流程v3: 第{episode}集后广告仍在展示，已执行单次上滑，继续等待",
+                        )
+                        last_log_at = now
+                    time.sleep(3)
+                    continue
                 shot = ops.take_screenshot(f"ep{episode}_ad", self.screenshot_dir)
-                skipped = ops.skip_ad_if_present(attempts=3)
+                skipped = ops.skip_ad_if_present()
                 self._log(
                     "info" if skipped else "warn",
                     f"全流程v3: 第{episode}集后出现广告，已截图 {shot}，跳过广告={skipped}",
                 )
+                last_log_at = time.time()
                 time.sleep(3)
                 continue
             if app.get("activity") and app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
@@ -622,6 +746,19 @@ class TaskEngine:
                 time.sleep(2)
                 continue
             if self._total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current, target=target):
+                self._log(
+                    "warn",
+                    f"全流程v3: 第{episode}集后疑似跳到其他短剧，期望总集数{expected_total}，"
+                    f"实际{total}，尝试恢复目标第{target}集",
+                )
+                if self._recover_to_verified_episode(
+                    ops,
+                    task,
+                    target,
+                    expected_total,
+                    f"第{episode}集后总集数变为{total}",
+                ):
+                    return True
                 raise RuntimeError(f"第{episode}集后跳到其他短剧: 期望总集数 {expected_total}，实际 {total}")
 
             if current == target:
@@ -635,12 +772,17 @@ class TaskEngine:
                 after_comment = bool(comment_recovered_at and now - comment_recovered_at < 420)
                 log_interval = 30
                 soft_recover_after = 30
-                force_after = 60 if after_comment else 120
+                observe_after = 60 if after_comment else 180
+                paused = bool(state.get("playback_paused"))
+                normal_playing = bool(state.get("playback_visible")) and not paused and not state.get("ad_visible")
                 if now - last_log_at >= log_interval:
-                    self._log("info", f"全流程v3: 仍在第{episode}集，等待自动播放第{target}集")
-                    self._safe_resume_playback(ops, episode, "仍停留当前集，检查是否暂停")
+                    if paused or not normal_playing:
+                        self._log("info", f"全流程v3: 仍在第{episode}集，等待自动播放第{target}集")
+                        self._safe_resume_playback(ops, episode, "仍停留当前集，检查是否暂停")
+                    else:
+                        self._log("info", f"全流程v3: 第{episode}集仍在正常播放，继续等待自然进入第{target}集")
                     last_log_at = now
-                if after_comment and not stale_recovered and now - same_episode_since >= soft_recover_after:
+                if after_comment and not stale_recovered and now - same_episode_since >= soft_recover_after and not normal_playing:
                     shot = ops.take_screenshot(f"ep{episode}_after_comment_stale_observe", self.screenshot_dir)
                     recovered = self._safe_resume_playback(ops, episode, "评论后仍停留当前集，继续等待自然播放")
                     self._log(
@@ -649,11 +791,21 @@ class TaskEngine:
                     )
                     stale_recovered = True
                     last_log_at = now
-                if not forced_target and now - same_episode_since >= force_after:
-                    shot = ops.take_screenshot(f"ep{episode}_stale_force_target", self.screenshot_dir)
-                    forced_target = ops.play_episode(target)
-                    self._log("warn", f"全流程v3: 第{episode}集停留超过{force_after}秒，已截图 {shot}，强制切第{target}集={forced_target}")
-                    time.sleep(3)
+                if not stale_recovered and now - same_episode_since >= observe_after:
+                    shot = ops.take_screenshot(f"ep{episode}_stale_observe", self.screenshot_dir)
+                    if normal_playing:
+                        self._log(
+                            "info",
+                            f"全流程v3: 第{episode}集已正常播放超过{observe_after}秒，已截图 {shot}，继续等待自然进入第{target}集",
+                        )
+                    else:
+                        recovered = self._safe_resume_playback(ops, episode, "停留当前集超过观察阈值，尝试恢复播放")
+                        self._log(
+                            "warn",
+                            f"全流程v3: 第{episode}集停留超过{observe_after}秒，已截图 {shot}，恢复播放={recovered}，继续等待第{target}集",
+                        )
+                    stale_recovered = True
+                    last_log_at = now
             elif current == 0:
                 now = time.time()
                 same_episode_since = 0.0
@@ -675,14 +827,65 @@ class TaskEngine:
                 same_episode_since = 0.0
                 stale_recovered = False
             if current > target:
-                self._log("warn", f"全流程v3: 已跳过目标第{target}集，当前第{current}集，尝试切回目标集")
+                pending_comments = self._pending_comment_episodes_between(task, target, current)
+                if not pending_comments:
+                    self._log(
+                        "info",
+                        f"全流程v3: 已自动跨到第{current}集，第{target}-{current - 1}集无待评论任务，顺延观察",
+                    )
+                    return True
+                self._log(
+                    "warn",
+                    f"全流程v3: 已跳过目标第{target}集，当前第{current}集，"
+                    f"区间内待评论集数={pending_comments}，尝试切回目标集",
+                )
                 if self._recover_to_verified_episode(ops, task, target, expected_total, f"自动跳过目标集，当前第{current}集"):
                     return True
                 raise RuntimeError(f"跳过目标集: 目标第{target}集，当前第{current}集")
             if current and current < episode:
                 raise RuntimeError(f"回退异常: 上一集第{episode}集，当前第{current}集")
             time.sleep(2)
+        # The episode marker can update immediately after the deadline. Confirm
+        # once more before turning a successful transition into a task failure.
+        time.sleep(2)
+        final_state = self._page_state(ops, task)
+        final_current = int(final_state.get("current_episode") or 0)
+        final_total = int(final_state.get("total_episodes") or 0)
+        if final_current == target and not self._total_mismatch_is_fatal(
+            ops,
+            task,
+            final_state,
+            expected_total,
+            final_total,
+            current=final_current,
+            target=target,
+        ):
+            self._log("info", f"全流程v3: 超时后二次确认已进入第{target}集")
+            return True
         return False
+
+    def _pending_comment_episodes_between(
+        self,
+        task: Dict[str, Any],
+        start_episode: int,
+        end_episode: int,
+    ) -> List[int]:
+        try:
+            plan = json.loads(task.get("execution_plan_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            plan = {}
+        planned = sorted(
+            {
+                int(value)
+                for value in plan.get("comment_episodes") or []
+                if str(value).isdigit()
+            }
+        )
+        return [
+            episode
+            for episode in planned
+            if start_episode <= episode < end_episode and not self._comment_already_verified(episode)
+        ]
 
     def _recover_to_verified_episode(
         self,
@@ -781,6 +984,8 @@ class TaskEngine:
             selected = ops.select_drama(selected_title, keyword=keyword)
             if not selected.get("success"):
                 self._log("warn", selected.get("message") or "重新进入目标短剧失败")
+                if self._retry_reopen_target_from_main(ops, keyword, target, expected_total, task):
+                    return True
                 return False
             playback_speed = str(task.get("playback_speed") or "1.0x")
             if playback_speed != "1.0x":
@@ -799,6 +1004,58 @@ class TaskEngine:
         except Exception as exc:
             self._log("warn", f"全流程v3: 重新进入目标短剧失败: {exc}")
             return False
+
+    def _retry_reopen_target_from_main(
+        self,
+        ops: HongguoOperations,
+        keyword: str,
+        target: int,
+        expected_total: int,
+        task: Dict[str, Any],
+    ) -> bool:
+        self._log("warn", f"全流程v3: 恢复选剧失败，强制回主页面后重试第{target}集")
+        open_main = getattr(ops, "_open_main_activity", None)
+        if callable(open_main):
+            opened_main = bool(open_main())
+            self._log("info" if opened_main else "warn", f"全流程v3: 恢复重试打开红果主页面={opened_main}")
+        opened = ops.open_search_page(keyword)
+        self._log("info" if opened.get("success") else "warn", opened.get("message") or "恢复重试进入搜索框")
+        if not opened.get("success"):
+            return False
+        input_result = ops.input_search_keyword(keyword)
+        if not input_result.get("success"):
+            self._log("warn", input_result.get("message") or "恢复重试填入关键词失败")
+            return False
+        search = ops.submit_search(keyword)
+        submit = search.get("submit") or {}
+        self._log(
+            "info" if search.get("success") else "warn",
+            f"{search.get('message') or '恢复重试搜索完成'}，提交动作={submit.get('action') or '-'}，"
+            f"结果页={bool(submit.get('tabs_visible') or search.get('tabs_visible'))}",
+        )
+        if not search.get("success"):
+            return False
+        titles = ops._extract_drama_titles()
+        selected_title = ops._choose_title(keyword, titles)
+        self._log("info", f"全流程v3: 恢复重试搜索结果={titles[:5]}，命中={selected_title or '-'}")
+        selected = ops.select_drama(selected_title, keyword=keyword)
+        if not selected.get("success"):
+            self._log("warn", selected.get("message") or "恢复重试进入目标短剧失败")
+            return False
+        playback_speed = str(task.get("playback_speed") or "1.0x")
+        if playback_speed != "1.0x":
+            speed_set = ops.set_playback_speed(playback_speed)
+            self._log("info" if speed_set else "warn", f"全流程v3: 恢复重试倍速设置 {playback_speed} = {speed_set}")
+        if not ops.play_episode(target):
+            self._log("warn", f"全流程v3: 恢复重试第{target}集播放触发未确认")
+        return self._wait_for_episode_verified(
+            ops,
+            task,
+            target,
+            expected_total,
+            timeout=90,
+            allow_reopen=False,
+        )
 
     def _page_state(self, ops: HongguoOperations, task: Dict[str, Any]) -> Dict[str, Any]:
         keyword = str(task.get("drama_name") or "").strip()
@@ -976,9 +1233,13 @@ class TaskEngine:
     def _resume_if_paused(self, ops: HongguoOperations, episode: int) -> bool:
         if not ops.is_playback_paused():
             return False
-        resumed = ops.resume_playback_if_paused(allow_center_fallback=True)
+        resumed = ops.resume_playback_safely()
         still_paused = ops.is_playback_paused()
-        ok = bool(resumed and not still_paused)
+        if still_paused:
+            resumed = ops.resume_playback_if_paused(allow_center_fallback=True) or resumed
+            time.sleep(0.8)
+            still_paused = ops.is_playback_paused()
+        ok = not still_paused
         self._log("info" if ok else "warn", f"全流程v3: 第{episode}集检测到暂停，恢复播放={resumed}，仍暂停={still_paused}")
         return ok
 
@@ -995,9 +1256,27 @@ class TaskEngine:
         time.sleep(1)
 
         state = self._page_state(ops, task)
+        if not self._has_playback_context(state):
+            foreground = bool(ops.bring_to_foreground())
+            self._log(
+                "info" if foreground else "warn",
+                f"全流程v3: 第{episode}集评论后检测到离开红果，尝试拉回前台={foreground}",
+            )
+            if foreground:
+                time.sleep(2)
+                if not ops.ensure_playback_page(episode):
+                    self._recover_to_verified_episode(
+                        ops,
+                        task,
+                        episode,
+                        expected_total,
+                        "评论后从桌面恢复播放页",
+                        allow_reopen=True,
+                    )
+                state = self._page_state(ops, task)
         if state.get("ad_visible"):
             shot = ops.take_screenshot(f"ep{episode}_after_comment_ad", self.screenshot_dir)
-            skipped = ops.skip_ad_if_present(attempts=3)
+            skipped = ops.skip_ad_if_present()
             self._log(
                 "info" if skipped else "warn",
                 f"全流程v3: 第{episode}集评论后遇到广告，已截图 {shot}，跳过广告={skipped}",
@@ -1005,7 +1284,41 @@ class TaskEngine:
             time.sleep(3)
             state = self._page_state(ops, task)
 
-        self._assert_target_playback(ops, task, state, expected_total)
+        app = state.get("app") or {}
+        if app.get("activity") and app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
+            recovered = self._recover_to_verified_episode(
+                ops,
+                task,
+                episode,
+                expected_total,
+                f"评论后停留在非播放页 {app.get('activity')}",
+            )
+            self._log(
+                "info" if recovered else "warn",
+                f"全流程v3: 第{episode}集评论后非播放页恢复={recovered}",
+            )
+            if recovered:
+                state = self._page_state(ops, task)
+
+        try:
+            self._assert_target_playback(ops, task, state, expected_total)
+        except RuntimeError as exc:
+            recovered = self._recover_to_verified_episode(
+                ops,
+                task,
+                episode,
+                expected_total,
+                f"评论后播放上下文异常: {exc}",
+                allow_reopen=True,
+            )
+            self._log(
+                "info" if recovered else "warn",
+                f"全流程v3: 第{episode}集评论后目标短剧恢复={recovered}",
+            )
+            if not recovered:
+                raise
+            state = self._page_state(ops, task)
+            self._assert_target_playback(ops, task, state, expected_total)
         was_paused = bool(state.get("playback_paused") or ops.is_playback_paused())
         resumed = ops.resume_playback_safely()
         time.sleep(1)
@@ -1014,7 +1327,7 @@ class TaskEngine:
             resumed = ops.resume_playback_if_paused(allow_center_fallback=True) or resumed
             time.sleep(1)
             still_paused = ops.is_playback_paused()
-        ok = bool(resumed and not still_paused)
+        ok = not still_paused
         if ok:
             self._comment_recovered_at[int(episode)] = time.time()
         self._log(
@@ -1026,7 +1339,11 @@ class TaskEngine:
     def _safe_resume_playback(self, ops: HongguoOperations, episode: int, reason: str) -> bool:
         resumed = ops.resume_playback_safely()
         still_paused = ops.is_playback_paused()
-        ok = bool(resumed and not still_paused)
+        if still_paused:
+            resumed = ops.resume_playback_if_paused(allow_center_fallback=True) or resumed
+            time.sleep(0.8)
+            still_paused = ops.is_playback_paused()
+        ok = not still_paused
         self._log("info" if ok else "warn", f"全流程v3: 第{episode}集{reason}，安全播放={resumed}，仍暂停={still_paused}")
         return ok
 
