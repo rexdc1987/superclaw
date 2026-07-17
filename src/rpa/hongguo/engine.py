@@ -363,6 +363,21 @@ class TaskEngine:
         episode: int,
         expected_total: int,
     ) -> None:
+        current = self._confirm_current_episode(ops, episode)
+        if current and current != episode:
+            self._log(
+                "warn",
+                f"全流程v3: 第{episode}集评论前强确认实际已到第{current}集，重新恢复评论目标集",
+            )
+            if not self._recover_to_verified_episode(
+                ops,
+                task,
+                episode,
+                expected_total,
+                f"评论前实际集数已变为第{current}集",
+            ):
+                raise RuntimeError(f"第{episode}集评论前无法从第{current}集恢复目标集")
+
         paused = ops.pause_playback_if_playing()
         panel_ready = ops.prepare_comment_window(episode)
         self._log(
@@ -385,13 +400,42 @@ class TaskEngine:
                 f"全流程v3: 第{episode}集恢复后准备评论，暂停播放={paused}，评论面板={panel_ready}",
             )
             if not panel_ready:
+                current = self._confirm_current_episode(ops, episode)
+                if current and current != episode:
+                    self._log(
+                        "warn",
+                        f"全流程v3: 第{episode}集评论面板重试时实际已到第{current}集，再次恢复目标集",
+                    )
+                    recovered = self._recover_to_verified_episode(
+                        ops,
+                        task,
+                        episode,
+                        expected_total,
+                        f"评论面板重试时实际集数已变为第{current}集",
+                    )
+                    confirmed = self._confirm_current_episode(ops, episode) if recovered else 0
+                    if recovered and (confirmed == 0 or confirmed == episode):
+                        paused = ops.pause_playback_if_playing()
+                        panel_ready = ops.prepare_comment_window(episode)
+                        self._log(
+                            "info" if panel_ready else "error",
+                            f"全流程v3: 第{episode}集二次恢复后准备评论，当前集={confirmed or 0}，"
+                            f"暂停播放={paused}，评论面板={panel_ready}",
+                        )
+                if panel_ready:
+                    current = episode
+                else:
+                    current = self._confirm_current_episode(ops, episode)
+            if not panel_ready:
+                failed_path = ops.take_screenshot(f"ep{episode}_comment_panel_open_failed", self.screenshot_dir)
                 resumed = ops.resume_playback_safely()
                 still_paused = ops.is_playback_paused()
                 self._log(
                     "info" if not still_paused else "warn",
-                    f"全流程v3: 第{episode}集评论面板打开失败，退出前恢复播放={resumed}，仍暂停={still_paused}",
+                    f"全流程v3: 第{episode}集评论面板打开失败，强确认当前集={current or 0}，截图 {failed_path}，"
+                    f"退出前恢复播放={resumed}，仍暂停={still_paused}",
                 )
-                raise RuntimeError(f"第{episode}集评论面板打开失败")
+                raise RuntimeError(f"第{episode}集评论面板打开失败，已截图 {failed_path}")
 
         generator = CommentGenerator(self._current_ai_config())
         content, source, usage = generator.generate_with_usage(
@@ -660,6 +704,11 @@ class TaskEngine:
         same_episode_since = 0.0
         forced_target = False
         stale_recovered = False
+        stale_observe_path = ""
+        stale_observe_at = 0.0
+        freeze_recovery_attempted = False
+        unreadable_since = 0.0
+        last_episode_probe_at = 0.0
         while time.time() < deadline:
             self._check_pause_stop()
             state = self._page_state(ops, task)
@@ -737,14 +786,40 @@ class TaskEngine:
                     )
                     time.sleep(3)
                     continue
-                paused = bool(state.get("playback_paused"))
-                if paused:
-                    self._safe_resume_playback(ops, episode, "播放页集数暂不可见，检测到暂停")
-                elif time.time() - last_log_at >= 20:
-                    self._log("info", f"全流程v3: 第{episode}集播放页集数暂不可见，继续观察，不执行上滑")
-                    last_log_at = time.time()
-                time.sleep(2)
-                continue
+                now = time.time()
+                if unreadable_since <= 0:
+                    unreadable_since = now
+                if now - unreadable_since >= 45 and now - last_episode_probe_at >= 45:
+                    confirmed = self._confirm_current_episode(ops, target)
+                    last_episode_probe_at = now
+                    if confirmed > 0:
+                        current = confirmed
+                        total = expected_total
+                        state["current_episode"] = confirmed
+                        state["total_episodes"] = expected_total
+                        self._update_task(current_episode=confirmed, updated_at=datetime.now())
+                        self._log(
+                            "warn",
+                            f"全流程v3: 第{episode}集后集数长时间不可见，强确认实际为第{confirmed}集，已纠正执行进度",
+                        )
+                    else:
+                        self._log(
+                            "warn",
+                            f"全流程v3: 第{episode}集后集数长时间不可见，强制显示控件后仍无法读取，继续观察",
+                        )
+                if current > 0:
+                    pass
+                else:
+                    paused = bool(state.get("playback_paused"))
+                    if paused:
+                        self._safe_resume_playback(ops, episode, "播放页集数暂不可见，检测到暂停")
+                    elif time.time() - last_log_at >= 20:
+                        self._log("info", f"全流程v3: 第{episode}集播放页集数暂不可见，继续观察，不执行上滑")
+                        last_log_at = time.time()
+                    time.sleep(2)
+                    continue
+            else:
+                unreadable_since = 0.0
             if self._total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current, target=target):
                 self._log(
                     "warn",
@@ -793,6 +868,8 @@ class TaskEngine:
                     last_log_at = now
                 if not stale_recovered and now - same_episode_since >= observe_after:
                     shot = ops.take_screenshot(f"ep{episode}_stale_observe", self.screenshot_dir)
+                    stale_observe_path = shot
+                    stale_observe_at = now
                     if normal_playing:
                         self._log(
                             "info",
@@ -806,10 +883,42 @@ class TaskEngine:
                         )
                     stale_recovered = True
                     last_log_at = now
+                if (
+                    bool(state.get("playback_visible"))
+                    and not state.get("ad_visible")
+                    and stale_observe_path
+                    and not freeze_recovery_attempted
+                    and now - stale_observe_at >= 90
+                ):
+                    confirm_shot = ops.take_screenshot(f"ep{episode}_stale_confirm", self.screenshot_dir)
+                    if self._video_frames_are_static(stale_observe_path, confirm_shot):
+                        freeze_recovery_attempted = True
+                        recovered = bool(ops.play_episode(target))
+                        if not recovered:
+                            recovered = self._recover_to_verified_episode(
+                                ops,
+                                task,
+                                target,
+                                expected_total,
+                                f"第{episode}集视频画面持续静止",
+                            )
+                        self._log(
+                            "warn",
+                            f"全流程v3: 第{episode}集视频区域连续90秒静止，截图 {confirm_shot}，"
+                            f"恢复目标第{target}集={recovered}",
+                        )
+                        if recovered:
+                            return True
+                    else:
+                        stale_observe_path = confirm_shot
+                        stale_observe_at = now
             elif current == 0:
                 now = time.time()
                 same_episode_since = 0.0
                 stale_recovered = False
+                stale_observe_path = ""
+                stale_observe_at = 0.0
+                freeze_recovery_attempted = False
                 if getattr(ops, "_episode_list_panel_open", lambda: False)():
                     closed = getattr(ops, "_close_episode_list_panel", lambda _episode=0: False)(target)
                     self._log(
@@ -826,6 +935,9 @@ class TaskEngine:
             else:
                 same_episode_since = 0.0
                 stale_recovered = False
+                stale_observe_path = ""
+                stale_observe_at = 0.0
+                freeze_recovery_attempted = False
             if current > target:
                 pending_comments = self._pending_comment_episodes_between(task, target, current)
                 if not pending_comments:
@@ -850,6 +962,16 @@ class TaskEngine:
         time.sleep(2)
         final_state = self._page_state(ops, task)
         final_current = int(final_state.get("current_episode") or 0)
+        if final_current <= 0 and final_state.get("playback_visible"):
+            final_current = self._confirm_current_episode(ops, target)
+            if final_current > 0:
+                final_state["current_episode"] = final_current
+                final_state["total_episodes"] = expected_total
+                self._update_task(current_episode=final_current, updated_at=datetime.now())
+                self._log(
+                    "warn",
+                    f"全流程v3: 第{episode}集后超时前强确认实际为第{final_current}集，已纠正执行进度",
+                )
         final_total = int(final_state.get("total_episodes") or 0)
         if final_current == target and not self._total_mismatch_is_fatal(
             ops,
@@ -862,7 +984,46 @@ class TaskEngine:
         ):
             self._log("info", f"全流程v3: 超时后二次确认已进入第{target}集")
             return True
+        if final_current > target:
+            pending_comments = self._pending_comment_episodes_between(task, target, final_current)
+            if not pending_comments:
+                self._log(
+                    "info",
+                    f"全流程v3: 超时前强确认已播放到第{final_current}集，"
+                    f"第{target}-{final_current - 1}集无待评论任务，顺延观察",
+                )
+                return True
+            self._log(
+                "warn",
+                f"全流程v3: 超时前强确认已播放到第{final_current}集，"
+                f"区间待评论集数={pending_comments}，恢复第{target}集",
+            )
+            return self._recover_to_verified_episode(
+                ops,
+                task,
+                target,
+                expected_total,
+                f"超时前发现实际已到第{final_current}集",
+            )
         return False
+
+    @staticmethod
+    def _confirm_current_episode(ops: HongguoOperations, expected_episode: int = 0) -> int:
+        probe = getattr(ops, "confirm_current_episode", None)
+        if callable(probe):
+            try:
+                current = probe(expected_episode=expected_episode)
+                if isinstance(current, (int, float, str)) and str(current).isdigit():
+                    return int(current)
+            except Exception:
+                pass
+        try:
+            current = ops.get_current_episode()
+            if isinstance(current, (int, float, str)) and str(current).isdigit():
+                return int(current)
+        except Exception:
+            pass
+        return 0
 
     def _pending_comment_episodes_between(
         self,
@@ -1114,6 +1275,34 @@ class TaskEngine:
             return ""
 
     @staticmethod
+    def _video_frames_are_static(first_path: str, second_path: str, threshold: float = 1.5) -> bool:
+        try:
+            from PIL import Image, ImageChops, ImageStat
+
+            first_file = Path(first_path)
+            second_file = Path(second_path)
+            if not first_file.exists() or not second_file.exists():
+                return False
+            with Image.open(first_file) as first_image, Image.open(second_file) as second_image:
+                first = first_image.convert("L")
+                second = second_image.convert("L")
+                if first.size != second.size:
+                    return False
+                width, height = first.size
+                video_box = (
+                    int(width * 0.04),
+                    int(height * 0.31),
+                    int(width * 0.88),
+                    int(height * 0.61),
+                )
+                first = first.crop(video_box).resize((84, 48))
+                second = second.crop(video_box).resize((84, 48))
+                difference = ImageChops.difference(first, second)
+                return float(ImageStat.Stat(difference).mean[0]) <= float(threshold)
+        except Exception:
+            return False
+
+    @staticmethod
     def _playback_state_summary(state: Dict[str, Any]) -> str:
         app = state.get("app") or {}
         device = state.get("device") or {}
@@ -1194,7 +1383,13 @@ class TaskEngine:
         ]
         reliable_titles = [title for title in title_signals if self._reliable_title_signal(keyword, title)]
         if keyword and reliable_titles and not any(self._strict_title_matches(keyword, title) for title in reliable_titles):
-            raise RuntimeError(f"检测到短剧标题不匹配: 期望 {keyword}，实际 {reliable_titles[0]}")
+            if expected_total and total == expected_total and current == expected_total:
+                self._log(
+                    "warn",
+                    f"全流程v3: 最终第{current}集已确认，忽略页面相关推荐标题 {reliable_titles[0]}",
+                )
+            else:
+                raise RuntimeError(f"检测到短剧标题不匹配: 期望 {keyword}，实际 {reliable_titles[0]}")
         if not current and bool(state.get("playback_visible") or ops._playback_visible()):
             self._log("warn", "full_v3: playback visible but episode unreadable; continue observation")
             return
@@ -1860,7 +2055,7 @@ class TaskEngine:
         }
 
     def _choose_title(self, keyword: str, titles: Iterable[str]) -> str:
-        titles = list(titles)
+        titles = [title for title in titles if not self._looks_like_preview_title(title)]
         matches = [title for title in titles if self._title_matches(keyword, title)]
         if not matches:
             return ""
@@ -1901,6 +2096,11 @@ class TaskEngine:
             ranked.sort(key=lambda item: item[0])
             return ranked[0][1]
         return matches[0]
+
+    @staticmethod
+    def _looks_like_preview_title(title: str) -> bool:
+        value = str(title or "").strip()
+        return any(marker in value for marker in ("即将上线", "预告"))
 
     def _title_matches(self, keyword: str, title: str) -> bool:
         keyword_key = self._normalize_title_key(keyword)

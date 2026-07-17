@@ -528,6 +528,13 @@ class HongguoOperations:
                     and total_episodes >= current_episode
                 ):
                     return clicked_title
+                if (
+                    attempt + 1 >= max(1, attempts)
+                    and current.get("package") == APP_PACKAGE
+                    and current.get("activity") == SHORT_SERIES_ACTIVITY
+                    and self._playback_visible()
+                ):
+                    return clicked_title
             if attempt + 1 < attempts:
                 self._sleep(1, 1.5)
         return ""
@@ -1035,10 +1042,13 @@ class HongguoOperations:
             return False
 
         self._ad_swipe_pending = True
-        # Some ads show a short countdown before the continuation gesture is
-        # accepted. Wait once, then re-check so a vanished ad cannot cause a
-        # swipe on the next episode.
-        time.sleep(3)
+        # Wait for the ad's continuation countdown before the single swipe.
+        # A fixed delay was too short for ads that start with a 7-second gate.
+        raw_xml = self._xml()
+        xml = html.unescape(raw_xml) if isinstance(raw_xml, str) else ""
+        countdown = re.search(r"(\d{1,2})\s*\u79d2\s*\u540e", xml)
+        ready_wait = max(8, min(16, int(countdown.group(1)) + 1)) if countdown else 15
+        time.sleep(ready_wait)
         if not self._ad_continue_visible():
             return True
         xml = self._xml()
@@ -1139,6 +1149,35 @@ class HongguoOperations:
         if len(numbers) == 1 and self._episode_number_context_visible(xml):
             return numbers[0]
         return 0
+
+    def confirm_current_episode(self, expected_episode: int = 0) -> int:
+        """Read the active episode after making hidden playback controls visible."""
+        if not self._short_series_activity_active():
+            return 0
+
+        for attempt in range(3):
+            current = self.get_current_episode()
+            if current > 0:
+                return current
+            self._reveal_playback_controls()
+            time.sleep(0.8)
+            if attempt == 1:
+                self.exit_fullscreen()
+                self._reveal_playback_controls()
+                time.sleep(0.8)
+
+        trigger = self._episode_panel_selector()
+        if trigger is None:
+            return 0
+        try:
+            trigger.click()
+            time.sleep(1.2)
+            current = self.get_current_episode()
+        except Exception:
+            current = 0
+        finally:
+            self._close_episode_list_panel(current or expected_episode)
+        return current
 
     def get_total_episodes(self, xml: Optional[str] = None, assume_foreground: bool = False) -> int:
         if not assume_foreground and not self._is_app_foreground():
@@ -1613,7 +1652,17 @@ class HongguoOperations:
             if current and current != episode_number:
                 return False
         self.pause_playback_if_playing()
-        return self._open_comment_panel(3)
+        if self._open_comment_panel(3):
+            return True
+        if self._ad_continue_visible():
+            return False
+
+        # Under multi-instance load the first coordinate tap can only reveal
+        # Surface controls. Normalize the layout and make one final panel try.
+        self.exit_fullscreen()
+        self._reveal_playback_controls()
+        time.sleep(0.8)
+        return self._open_comment_panel(5, prefer_coordinate=True)
 
     def post_comment(self, content: str, episode_number: int = 0) -> Dict[str, Any]:
         try:
@@ -2804,6 +2853,8 @@ class HongguoOperations:
         if "#" in text:
             return True
         non_drama_markers = (
+            "即将上线",
+            "预告",
             "水墨山海",
             "共庆半周年",
             "官方正规接口",
