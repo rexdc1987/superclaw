@@ -12,7 +12,7 @@ import unicodedata
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -20,10 +20,14 @@ from pymysql.cursors import DictCursor
 from .ai_usage import record_usage
 from .comment_gen import CommentGenerator
 from .device import DEFAULT_ADDR, check_connection, connect
+from .leases import DeviceLeaseStore
 from .operations import LIVE_LITE_ACTIVITY, SHORT_SERIES_ACTIVITY, HongguoOperations
 
 
-DEFAULT_SCREENSHOT_ROOT = "E:/Projects/SuperClaw/screenshots/hongguo"
+DEFAULT_SCREENSHOT_ROOT = os.environ.get(
+    "SUPERCLAW_SCREENSHOT_ROOT",
+    str((Path(__file__).resolve().parents[3] / "screenshots" / "hongguo").as_posix()),
+)
 
 
 class TaskEngine:
@@ -36,6 +40,7 @@ class TaskEngine:
         screenshot_dir: str,
         ai_config: Optional[Dict[str, Any]] = None,
         device_addr: str = DEFAULT_ADDR,
+        lease_heartbeat: Optional[Callable[[int], None]] = None,
     ):
         self.task_id = int(task_id)
         self.db_config = dict(db_config)
@@ -50,6 +55,8 @@ class TaskEngine:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._generator = CommentGenerator(self.ai_config)
+        self._lease_heartbeat = lease_heartbeat
+        self._last_lease_heartbeat = 0.0
 
     @property
     def is_alive(self) -> bool:
@@ -2555,6 +2562,12 @@ class TaskEngine:
     def _update_task(self, **kwargs: Any) -> None:
         if not kwargs:
             return
+        if self._lease_heartbeat and time.monotonic() - self._last_lease_heartbeat >= 300:
+            try:
+                self._lease_heartbeat(self.task_id)
+                self._last_lease_heartbeat = time.monotonic()
+            except Exception:
+                pass
         assignments = []
         values = []
         for key, value in kwargs.items():
@@ -2601,6 +2614,9 @@ class TaskEngineManager:
         self._engines: Dict[int, TaskEngine] = {}
         self._lock = threading.Lock()
 
+    def _lease_store(self) -> DeviceLeaseStore:
+        return DeviceLeaseStore(self._normalized_db_config())
+
     @classmethod
     def get_instance(
         cls,
@@ -2624,6 +2640,7 @@ class TaskEngineManager:
         finished = [task_id for task_id, engine in self._engines.items() if not engine.is_alive]
         for task_id in finished:
             self._engines.pop(task_id, None)
+            self._lease_store().release(task_id)
 
     def _device_busy_locked(self, device_addr: str, task_id: int) -> bool:
         for running_task_id, running_engine in self._engines.items():
@@ -2643,15 +2660,23 @@ class TaskEngineManager:
                 if engine and engine.is_alive:
                     return False
                 if not self._device_busy_locked(effective_device_addr, int(task_id)):
+                    lease_store = self._lease_store()
+                    if not lease_store.acquire(int(task_id), effective_device_addr):
+                        return False
                     engine = TaskEngine(
                         task_id=task_id,
                         db_config=self._normalized_db_config(),
                         screenshot_dir=self._task_screenshot_dir(task_id),
                         ai_config=dict(self.ai_config or {}),
                         device_addr=effective_device_addr,
+                        lease_heartbeat=lease_store.renew,
                     )
                     self._engines[int(task_id)] = engine
-                    return engine.start()
+                    started = engine.start()
+                    if not started:
+                        self._engines.pop(int(task_id), None)
+                        self._lease_store().release(int(task_id))
+                    return started
             if time.time() >= deadline:
                 return False
             time.sleep(0.5)
@@ -2667,6 +2692,7 @@ class TaskEngineManager:
     def stop_task(self, task_id: int) -> bool:
         engine = self._engines.get(int(task_id))
         if not engine:
+            self._lease_store().release(int(task_id))
             return False
         stopped = engine.stop()
         engine.wait_stopped(5)

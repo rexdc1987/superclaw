@@ -16,19 +16,29 @@ def _get_base_dir():
 
 def _load_config():
     config_path = os.path.join(_get_base_dir(), "config", "default.yaml")
+    local_path = os.path.join(_get_base_dir(), "config", "local.yaml")
+    config = {}
     if os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    return {}
+            config = yaml.safe_load(f) or {}
+    if os.path.exists(local_path):
+        with open(local_path, "r", encoding="utf-8") as f:
+            local = yaml.safe_load(f) or {}
+        for key, value in local.items():
+            if isinstance(value, dict) and isinstance(config.get(key), dict):
+                config[key].update(value)
+            else:
+                config[key] = value
+    return config
 
 def _build_url(cfg):
     db = cfg.get("database", {})
     engine_type = db.get("engine", "sqlite")
     if engine_type == "mysql":
-        host = db.get("host", "127.0.0.1")
-        port = db.get("port", 3306)
-        name = db.get("name", "superclaw")
-        user = db.get("user", "superclaw")
+        host = os.environ.get("SUPERCLAW_DB_HOST") or db.get("host", "127.0.0.1")
+        port = int(os.environ.get("SUPERCLAW_DB_PORT") or db.get("port", 3306))
+        name = os.environ.get("SUPERCLAW_DB_NAME") or db.get("name", "superclaw")
+        user = os.environ.get("SUPERCLAW_DB_USER") or db.get("user", "superclaw")
         pwd = os.environ.get("SUPERCLAW_DB_PASSWORD") or db.get("password", "")
         return f"mysql+pymysql://{user}:{pwd}@{host}:{port}/{name}?charset=utf8mb4"
     db_path = os.path.join(_get_base_dir(), "data", "superclaw.db")

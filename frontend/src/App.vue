@@ -51,7 +51,7 @@
 </template>
 
 <script setup>
-import { onMounted } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 
@@ -59,7 +59,7 @@ const route = useRoute()
 const router = useRouter()
 const userStore = useUserStore()
 
-const menuItems = [
+const allMenuItems = [
   { path: '/dashboard', title: '仪表盘', icon: 'DataBoard' },
   { path: '/accounts', title: '账号管理', icon: 'User' },
   { path: '/tasks', title: '任务中心', icon: 'List' },
@@ -72,10 +72,11 @@ const menuItems = [
   { path: '/hongguo', title: '红果短剧', icon: 'VideoPlay' },
   { path: '/hongguo/multi', title: '红果多开', icon: 'Operation' },
   { path: '/hongguo/templates', title: '红果模板', icon: 'Document' },
-  { path: '/hongguo/settings', title: 'AI配置', icon: 'Setting' },
+  { path: '/hongguo/settings', title: 'AI配置', icon: 'Setting', adminOnly: true },
   { path: '/risk', title: '风控中心', icon: 'Shield' },
-  { path: '/users', title: '用户管理', icon: 'UserFilled' },
+  { path: '/users', title: '用户管理', icon: 'UserFilled', adminOnly: true },
 ]
+const menuItems = computed(() => allMenuItems.filter((item) => !item.adminOnly || userStore.userInfo.role === 'admin'))
 
 onMounted(() => {
   document.documentElement.classList.add('dark')

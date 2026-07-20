@@ -25,6 +25,11 @@ api.interceptors.response.use((response) => response.data, (error) => {
 
 export default api
 
+// Authentication
+export const getAuthStatus = () => api.get('/auth/status')
+export const login = (data) => api.post('/auth/login', data)
+export const getCurrentUser = () => api.get('/auth/me')
+
 // Accounts
 export const getAccounts = (params) => api.get('/accounts/', { params })
 export const getAccount = (id) => api.get('/accounts/' + id)

@@ -40,18 +40,51 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def app_config() -> Dict[str, Any]:
     config_path = project_root() / "config" / "default.yaml"
-    if not config_path.exists():
-        return {}
-    with config_path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    local_path = project_root() / "config" / "local.yaml"
+    base: Dict[str, Any] = {}
+    local: Dict[str, Any] = {}
+    if config_path.exists():
+        with config_path.open("r", encoding="utf-8") as f:
+            base = yaml.safe_load(f) or {}
+    if local_path.exists():
+        with local_path.open("r", encoding="utf-8") as f:
+            local = yaml.safe_load(f) or {}
+    return _deep_merge(base, local)
 
 
 def save_app_config(cfg: Dict[str, Any]) -> None:
     config_path = project_root() / "config" / "default.yaml"
+    local_path = project_root() / "config" / "local.yaml"
+    public = _deep_merge({}, cfg)
+    secrets: Dict[str, Any] = {}
+    database = public.get("database") or {}
+    if database.get("password"):
+        secrets.setdefault("database", {})["password"] = database.get("password")
+    database["password"] = ""
+    ai = public.get("ai") or {}
+    if ai.get("api_key"):
+        secrets.setdefault("ai", {})["api_key"] = ai.pop("api_key")
     with config_path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+        yaml.safe_dump(public, f, allow_unicode=True, sort_keys=False)
+    if secrets:
+        existing: Dict[str, Any] = {}
+        if local_path.exists():
+            with local_path.open("r", encoding="utf-8") as f:
+                existing = yaml.safe_load(f) or {}
+        with local_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(_deep_merge(existing, secrets), f, allow_unicode=True, sort_keys=False)
 
 
 def ai_config(include_secret: bool = True) -> Dict[str, Any]:

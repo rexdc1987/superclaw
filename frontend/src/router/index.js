@@ -69,7 +69,7 @@ const routes = [
     path: '/users',
     name: 'Users',
     component: () => import('@/views/Users.vue'),
-    meta: { title: '用户管理', icon: 'UserFilled' }
+    meta: { title: '用户管理', icon: 'UserFilled', requiresAdmin: true }
   },
   {
     path: '/douyin-comment',
@@ -111,7 +111,7 @@ const routes = [
     path: '/hongguo/settings',
     name: 'HongguoSettings',
     component: () => import('@/views/HongguoSettings.vue'),
-    meta: { title: 'AI配置', icon: 'Setting' }
+    meta: { title: 'AI配置', icon: 'Setting', requiresAdmin: true }
   },
 ]
 
@@ -125,6 +125,9 @@ router.beforeEach((to, from, next) => {
   const token = localStorage.getItem('token')
   if (to.path !== '/login' && !token) {
     next('/login')
+  } else if (to.meta.requiresAdmin) {
+    const userInfo = JSON.parse(localStorage.getItem('userInfo') || '{}')
+    next(userInfo.role === 'admin' ? undefined : '/dashboard')
   } else {
     next()
   }

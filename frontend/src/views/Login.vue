@@ -34,6 +34,7 @@ import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useUserStore } from '@/stores/user'
+import { login } from '@/api'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -48,8 +49,9 @@ async function handleLogin() {
 
   loading.value = true
   try {
-    userStore.setToken('demo-token')
-    userStore.setUserInfo({ username: form.value.username, role: 'admin' })
+    const result = await login(form.value)
+    userStore.setToken(result.access_token)
+    userStore.setUserInfo(result.user)
     ElMessage.success('登录成功')
     router.push('/dashboard')
   } catch (e) {

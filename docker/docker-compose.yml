@@ -1,41 +1,45 @@
-# SuperClaw Docker Compose
-# 用法: docker-compose up -d
-
 services:
-  # ---- SuperClaw 主服务 ----
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${SUPERCLAW_DB_NAME:-superclaw}
+      MYSQL_USER: ${SUPERCLAW_DB_USER:-superclaw}
+      MYSQL_PASSWORD: ${SUPERCLAW_DB_PASSWORD:?SUPERCLAW_DB_PASSWORD is required}
+      MYSQL_ROOT_PASSWORD: ${SUPERCLAW_DB_ROOT_PASSWORD:?SUPERCLAW_DB_ROOT_PASSWORD is required}
+    volumes:
+      - superclaw_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   superclaw:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: superclaw
     restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
     ports:
-      - "8000:8000"
+      - "${SUPERCLAW_PUBLIC_PORT:-8980}:8980"
     environment:
-      - SUPERCLAW_ENV=production
-      - SUPERCLAW_APP__DEBUG=false
-      - SUPERCLAW_APP__LOG_LEVEL=INFO
-      - SUPERCLAW_DATABASE__URL=sqlite:///app/data/superclaw.db
-      - SUPERCLAW_QUEUE__MAX_WORKERS=5
-      - SUPERCLAW_RATE_LIMIT__GLOBAL_CAPACITY=100
+      SUPERCLAW_AUTH_REQUIRED: "true"
+      SUPERCLAW_AUTH_SECRET: ${SUPERCLAW_AUTH_SECRET:?SUPERCLAW_AUTH_SECRET is required}
+      SUPERCLAW_CORS_ORIGINS: ${SUPERCLAW_CORS_ORIGINS:?SUPERCLAW_CORS_ORIGINS is required}
+      SUPERCLAW_DB_HOST: mysql
+      SUPERCLAW_DB_PORT: "3306"
+      SUPERCLAW_DB_NAME: ${SUPERCLAW_DB_NAME:-superclaw}
+      SUPERCLAW_DB_USER: ${SUPERCLAW_DB_USER:-superclaw}
+      SUPERCLAW_DB_PASSWORD: ${SUPERCLAW_DB_PASSWORD:?SUPERCLAW_DB_PASSWORD is required}
+      SUPERCLAW_EXECUTION_MODE: api
+      SUPERCLAW_SCREENSHOT_ROOT: /data/screenshots/hongguo
+      XIAOMI_API_KEY: ${XIAOMI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
-      - superclaw_data:/app/data
-      - superclaw_logs:/app/logs
-    networks:
-      - superclaw-net
-    healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      - ${SUPERCLAW_SCREENSHOT_PATH:-../data/screenshots}:/data/screenshots
 
 volumes:
-  superclaw_data:
-    driver: local
-  superclaw_logs:
-    driver: local
-
-networks:
-  superclaw-net:
-    driver: bridge
+  superclaw_mysql:

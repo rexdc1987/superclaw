@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, field_validator
 from pymysql.cursors import DictCursor
+
+from api.security import require_admin
 
 from rpa.hongguo.ai_usage import load_usage_stats, record_usage, reset_usage_stats
 from rpa.hongguo.comment_gen import CommentGenerator
@@ -24,7 +26,11 @@ from services.ai_config_service import (
 )
 
 
-router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
+router = APIRouter(
+    prefix="/api/v1/settings",
+    tags=["settings"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 class AISettingsUpdate(BaseModel):
@@ -72,10 +78,10 @@ def _refresh_consumers() -> None:
     db = cfg.get("database", {})
     TaskEngineManager.get_instance(
         db_config={
-            "host": db.get("host", "localhost"),
-            "port": int(db.get("port", 3308)),
-            "database": db.get("name", "superclaw"),
-            "user": db.get("user", "superclaw"),
+            "host": os.environ.get("SUPERCLAW_DB_HOST") or db.get("host", "localhost"),
+            "port": int(os.environ.get("SUPERCLAW_DB_PORT") or db.get("port", 3308)),
+            "database": os.environ.get("SUPERCLAW_DB_NAME") or db.get("name", "superclaw"),
+            "user": os.environ.get("SUPERCLAW_DB_USER") or db.get("user", "superclaw"),
             "password": os.environ.get("SUPERCLAW_DB_PASSWORD") or db.get("password", ""),
             "charset": "utf8mb4",
             "cursorclass": DictCursor,

@@ -9,21 +9,24 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 import time
+from copy import deepcopy
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
 import pymysql
 import yaml
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 from pymysql.cursors import DictCursor
 
+from api.security import current_principal, require_admin
 from rpa.hongguo.ai_usage import load_usage_stats, record_usage, reset_usage_stats
 from rpa.hongguo.comment_gen import CommentGenerator
 from rpa.hongguo.device import (
@@ -38,6 +41,7 @@ from rpa.hongguo.device import (
 )
 from rpa.hongguo.engine import DEFAULT_SCREENSHOT_ROOT, TaskEngineManager
 from rpa.hongguo.operations import APP_PACKAGE, HongguoOperations
+from rpa.hongguo.schema import ensure_base_schema
 from services.ai_config_service import (
     ai_config,
     app_config,
@@ -112,7 +116,7 @@ def _project_root() -> Path:
 
 
 def _screenshot_root() -> Path:
-    return Path(DEFAULT_SCREENSHOT_ROOT)
+    return Path(os.environ.get("SUPERCLAW_SCREENSHOT_ROOT", DEFAULT_SCREENSHOT_ROOT)).resolve()
 
 
 def _task_screenshot_dir(task_id: int) -> Path:
@@ -126,6 +130,76 @@ def _engine_manager() -> TaskEngineManager:
         _ai_config(),
         device_addr=_hongguo_device_addr(),
     )
+
+
+def reconcile_runtime_state() -> Dict[str, int]:
+    """Clear task/lease state left behind by a terminated embedded API process."""
+    if os.environ.get("SUPERCLAW_EXECUTION_MODE", "embedded").strip().lower() != "embedded":
+        return {"stopped_tasks": 0, "released_leases": 0}
+    now = datetime.now()
+    message = "服务进程已重启，原执行线程不存在，请手动重新启动任务"
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM hongguo_comment_tasks WHERE status IN ('running', 'paused')"
+            )
+            task_ids = [int(row["id"]) for row in (cur.fetchall() or [])]
+            if task_ids:
+                placeholders = ", ".join(["%s"] * len(task_ids))
+                cur.execute(
+                    f"""
+                    UPDATE hongguo_comment_tasks
+                    SET status='stopped', error_message=%s, completed_at=%s, updated_at=%s
+                    WHERE id IN ({placeholders})
+                    """,
+                    (message, now, now, *task_ids),
+                )
+                cur.executemany(
+                    """
+                    INSERT INTO hongguo_execution_logs (task_id, level, message, created_at)
+                    VALUES (%s, 'warn', %s, %s)
+                    """,
+                    [(task_id, message, now) for task_id in task_ids],
+                )
+            cur.execute("DELETE FROM hongguo_device_leases")
+            released = int(cur.rowcount or 0)
+    return {"stopped_tasks": len(task_ids), "released_leases": released}
+
+
+def hongguo_runtime_health() -> Dict[str, Any]:
+    mode = _execution_mode()
+    result: Dict[str, Any] = {
+        "database": False,
+        "execution_mode": mode,
+        "online_workers": 0,
+        "running_tasks": 0,
+        "screenshot_root": str(_screenshot_root()),
+    }
+    try:
+        cutoff = datetime.now() - timedelta(seconds=90)
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok")
+                result["database"] = bool((cur.fetchone() or {}).get("ok"))
+                cur.execute(
+                    "SELECT COUNT(*) AS count FROM hongguo_comment_tasks WHERE status='running'"
+                )
+                result["running_tasks"] = int((cur.fetchone() or {}).get("count") or 0)
+                if mode == "api":
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) AS count FROM hongguo_workers
+                        WHERE status='online' AND last_seen_at >= %s
+                        """,
+                        (cutoff,),
+                    )
+                    result["online_workers"] = int((cur.fetchone() or {}).get("count") or 0)
+    except Exception as exc:
+        result["database_error"] = str(exc)
+    result["task_execution_ready"] = bool(
+        result["database"] and (mode == "embedded" or result["online_workers"] > 0)
+    )
+    return result
 
 
 def _app_config() -> Dict[str, Any]:
@@ -148,6 +222,14 @@ def _task_device_addr(task: Dict[str, Any]) -> str:
     return str(task.get("device_addr") or _hongguo_device_addr()).strip() or DEFAULT_ADDR
 
 
+def _local_worker_id() -> str:
+    return os.environ.get("SUPERCLAW_WORKER_ID", socket.gethostname()).strip() or socket.gethostname()
+
+
+def _execution_mode() -> str:
+    return os.environ.get("SUPERCLAW_EXECUTION_MODE", "embedded").strip().lower()
+
+
 def _save_app_config(cfg: Dict[str, Any]) -> None:
     save_app_config(cfg)
 
@@ -156,10 +238,10 @@ def _db_config() -> Dict[str, Any]:
     cfg = _app_config()
     db = cfg.get("database", {})
     return {
-        "host": db.get("host", "localhost"),
-        "port": int(db.get("port", 3308)),
-        "database": db.get("name", "superclaw"),
-        "user": db.get("user", "superclaw"),
+        "host": os.environ.get("SUPERCLAW_DB_HOST") or db.get("host", "localhost"),
+        "port": int(os.environ.get("SUPERCLAW_DB_PORT") or db.get("port", 3308)),
+        "database": os.environ.get("SUPERCLAW_DB_NAME") or db.get("name", "superclaw"),
+        "user": os.environ.get("SUPERCLAW_DB_USER") or db.get("user", "superclaw"),
         "password": os.environ.get("SUPERCLAW_DB_PASSWORD") or db.get("password", ""),
         "charset": "utf8mb4",
         "cursorclass": DictCursor,
@@ -189,6 +271,7 @@ def _normalize_playback_speed(value: Optional[str]) -> str:
 
 
 def _ensure_task_schema(conn) -> None:
+    ensure_base_schema(conn)
     db_name = _db_config()["database"]
     managed_columns = {
         "playback_speed",
@@ -196,16 +279,20 @@ def _ensure_task_schema(conn) -> None:
         "device_addr",
         "device_label",
         "multi_run_id",
+        "owner_user_id",
+        "worker_id",
+        "dispatch_requested_at",
+        "control_command",
     }
     with conn.cursor() as cur:
         existing: set[str] = set()
         cur.execute(
-            """
+            f"""
             SELECT COLUMN_NAME
             FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA=%s
               AND TABLE_NAME='hongguo_comment_tasks'
-              AND COLUMN_NAME IN (%s, %s, %s, %s, %s)
+              AND COLUMN_NAME IN ({", ".join(["%s"] * len(managed_columns))})
             """,
             (db_name, *sorted(managed_columns)),
         )
@@ -260,6 +347,128 @@ def _ensure_task_schema(conn) -> None:
                 AFTER device_label
                 """
             )
+        if "owner_user_id" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN owner_user_id BIGINT NOT NULL DEFAULT 0
+                AFTER multi_run_id
+                """
+            )
+        if "worker_id" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN worker_id VARCHAR(120) DEFAULT NULL
+                AFTER owner_user_id
+                """
+            )
+        if "dispatch_requested_at" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN dispatch_requested_at DATETIME DEFAULT NULL
+                AFTER worker_id
+                """
+            )
+        if "control_command" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN control_command VARCHAR(16) DEFAULT NULL
+                AFTER dispatch_requested_at
+                """
+            )
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=%s
+              AND TABLE_NAME='hongguo_comment_templates'
+              AND COLUMN_NAME='owner_user_id'
+            """,
+            (db_name,),
+        )
+        if int((cur.fetchone() or {}).get("count") or 0) == 0:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_templates
+                ADD COLUMN owner_user_id BIGINT NOT NULL DEFAULT 0
+                """
+            )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hongguo_device_leases (
+                lease_key VARCHAR(220) NOT NULL PRIMARY KEY,
+                device_addr VARCHAR(80) NOT NULL,
+                owner_user_id BIGINT NOT NULL DEFAULT 0,
+                task_id BIGINT NOT NULL,
+                worker_id VARCHAR(120) NOT NULL,
+                acquired_at DATETIME NOT NULL,
+                expires_at DATETIME NOT NULL,
+                INDEX idx_hongguo_lease_task (task_id),
+                INDEX idx_hongguo_lease_owner (owner_user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cur.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=%s
+              AND TABLE_NAME='hongguo_device_leases'
+              AND COLUMN_NAME='lease_key'
+            """,
+            (db_name,),
+        )
+        if int((cur.fetchone() or {}).get("count") or 0) == 0:
+            cur.execute(
+                "ALTER TABLE hongguo_device_leases ADD COLUMN lease_key VARCHAR(220) NULL FIRST"
+            )
+            cur.execute(
+                "UPDATE hongguo_device_leases SET lease_key=CONCAT(worker_id, '|', device_addr)"
+            )
+            cur.execute(
+                """
+                ALTER TABLE hongguo_device_leases
+                DROP PRIMARY KEY,
+                MODIFY lease_key VARCHAR(220) NOT NULL,
+                ADD PRIMARY KEY (lease_key),
+                ADD INDEX idx_hongguo_lease_device (device_addr)
+                """
+            )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hongguo_workers (
+                worker_id VARCHAR(120) NOT NULL PRIMARY KEY,
+                name VARCHAR(160) NOT NULL,
+                host VARCHAR(160) NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'online',
+                metadata_json TEXT DEFAULT NULL,
+                last_seen_at DATETIME NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hongguo_worker_devices (
+                worker_id VARCHAR(120) NOT NULL,
+                device_addr VARCHAR(80) NOT NULL,
+                label VARCHAR(200) DEFAULT NULL,
+                online TINYINT(1) NOT NULL DEFAULT 0,
+                logged_in TINYINT(1) NOT NULL DEFAULT 0,
+                payload_json TEXT DEFAULT NULL,
+                last_seen_at DATETIME NOT NULL,
+                PRIMARY KEY (worker_id, device_addr),
+                INDEX idx_hongguo_device_seen (last_seen_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
 
 
 @contextmanager
@@ -306,6 +515,17 @@ def _serialize_task(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return row
 
 
+def _owner_user_id() -> int:
+    return int(current_principal().user_id)
+
+
+def _owner_filter(column: str = "owner_user_id") -> tuple[str, List[Any]]:
+    principal = current_principal()
+    if principal.is_admin:
+        return "", []
+    return f"{column}=%s", [int(principal.user_id)]
+
+
 def _public_screenshot_url(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
@@ -315,8 +535,13 @@ def _public_screenshot_url(path: Optional[str]) -> Optional[str]:
 
 
 def _fetch_one_or_404(conn, task_id: int) -> Dict[str, Any]:
+    owner_clause, owner_params = _owner_filter()
+    owner_sql = f" AND {owner_clause}" if owner_clause else ""
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM hongguo_comment_tasks WHERE id=%s", (task_id,))
+        cur.execute(
+            f"SELECT * FROM hongguo_comment_tasks WHERE id=%s{owner_sql}",
+            (task_id, *owner_params),
+        )
         row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -387,6 +612,7 @@ class TaskCreate(TaskBase):
 class MultiDeviceSelection(BaseModel):
     addr: str = Field(max_length=80)
     label: Optional[str] = Field(default=None, max_length=200)
+    worker_id: Optional[str] = Field(default=None, max_length=120)
 
     @field_validator("addr")
     @classmethod
@@ -406,9 +632,10 @@ class MultiTaskCreate(TaskBase):
     def validate_unique_devices(cls, value: List[MultiDeviceSelection]) -> List[MultiDeviceSelection]:
         seen: set[str] = set()
         for item in value:
-            if item.addr in seen:
-                raise ValueError(f"duplicate device: {item.addr}")
-            seen.add(item.addr)
+            key = f"{item.worker_id or ''}|{item.addr}"
+            if key in seen:
+                raise ValueError(f"duplicate device: {key}")
+            seen.add(key)
         return value
 
 
@@ -544,6 +771,7 @@ def _insert_task_record(
     device_addr: Optional[str] = None,
     device_label: Optional[str] = None,
     multi_run_id: Optional[str] = None,
+    worker_id: Optional[str] = None,
 ) -> int:
     now = datetime.now()
     with conn.cursor() as cur:
@@ -554,9 +782,9 @@ def _insert_task_record(
                 start_episode, episode_interval, comment_interval_sec,
                 random_comment_count, random_min_interval, random_max_interval,
                 templates_json, playback_speed, status,
-                device_addr, device_label, multi_run_id,
+                device_addr, device_label, multi_run_id, owner_user_id, worker_id,
                 created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 *_task_insert_values(payload),
@@ -564,6 +792,8 @@ def _insert_task_record(
                 device_addr,
                 device_label,
                 multi_run_id,
+                _owner_user_id(),
+                worker_id or _local_worker_id(),
                 now,
                 now,
             ),
@@ -587,8 +817,16 @@ async def list_tasks(
 ):
     if status is not None and status not in TASK_STATUSES:
         raise HTTPException(status_code=400, detail="Invalid status")
-    where = "WHERE status=%s" if status else ""
-    params: List[Any] = [status] if status else []
+    clauses: List[str] = []
+    params: List[Any] = []
+    if status:
+        clauses.append("status=%s")
+        params.append(status)
+    owner_clause, owner_params = _owner_filter()
+    if owner_clause:
+        clauses.append(owner_clause)
+        params.extend(owner_params)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.extend([limit, offset])
     with _connection() as conn:
         with conn.cursor() as cur:
@@ -2118,12 +2356,12 @@ async def run_stage_task(task_id: int, payload: StageRunRequest):
 
 
 @router.get("/settings/ai")
-async def get_ai_settings():
+async def get_ai_settings(_=Depends(require_admin)):
     return _public_ai_settings(_app_config().get("ai", {}))
 
 
 @router.put("/settings/ai")
-async def update_ai_settings(payload: AISettingsUpdate):
+async def update_ai_settings(payload: AISettingsUpdate, _=Depends(require_admin)):
     current = update_ai_config(payload.model_dump())
     TaskEngineManager.get_instance(
         _db_config(),
@@ -2135,7 +2373,7 @@ async def update_ai_settings(payload: AISettingsUpdate):
 
 
 @router.post("/settings/ai/test")
-async def test_ai_settings(payload: Optional[AISettingsUpdate] = None):
+async def test_ai_settings(payload: Optional[AISettingsUpdate] = None, _=Depends(require_admin)):
     if payload is None:
         ai = _ai_config()
     else:
@@ -2153,12 +2391,12 @@ async def test_ai_settings(payload: Optional[AISettingsUpdate] = None):
 
 
 @router.get("/settings/ai/usage")
-async def get_ai_usage():
+async def get_ai_usage(_=Depends(require_admin)):
     return load_usage_stats()
 
 
 @router.post("/settings/ai/usage/reset")
-async def reset_ai_usage():
+async def reset_ai_usage(_=Depends(require_admin)):
     return reset_usage_stats()
 
 
@@ -2176,6 +2414,25 @@ def _start_task_on_device(task_id: int, device_addr: Optional[str] = None) -> Di
         _validate_transition(current.get("status"), "running")
     effective_device_addr = device_addr or current.get("device_addr") or _hongguo_device_addr()
     now = datetime.now()
+    if _execution_mode() == "api":
+        worker_id = str(current.get("worker_id") or "").strip()
+        if not worker_id:
+            raise HTTPException(status_code=409, detail="Task has no assigned worker")
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE hongguo_comment_tasks
+                    SET status='pending', dispatch_requested_at=%s, control_command='start',
+                        completed_at=NULL, duration_seconds=NULL, error_message=NULL,
+                        current_episode=0, comments_sent=0, comments_verified=0,
+                        device_addr=%s, updated_at=%s
+                    WHERE id=%s
+                    """,
+                    (now, effective_device_addr, now, task_id),
+                )
+            _insert_log(conn, task_id, f"任务已派发到执行节点 {worker_id}，设备={effective_device_addr}")
+            return _serialize_task(_fetch_one_or_404(conn, task_id))
     with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -2221,6 +2478,15 @@ async def pause_task(task_id: int):
     with _connection() as conn:
         current = _fetch_one_or_404(conn, task_id)
     _validate_transition(current["status"], "paused")
+    if _execution_mode() == "api":
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE hongguo_comment_tasks SET control_command='pause', updated_at=%s WHERE id=%s",
+                    (datetime.now(), task_id),
+                )
+            _insert_log(conn, task_id, "已向执行节点发送暂停命令")
+            return _serialize_task(_fetch_one_or_404(conn, task_id))
     if not _engine_manager().pause_task(task_id):
         raise HTTPException(status_code=409, detail="Task engine is not running")
     with _connection() as conn:
@@ -2233,6 +2499,15 @@ async def resume_task(task_id: int):
         current = _fetch_one_or_404(conn, task_id)
     if current["status"] != "paused":
         raise HTTPException(status_code=409, detail="Only paused tasks can be resumed")
+    if _execution_mode() == "api":
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE hongguo_comment_tasks SET control_command='resume', updated_at=%s WHERE id=%s",
+                    (datetime.now(), task_id),
+                )
+            _insert_log(conn, task_id, "已向执行节点发送恢复命令")
+            return _serialize_task(_fetch_one_or_404(conn, task_id))
     if not _engine_manager().resume_task(task_id):
         raise HTTPException(status_code=409, detail="Task engine is not running")
     with _connection() as conn:
@@ -2244,6 +2519,25 @@ async def stop_task(task_id: int):
     with _connection() as conn:
         current = _fetch_one_or_404(conn, task_id)
     _validate_transition(current["status"], "stopped")
+    if _execution_mode() == "api":
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                if current["status"] in {"pending", "waiting_login"}:
+                    cur.execute(
+                        """
+                        UPDATE hongguo_comment_tasks
+                        SET status='stopped', control_command=NULL, completed_at=%s, updated_at=%s
+                        WHERE id=%s
+                        """,
+                        (datetime.now(), datetime.now(), task_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE hongguo_comment_tasks SET control_command='stop', updated_at=%s WHERE id=%s",
+                        (datetime.now(), task_id),
+                    )
+            _insert_log(conn, task_id, "已向执行节点发送停止命令")
+            return _serialize_task(_fetch_one_or_404(conn, task_id))
     if not _engine_manager().stop_task(task_id):
         return _set_task_status(task_id, "stopped", "任务已停止")
     with _connection() as conn:
@@ -2373,10 +2667,22 @@ async def screenshot_image(task_id: int):
 async def screenshot_proxy(path: str):
     if not path:
         raise HTTPException(status_code=404, detail="No screenshot available")
-    decoded = path.replace("+", " ")
-    if not Path(decoded).exists():
+    decoded = Path(path.replace("+", " ")).resolve()
+    screenshot_root = _screenshot_root()
+    try:
+        relative = decoded.relative_to(screenshot_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Screenshot path is outside the allowed root")
+    if decoded.suffix.lower() not in {".png", ".jpg", ".jpeg"} or not decoded.is_file():
         raise HTTPException(status_code=404, detail="No screenshot available")
-    return FileResponse(decoded, media_type="image/png")
+    try:
+        task_id = int(relative.parts[0])
+    except (IndexError, TypeError, ValueError):
+        raise HTTPException(status_code=403, detail="Screenshot is not associated with a task")
+    with _connection() as conn:
+        _fetch_one_or_404(conn, task_id)
+    media_type = "image/jpeg" if decoded.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+    return FileResponse(str(decoded), media_type=media_type)
 
 
 def _latest_screenshot_file(task_id: int) -> Optional[str]:
@@ -2686,15 +2992,17 @@ def _serialize_multi_run(run_id: str, tasks: List[Dict[str, Any]]) -> Dict[str, 
 
 
 def _fetch_multi_run_tasks(conn, run_id: str) -> List[Dict[str, Any]]:
+    owner_clause, owner_params = _owner_filter()
+    owner_sql = f" AND {owner_clause}" if owner_clause else ""
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT *
             FROM hongguo_comment_tasks
-            WHERE multi_run_id=%s
+            WHERE multi_run_id=%s{owner_sql}
             ORDER BY id ASC
             """,
-            (run_id,),
+            (run_id, *owner_params),
         )
         return list(cur.fetchall() or [])
 
@@ -2755,6 +3063,8 @@ def _detect_multi_devices_uncached() -> Dict[str, Any]:
         )
 
     devices = [item for item in device_slots if item is not None]
+    for item in devices:
+        item["worker_id"] = _local_worker_id()
 
     for addr in discover_online_addrs():
         if addr in seen_addrs:
@@ -2778,9 +3088,94 @@ def _detect_multi_devices_uncached() -> Dict[str, Any]:
     }
 
 
+def _list_registered_worker_devices() -> Dict[str, Any]:
+    cutoff = datetime.now() - timedelta(seconds=90)
+    devices: List[Dict[str, Any]] = []
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT device.*, worker.name AS worker_name
+                FROM hongguo_worker_devices AS device
+                JOIN hongguo_workers AS worker ON worker.worker_id=device.worker_id
+                WHERE device.last_seen_at >= %s
+                  AND worker.last_seen_at >= %s
+                  AND worker.status='online'
+                ORDER BY worker.name, device.label, device.device_addr
+                """,
+                (cutoff, cutoff),
+            )
+            rows = cur.fetchall() or []
+    for row in rows:
+        payload = _json_loads(row.get("payload_json"))
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.update(
+            {
+                "addr": row.get("device_addr"),
+                "serial": row.get("device_addr"),
+                "label": row.get("label") or row.get("device_addr"),
+                "worker_id": row.get("worker_id"),
+                "worker_name": row.get("worker_name") or row.get("worker_id"),
+                "online": bool(row.get("online")),
+                "logged_in": bool(row.get("logged_in")),
+                "remote_worker": True,
+            }
+        )
+        devices.append(payload)
+    result = {
+        "success": True,
+        "devices": devices,
+        "ignored_devices": [],
+        "online_count": sum(1 for item in devices if item.get("online")),
+        "logged_in_count": sum(1 for item in devices if item.get("logged_in")),
+        "remote_workers": True,
+    }
+    return _apply_device_lease_visibility(result)
+
+
+def _apply_device_lease_visibility(result: Dict[str, Any]) -> Dict[str, Any]:
+    visible = deepcopy(result)
+    principal = current_principal()
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT device_addr, owner_user_id, task_id, worker_id, expires_at
+                FROM hongguo_device_leases
+                WHERE expires_at > %s
+                """,
+                (datetime.now(),),
+            )
+            leases = {
+                (str(row.get("worker_id") or ""), str(row["device_addr"])): row
+                for row in (cur.fetchall() or [])
+            }
+    for item in visible.get("devices") or []:
+        addr = str(item.get("addr") or item.get("serial") or "")
+        worker_id = str(item.get("worker_id") or _local_worker_id())
+        lease = leases.get((worker_id, addr))
+        if not lease:
+            item["leased"] = False
+            item["leased_by_other"] = False
+            continue
+        owner_user_id = int(lease.get("owner_user_id") or 0)
+        item["leased"] = True
+        item["leased_by_other"] = not principal.is_admin and owner_user_id != int(principal.user_id)
+        item["lease_task_id"] = int(lease.get("task_id") or 0) if not item["leased_by_other"] else None
+        if item["leased_by_other"]:
+            item["status"] = "device_busy"
+            item["message"] = "设备正在执行其他用户的任务"
+            item["account"] = {"logged_in": bool(item.get("logged_in"))}
+    return visible
+
+
 @router.get("/multi/devices")
 def list_multi_devices():
     global _multi_device_detection_cache, _multi_device_detection_cache_at
+
+    if _execution_mode() == "api":
+        return _list_registered_worker_devices()
 
     request_started = time.monotonic()
     with _MULTI_DEVICE_DETECTION_LOCK:
@@ -2791,7 +3186,7 @@ def list_multi_devices():
             _multi_device_detection_cache is not None
             and _multi_device_detection_cache_at >= request_started
         ):
-            cached = dict(_multi_device_detection_cache)
+            cached = _apply_device_lease_visibility(_multi_device_detection_cache)
             cached["reused_concurrent_result"] = True
             return cached
 
@@ -2807,7 +3202,7 @@ def list_multi_devices():
             result["logged_in_count"],
             result["check_duration_sec"],
         )
-        return result
+        return _apply_device_lease_visibility(result)
 
 
 @router.post("/multi/tasks")
@@ -2822,6 +3217,7 @@ async def create_multi_tasks(payload: MultiTaskCreate):
                 device_addr=item.addr,
                 device_label=item.label or item.addr,
                 multi_run_id=run_id,
+                worker_id=item.worker_id or _local_worker_id(),
             )
             _insert_log(conn, task_id, f"多开批次任务已创建，批次={run_id}，设备={item.addr}")
             created.append(_serialize_task(_fetch_one_or_404(conn, task_id)))
@@ -2835,18 +3231,20 @@ async def create_multi_tasks(payload: MultiTaskCreate):
 
 @router.get("/multi/runs")
 def list_multi_runs(limit: int = Query(default=20, ge=1, le=100)):
+    owner_clause, owner_params = _owner_filter()
+    owner_sql = f" AND {owner_clause}" if owner_clause else ""
     with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT multi_run_id
                 FROM hongguo_comment_tasks
-                WHERE multi_run_id IS NOT NULL AND multi_run_id <> ''
+                WHERE multi_run_id IS NOT NULL AND multi_run_id <> ''{owner_sql}
                 GROUP BY multi_run_id
                 ORDER BY MAX(created_at) DESC
                 LIMIT %s
                 """,
-                (limit,),
+                (*owner_params, limit),
             )
             run_ids = [row["multi_run_id"] for row in cur.fetchall() or []]
         runs = [_serialize_multi_run(run_id, _fetch_multi_run_tasks(conn, run_id)) for run_id in run_ids]
@@ -2897,8 +3295,18 @@ def stop_multi_run(run_id: str):
     for task in tasks:
         task_id = int(task["id"])
         try:
-            _engine_manager().stop_task(task_id)
-            stopped.append(_set_task_status(task_id, "stopped", "多开批次任务已停止"))
+            if _execution_mode() == "api" and task.get("status") in {"running", "paused"}:
+                with _connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE hongguo_comment_tasks SET control_command='stop', updated_at=%s WHERE id=%s",
+                            (datetime.now(), task_id),
+                        )
+                    _insert_log(conn, task_id, "多开批次已向执行节点发送停止命令")
+                    stopped.append(_serialize_task(_fetch_one_or_404(conn, task_id)))
+            else:
+                _engine_manager().stop_task(task_id)
+                stopped.append(_set_task_status(task_id, "stopped", "多开批次任务已停止"))
         except Exception as exc:
             stopped.append({"id": task_id, "error_message": str(exc)})
     with _connection() as conn:
@@ -2918,6 +3326,10 @@ async def list_templates(
         params.append(category)
     if not include_default:
         clauses.append("is_default=0")
+    principal = current_principal()
+    if not principal.is_admin:
+        clauses.append("(owner_user_id=%s OR (owner_user_id=0 AND is_default=1))")
+        params.append(int(principal.user_id))
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _connection() as conn:
         with conn.cursor() as cur:
@@ -2938,10 +3350,10 @@ async def create_template(payload: TemplateCreate):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO hongguo_comment_templates (content, category, is_default)
-                VALUES (%s, %s, %s)
+                INSERT INTO hongguo_comment_templates (content, category, is_default, owner_user_id)
+                VALUES (%s, %s, %s, %s)
                 """,
-                (payload.content, payload.category, int(payload.is_default)),
+                (payload.content, payload.category, int(payload.is_default), _owner_user_id()),
             )
             template_id = cur.lastrowid
             cur.execute("SELECT * FROM hongguo_comment_templates WHERE id=%s", (template_id,))
@@ -2950,9 +3362,14 @@ async def create_template(payload: TemplateCreate):
 
 @router.get("/templates/{template_id}")
 async def get_template(template_id: int):
+    owner_clause, owner_params = _owner_filter()
+    owner_sql = f" AND {owner_clause}" if owner_clause else ""
     with _connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM hongguo_comment_templates WHERE id=%s", (template_id,))
+            cur.execute(
+                f"SELECT * FROM hongguo_comment_templates WHERE id=%s{owner_sql}",
+                (template_id, *owner_params),
+            )
             row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -2968,30 +3385,46 @@ async def update_template(template_id: int, payload: TemplateUpdate):
         data["is_default"] = int(data["is_default"])
     assignments = [f"{key}=%s" for key in data]
     values = list(data.values())
-    values.append(template_id)
+    owner_clause, owner_params = _owner_filter()
+    owner_sql = f" AND {owner_clause}" if owner_clause else ""
+    values.extend([template_id, *owner_params])
     with _connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM hongguo_comment_templates WHERE id=%s", (template_id,))
+            cur.execute(
+                f"SELECT id FROM hongguo_comment_templates WHERE id=%s{owner_sql}",
+                (template_id, *owner_params),
+            )
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="Template not found")
             cur.execute(
                 f"""
                 UPDATE hongguo_comment_templates
                 SET {", ".join(assignments)}
-                WHERE id=%s
+                WHERE id=%s{owner_sql}
                 """,
                 values,
             )
-            cur.execute("SELECT * FROM hongguo_comment_templates WHERE id=%s", (template_id,))
+            cur.execute(
+                f"SELECT * FROM hongguo_comment_templates WHERE id=%s{owner_sql}",
+                (template_id, *owner_params),
+            )
             return cur.fetchone()
 
 
 @router.delete("/templates/{template_id}")
 async def delete_template(template_id: int):
+    owner_clause, owner_params = _owner_filter()
+    owner_sql = f" AND {owner_clause}" if owner_clause else ""
     with _connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM hongguo_comment_templates WHERE id=%s", (template_id,))
+            cur.execute(
+                f"SELECT id FROM hongguo_comment_templates WHERE id=%s{owner_sql}",
+                (template_id, *owner_params),
+            )
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="Template not found")
-            cur.execute("DELETE FROM hongguo_comment_templates WHERE id=%s", (template_id,))
+            cur.execute(
+                f"DELETE FROM hongguo_comment_templates WHERE id=%s{owner_sql}",
+                (template_id, *owner_params),
+            )
     return {"success": True, "id": template_id}

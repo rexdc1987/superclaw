@@ -56,7 +56,7 @@
           <el-table-column label="实例" min-width="220" show-overflow-tooltip>
             <template #default="{ row }">
               <div class="device-title">{{ row.label || row.addr }}</div>
-              <div class="device-sub">{{ row.addr }}</div>
+              <div class="device-sub">{{ row.worker_name ? row.worker_name + ' / ' : '' }}{{ row.addr }}</div>
             </template>
           </el-table-column>
           <el-table-column label="登录" width="100">
@@ -179,7 +179,7 @@
         <el-table-column label="实例" min-width="230" show-overflow-tooltip>
           <template #default="{ row }">
             <div class="device-title">{{ row.device_label || row.device_addr || '-' }}</div>
-            <div class="device-sub">{{ row.device_addr || '-' }}</div>
+            <div class="device-sub">{{ row.worker_id ? row.worker_id + ' / ' : '' }}{{ row.device_addr || '-' }}</div>
           </template>
         </el-table-column>
         <el-table-column prop="drama_name" label="短剧" min-width="150" show-overflow-tooltip />
@@ -296,16 +296,18 @@ const deviceSummary = computed(() => ({
 }))
 
 function isDeviceSelectable(row) {
-  return Boolean(row.online && row.logged_in)
+  return Boolean(row.online && row.logged_in && !row.leased_by_other)
 }
 
 function loginTagType(row) {
+  if (row.leased_by_other) return 'info'
   if (row.logged_in) return 'success'
   if (row.status === 'adb_not_ready' || row.status === 'login_check_timeout') return 'danger'
   return 'warning'
 }
 
 function loginTagText(row) {
+  if (row.leased_by_other) return '占用中'
   if (row.logged_in) return '已登录'
   if (row.status === 'adb_not_ready') return 'ADB未就绪'
   if (row.status === 'login_check_timeout') return '检测超时'
@@ -339,7 +341,7 @@ async function detectDevices() {
     selectedDevices.value = []
     await nextTick()
     devices.value.forEach((item) => {
-      if (item.online && item.logged_in) deviceTableRef.value?.toggleRowSelection(item, true)
+      if (isDeviceSelectable(item)) deviceTableRef.value?.toggleRowSelection(item, true)
     })
     ElMessage.success(`检测完成：在线 ${result.online_count || 0} 台，已登录 ${result.logged_in_count || 0} 台`)
     const ignoredDevices = result.ignored_devices || []
@@ -385,6 +387,7 @@ async function createRun() {
       devices: selectedDevices.value.map((item) => ({
         addr: item.addr,
         label: item.label || item.addr,
+        worker_id: item.worker_id || null,
       })),
     }
     const result = await createMultiTasks(payload)
@@ -517,7 +520,11 @@ async function rebuildRunFromActiveRun() {
       ...rule,
       devices: tasks
         .filter((item) => item.device_addr)
-        .map((item) => ({ addr: item.device_addr, label: item.device_label || item.device_addr })),
+        .map((item) => ({
+          addr: item.device_addr,
+          label: item.device_label || item.device_addr,
+          worker_id: item.worker_id || null,
+        })),
     }
     if (!payload.devices.length) {
       ElMessage.warning('当前批次没有可复用的设备')

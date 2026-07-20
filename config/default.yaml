@@ -4,7 +4,7 @@ database:
   port: 3308
   name: superclaw
   user: superclaw
-  password: GEW3fHhi8KxwhMwM
+  password: ''
 logging:
   level: INFO
   dir: logs

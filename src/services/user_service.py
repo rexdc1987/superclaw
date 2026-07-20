@@ -1,24 +1,38 @@
 """User authentication and management service."""
 import hashlib
+import os
 import secrets
 from datetime import datetime, timezone, timedelta
 from models.database import get_session
 from models.user import User
 
 
-def _hash_password(password, salt=None):
+PBKDF2_ITERATIONS = 310000
+
+
+def _hash_password(password, salt=None, iterations=PBKDF2_ITERATIONS):
     if salt is None:
         salt = secrets.token_hex(16)
-    hashed = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"{salt}${hashed}"
+    hashed = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        int(iterations),
+    ).hex()
+    return f"pbkdf2_sha256${int(iterations)}${salt}${hashed}"
 
 
 def _verify_password(password, stored_hash):
-    parts = stored_hash.split("$", 1)
-    if len(parts) != 2:
-        return False
-    salt, _ = parts
-    return _hash_password(password, salt) == stored_hash
+    parts = str(stored_hash or "").split("$")
+    if len(parts) == 4 and parts[0] == "pbkdf2_sha256":
+        _, iterations, salt, expected = parts
+        actual = _hash_password(password, salt, int(iterations)).rsplit("$", 1)[-1]
+        return secrets.compare_digest(actual, expected)
+    if len(parts) == 2:
+        salt, expected = parts
+        actual = hashlib.sha256((salt + password).encode()).hexdigest()
+        return secrets.compare_digest(actual, expected)
+    return False
 
 
 class UserService:
@@ -32,6 +46,8 @@ class UserService:
                 return None
             if not user.is_active():
                 return None
+            if not str(user.password_hash or "").startswith("pbkdf2_sha256$"):
+                user.password_hash = _hash_password(password)
             user.last_login = datetime.utcnow()
             session.commit()
             session.refresh(user)
@@ -128,9 +144,12 @@ class UserService:
         try:
             count = session.query(User).count()
             if count == 0:
+                password = os.environ.get("SUPERCLAW_ADMIN_PASSWORD", "")
+                if len(password) < 8:
+                    raise ValueError("SUPERCLAW_ADMIN_PASSWORD must contain at least 8 characters")
                 admin = User(
-                    username="admin",
-                    password_hash=_hash_password("admin123"),
+                    username=os.environ.get("SUPERCLAW_ADMIN_USERNAME", "admin").strip() or "admin",
+                    password_hash=_hash_password(password),
                     nickname="Administrator",
                     phone="",
                     position="系统管理员",
