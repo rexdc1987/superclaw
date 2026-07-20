@@ -20,7 +20,7 @@ from pymysql.cursors import DictCursor
 from .ai_usage import record_usage
 from .comment_gen import CommentGenerator
 from .device import DEFAULT_ADDR, check_connection, connect
-from .operations import HongguoOperations
+from .operations import LIVE_LITE_ACTIVITY, SHORT_SERIES_ACTIVITY, HongguoOperations
 
 
 DEFAULT_SCREENSHOT_ROOT = "E:/Projects/SuperClaw/screenshots/hongguo"
@@ -209,6 +209,19 @@ class TaskEngine:
             completed_at = datetime.now()
             missing_comments = self._missing_verified_comment_episodes(comment_episodes)
             if missing_comments:
+                self._log(
+                    "warn",
+                    f"全流程v3: 正常刷完后仍有未验证评论集数={missing_comments}，开始最终补偿重发",
+                )
+                missing_comments = self._retry_missing_comments_before_completion(
+                    ops,
+                    task,
+                    drama_title,
+                    total,
+                    missing_comments,
+                )
+                completed_at = datetime.now()
+            if missing_comments:
                 message = f"评论验证未达标: 未验证成功集数={missing_comments}，计划评论集数={sorted(comment_episodes)}"
                 self._update_task(
                     status="failed",
@@ -305,6 +318,13 @@ class TaskEngine:
             else:
                 raise RuntimeError(f"{selected.get('message') or '进入目标剧集失败'}，已截图 {shot}")
 
+        wrong_collection = ops._mismatched_collection_title(keyword)
+        if wrong_collection:
+            shot = ops.take_screenshot("select_drama_wrong_collection", self.screenshot_dir)
+            raise RuntimeError(
+                f"进入的合集与目标短剧不匹配: 期望 {keyword}，实际 {wrong_collection}，已截图 {shot}"
+            )
+
         playback_speed = str(task.get("playback_speed") or "1.0x")
         if playback_speed != "1.0x":
             speed_set = ops.set_playback_speed(playback_speed)
@@ -362,6 +382,8 @@ class TaskEngine:
         drama_title: str,
         episode: int,
         expected_total: int,
+        count_sent: bool = True,
+        avoid_contents: Optional[set[str]] = None,
     ) -> None:
         current = self._confirm_current_episode(ops, episode)
         if current and current != episode:
@@ -427,6 +449,29 @@ class TaskEngine:
                 else:
                     current = self._confirm_current_episode(ops, episode)
             if not panel_ready:
+                restarted = ops.restart_app()
+                self._log(
+                    "warn" if restarted else "error",
+                    f"全流程v3: 第{episode}集评论按钮持续被遮挡，冷启动红果={restarted}",
+                )
+                recovered = restarted and self._recover_to_verified_episode(
+                    ops,
+                    task,
+                    episode,
+                    expected_total,
+                    "评论按钮持续被奖励或直播透明层遮挡，冷启动后恢复",
+                    allow_reopen=True,
+                )
+                if recovered:
+                    paused = ops.pause_playback_if_playing()
+                    panel_ready = ops.prepare_comment_window(episode)
+                    current = self._confirm_current_episode(ops, episode)
+                    self._log(
+                        "info" if panel_ready else "error",
+                        f"全流程v3: 第{episode}集冷启动恢复后准备评论，当前集={current or 0}，"
+                        f"暂停播放={paused}，评论面板={panel_ready}",
+                    )
+            if not panel_ready:
                 failed_path = ops.take_screenshot(f"ep{episode}_comment_panel_open_failed", self.screenshot_dir)
                 resumed = ops.resume_playback_safely()
                 still_paused = ops.is_playback_paused()
@@ -438,11 +483,17 @@ class TaskEngine:
                 raise RuntimeError(f"第{episode}集评论面板打开失败，已截图 {failed_path}")
 
         generator = CommentGenerator(self._current_ai_config())
-        content, source, usage = generator.generate_with_usage(
-            drama_title,
-            task.get("content_source", "ai"),
-            self._templates(task),
-        )
+        content = ""
+        source = ""
+        usage = None
+        for _ in range(3):
+            content, source, usage = generator.generate_with_usage(
+                drama_title,
+                task.get("content_source", "ai"),
+                self._templates(task),
+            )
+            if not avoid_contents or content not in avoid_contents:
+                break
         if usage:
             record_usage(usage, context=f"task:{self.task_id}:episode:{episode}")
 
@@ -476,7 +527,8 @@ class TaskEngine:
                 self._log("warn", f"全流程v3: 第{episode}集评论失败后恢复播放异常: {exc}")
             return
 
-        self._increment_counter("sent")
+        if count_sent:
+            self._increment_counter("sent")
         verify = self._verify_comment_with_retry(ops, task, content, episode, expected_total)
         if not verify.get("verified"):
             self._log("warn", f"全流程v3: 第{episode}集评论验证仍未通过，准备回到目标集重发一次")
@@ -506,6 +558,62 @@ class TaskEngine:
         )
 
         self._restore_playback_after_comment(ops, task, episode, expected_total)
+
+    def _retry_missing_comments_before_completion(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        drama_title: str,
+        expected_total: int,
+        missing_comments: Iterable[int],
+    ) -> List[int]:
+        for episode in sorted(set(int(value) for value in missing_comments)):
+            self._check_pause_stop()
+            if self._comment_already_verified(episode):
+                continue
+            if not self._recover_to_verified_episode(
+                ops,
+                task,
+                episode,
+                expected_total,
+                "整剧结束前补偿未验证评论",
+            ):
+                self._log("error", f"全流程v3: 第{episode}集最终补偿前无法恢复目标集")
+                continue
+            avoid_contents = self._comment_contents_for_episode(episode)
+            try:
+                self._handle_verified_comment(
+                    ops,
+                    task,
+                    drama_title,
+                    episode,
+                    expected_total,
+                    count_sent=False,
+                    avoid_contents=avoid_contents,
+                )
+            except Exception as exc:
+                self._log("error", f"全流程v3: 第{episode}集最终补偿异常: {exc}")
+        return self._missing_verified_comment_episodes(missing_comments)
+
+    def _comment_contents_for_episode(self, episode: int) -> set[str]:
+        try:
+            with self._connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT comment_text
+                        FROM hongguo_comment_records
+                        WHERE task_id=%s AND episode_number=%s
+                        """,
+                        (self.task_id, episode),
+                    )
+                    return {
+                        str(row.get("comment_text") or "").strip()
+                        for row in cur.fetchall() or []
+                        if str(row.get("comment_text") or "").strip()
+                    }
+        except Exception:
+            return set()
 
     def _verify_comment_with_retry(
         self,
@@ -756,14 +864,82 @@ class TaskEngine:
                 last_log_at = time.time()
                 time.sleep(3)
                 continue
-            if app.get("activity") and app.get("activity") != "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
+            if app.get("activity") and app.get("activity") != SHORT_SERIES_ACTIVITY:
+                activity = str(app.get("activity") or "")
+                if activity == LIVE_LITE_ACTIVITY:
+                    self._log(
+                        "warn",
+                        f"全流程v3: 第{episode}集后检测到红果内部直播页，先关闭直播页再确认第{target}集",
+                    )
+                    close_live_lite = getattr(ops, "_close_live_lite_page", None)
+                    closed = bool(close_live_lite()) if callable(close_live_lite) else False
+                    self._log(
+                        "info" if closed else "warn",
+                        f"全流程v3: 第{episode}集后关闭红果内部直播页={closed}",
+                    )
+                    if closed:
+                        time.sleep(1)
+                        restored_state = self._page_state(ops, task)
+                        restored_app = restored_state.get("app") or {}
+                        restored_activity = str(restored_app.get("activity") or "")
+                        restored_current = int(restored_state.get("current_episode") or 0)
+                        if restored_activity == SHORT_SERIES_ACTIVITY and self._has_playback_context(restored_state):
+                            if restored_current == target:
+                                self._log("info", f"全流程v3: 关闭红果内部直播页后已进入第{target}集")
+                                return True
+                            if restored_current in (0, episode):
+                                advanced = bool(ops.play_episode(target))
+                                self._log(
+                                    "info" if advanced else "warn",
+                                    f"全流程v3: 关闭红果内部直播页后回到第{restored_current or episode}集，"
+                                    f"主动切换第{target}集={advanced}",
+                                )
+                                if advanced:
+                                    return True
+                                if self._recover_to_verified_episode(
+                                    ops,
+                                    task,
+                                    target,
+                                    expected_total,
+                                    f"第{episode}集后直播页反复拦截自动连播",
+                                ):
+                                    return True
+                                raise RuntimeError(
+                                    f"第{episode}集后关闭红果内部直播页，但无法切换到第{target}集"
+                                )
+                            if restored_current > target and not self._pending_comment_episodes_between(
+                                task,
+                                target,
+                                restored_current,
+                            ):
+                                self._log(
+                                    "info",
+                                    f"全流程v3: 关闭红果内部直播页后已播放到第{restored_current}集，"
+                                    f"第{target}-{restored_current - 1}集无待评论任务，顺延观察",
+                                )
+                                return True
+                            self._log(
+                                "warn",
+                                f"全流程v3: 关闭红果内部直播页后识别为第{restored_current or 0}集，"
+                                f"需要恢复目标第{target}集",
+                            )
+                        else:
+                            self._log(
+                                "warn",
+                                f"全流程v3: 关闭红果内部直播页后未回到短剧播放页，"
+                                f"当前 activity={restored_activity or '-'}",
+                            )
                 total = int(state.get("total_episodes") or 0)
                 if self._recover_to_verified_episode(
                     ops,
                     task,
                     target,
                     expected_total,
-                    f"第{episode}集后离开播放页，当前 activity={app.get('activity') or '-'}",
+                    (
+                        f"第{episode}集后红果内部直播页未能恢复目标播放"
+                        if activity == LIVE_LITE_ACTIVITY
+                        else f"第{episode}集后离开播放页，当前 activity={activity or '-'}"
+                    ),
                 ):
                     return True
                 raise RuntimeError(
@@ -1101,6 +1277,24 @@ class TaskEngine:
             return False
         try:
             self._log("warn", f"全流程v3: 准备重新搜索目标短剧并切到第{target}集")
+            live_lite_active = getattr(ops, "_live_lite_activity_active", None)
+            if callable(live_lite_active) and live_lite_active() is True:
+                close_live_lite = getattr(ops, "_close_live_lite_page", None)
+                closed = bool(close_live_lite()) if callable(close_live_lite) else False
+                self._log(
+                    "info" if closed else "warn",
+                    f"全流程v3: 重新搜索前检测到红果内部直播页，关闭直播页={closed}",
+                )
+                if not closed:
+                    open_main = getattr(ops, "_open_main_activity", None)
+                    opened_main = bool(open_main()) if callable(open_main) else False
+                    self._log(
+                        "info" if opened_main else "warn",
+                        f"全流程v3: 直播页关闭失败，强制打开红果主页面={opened_main}",
+                    )
+                    if not opened_main:
+                        return False
+                time.sleep(1)
             is_foreground = getattr(ops, "_is_app_foreground", None)
             if callable(is_foreground) and not is_foreground():
                 bring_to_foreground = getattr(ops, "bring_to_foreground", None)
@@ -1114,7 +1308,22 @@ class TaskEngine:
             opened = ops.open_search_page(keyword)
             self._log("info" if opened.get("success") else "warn", opened.get("message") or "重新进入搜索框")
             if not opened.get("success"):
-                return False
+                open_main = getattr(ops, "_open_main_activity", None)
+                opened_main = bool(open_main()) if callable(open_main) else False
+                self._log(
+                    "info" if opened_main else "warn",
+                    f"全流程v3: 恢复搜索入口未加载，强制打开红果主页面={opened_main}",
+                )
+                if not opened_main:
+                    return False
+                time.sleep(1)
+                opened = ops.open_search_page(keyword)
+                self._log(
+                    "info" if opened.get("success") else "warn",
+                    opened.get("message") or "强制回主页面后重新进入搜索框",
+                )
+                if not opened.get("success"):
+                    return False
             input_result = ops.input_search_keyword(keyword)
             if not input_result.get("success"):
                 self._log("warn", input_result.get("message") or "重新填入关键词失败")
@@ -1243,6 +1452,7 @@ class TaskEngine:
             "ad_visible": ops._ad_continue_visible(xml),
             "detail_title": ops._extract_detail_title(keyword, xml),
             "playing_title": ops._current_playing_title(xml),
+            "collection_title": ops._current_collection_title(xml),
         }
 
     def _page_state_with_empty_retry(
@@ -1377,10 +1587,14 @@ class TaskEngine:
         if self._total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current):
             raise RuntimeError(f"检测到短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
         keyword = str(task.get("drama_name") or "").strip()
-        title_signals = [
-            str(state.get("playing_title") or "").strip(),
-            str(state.get("detail_title") or "").strip(),
-        ]
+        collection_title = str(state.get("collection_title") or "").strip()
+        if keyword and collection_title and not self._strict_title_matches(keyword, collection_title):
+            raise RuntimeError(f"检测到非目标合集: 期望 {keyword}，实际 {collection_title}")
+        playing_title = str(state.get("playing_title") or "").strip()
+        detail_title = str(state.get("detail_title") or "").strip()
+        title_signals = [playing_title]
+        if not state.get("playback_visible"):
+            title_signals.append(detail_title)
         reliable_titles = [title for title in title_signals if self._reliable_title_signal(keyword, title)]
         if keyword and reliable_titles and not any(self._strict_title_matches(keyword, title) for title in reliable_titles):
             if expected_total and total == expected_total and current == expected_total:
@@ -1390,6 +1604,14 @@ class TaskEngine:
                 )
             else:
                 raise RuntimeError(f"检测到短剧标题不匹配: 期望 {keyword}，实际 {reliable_titles[0]}")
+        if (
+            keyword
+            and state.get("playback_visible")
+            and detail_title
+            and self._reliable_title_signal(keyword, detail_title)
+            and not self._strict_title_matches(keyword, detail_title)
+        ):
+            self._log("warn", f"全流程v3: 忽略播放页相关推荐标题 {detail_title}")
         if not current and bool(state.get("playback_visible") or ops._playback_visible()):
             self._log("warn", "full_v3: playback visible but episode unreadable; continue observation")
             return
@@ -2063,6 +2285,15 @@ class TaskEngine:
         keyword_has_variant = bool(self._season_marker(keyword_key) or self._has_variant_marker(keyword_key))
         exact = [title for title in matches if self._normalize_title_key(title) == keyword_key]
         if keyword_has_variant:
+            canonical = [
+                title
+                for title in matches
+                if re.search(r"第[一二三四五六七八九十\d]+季", self._normalize_title_key(title))
+                and self._season_marker(self._normalize_title_key(title)) == self._season_marker(keyword_key)
+                and self._title_stem(self._normalize_title_key(title)) == self._title_stem(keyword_key)
+            ]
+            if canonical:
+                return min(canonical, key=lambda value: len(self._normalize_title_key(value)))
             extended = [
                 title
                 for title in matches
@@ -2100,7 +2331,13 @@ class TaskEngine:
     @staticmethod
     def _looks_like_preview_title(title: str) -> bool:
         value = str(title or "").strip()
-        return any(marker in value for marker in ("即将上线", "预告"))
+        if any(marker in value for marker in ("即将上线", "预告", "预约")):
+            return True
+        if "《" in value and "》" in value:
+            before, remainder = value.split("《", 1)
+            _, after = remainder.split("》", 1)
+            return bool(before.strip() or after.strip())
+        return False
 
     def _title_matches(self, keyword: str, title: str) -> bool:
         keyword_key = self._normalize_title_key(keyword)

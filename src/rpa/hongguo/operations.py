@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import random
 import re
 import time
@@ -12,6 +13,8 @@ from typing import Any, Dict, List, Optional
 
 from .device import call_with_timeout, connect_exact, get_screen_size, screenshot
 
+
+logger = logging.getLogger("uvicorn.error")
 
 APP_PACKAGE = "com.phoenix.read"
 SHORT_SERIES_ACTIVITY = "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity"
@@ -110,6 +113,15 @@ class HongguoOperations:
             time.sleep(1.5)
             self._close_popups()
             return self._is_app_foreground() or self._wait_app_ready(5)
+        except Exception:
+            return False
+
+    def restart_app(self) -> bool:
+        try:
+            self._stop_app()
+            time.sleep(1.5)
+            self._start_app()
+            return self._wait_app_ready(30)
         except Exception:
             return False
 
@@ -454,7 +466,8 @@ class HongguoOperations:
                     "playable": False,
                     "message": "未进入搜索结果页 tabs，仍停留在搜索候选页，取消选择短剧",
                 }
-            clicked = self._click_matching_result_card(title, expected) if title else False
+            clicked_card = self._click_matching_result_card(title, expected) if title else False
+            clicked = clicked_card
             if not clicked:
                 clicked = self._click_matching_title(title, expected) if title else False
             if not clicked:
@@ -477,6 +490,29 @@ class HongguoOperations:
                     "drama_title": title,
                     "playable": False,
                     "message": f"点击短剧结果后未进入详情页: 期望 {expected}",
+                }
+            wrong_collection = self._mismatched_collection_title(expected)
+            if wrong_collection and clicked_card:
+                self.d.press("back")
+                self._sleep(1.2, 2)
+                retried = self._click_matching_title(title, expected) if title else False
+                if retried:
+                    self._sleep(2, 3)
+                    self._dismiss_launcher_widget_dialog()
+                if not retried or self._still_on_search_selection_page():
+                    return {
+                        "success": False,
+                        "drama_title": title,
+                        "playable": False,
+                        "message": f"目标卡片误入非目标合集 {wrong_collection}，精确标题重试未进入详情页",
+                    }
+                wrong_collection = self._mismatched_collection_title(expected)
+            if wrong_collection:
+                return {
+                    "success": False,
+                    "drama_title": title,
+                    "playable": False,
+                    "message": f"进入的合集与目标短剧不匹配: 期望 {expected}，实际 {wrong_collection}",
                 }
             current_after_click = self._safe_app_current()
             if current_after_click.get("package") and current_after_click.get("package") != APP_PACKAGE:
@@ -572,6 +608,31 @@ class HongguoOperations:
     def _looks_like_explicit_drama_title(self, text: str) -> bool:
         value = html.unescape(str(text or "")).strip()
         return bool(re.search(r"[:：]|第[一二三四五六七八九十\d]+[季部篇]|[上下续前后]篇", value))
+
+    def _current_collection_title(self, xml: Optional[str] = None) -> str:
+        xml = xml if xml is not None else self._xml()
+        texts: List[str] = []
+        for node in self._visible_hongguo_nodes(xml):
+            text_match = re.search(r'text="([^"]+)"', node)
+            if text_match:
+                text = html.unescape(text_match.group(1)).strip()
+                if text:
+                    texts.append(text)
+        sources = [*texts, " ".join(texts)]
+        pattern = re.compile(
+            r"合集\s*[·•・:：-]*\s*(.{2,40}?)\s*[·•・:：-]*\s*更新至\s*\d+\s*集"
+        )
+        for source in sources:
+            match = pattern.search(source)
+            if match:
+                return match.group(1).strip(" ·•・:：-")
+        return ""
+
+    def _mismatched_collection_title(self, expected: str, xml: Optional[str] = None) -> str:
+        collection_title = self._current_collection_title(xml)
+        if collection_title and expected and not self._strict_title_matches(expected, collection_title):
+            return collection_title
+        return ""
 
     def _refresh_connection(self) -> bool:
         serial = getattr(self.d, "serial", None) or getattr(self.d, "_serial", None)
@@ -1641,6 +1702,20 @@ class HongguoOperations:
         return any(marker in xml for marker in ("全屏观看", "选集", "合集", "有趣评论", "说点什么"))
 
     def prepare_comment_window(self, episode_number: int = 0) -> bool:
+        if self._ad_continue_visible():
+            self.skip_ad_if_present()
+            time.sleep(2)
+            if self._ad_continue_visible():
+                if self._live_lite_activity_active():
+                    self._close_live_lite_page()
+                return False
+        if self._live_lite_activity_active():
+            if not self._close_live_lite_page():
+                return False
+            time.sleep(1)
+        if self._episode_list_panel_open():
+            if not self._close_episode_list_panel(episode_number):
+                return False
         # Open the panel immediately so a near-complete episode cannot roll
         # into an ad while slower hierarchy checks are running.
         if self._open_comment_panel(0.5, prefer_coordinate=True):
@@ -1734,8 +1809,7 @@ class HongguoOperations:
                         "screenshot_path": screenshot_path,
                         "message": f"未回到第{episode_number}集播放页",
                     }
-            self.exit_fullscreen()
-            if not self._open_comment_panel(2):
+            if not self.prepare_comment_window(episode_number):
                 return {"verified": False, "screenshot_path": "", "message": "未找到评论按钮"}
             self._sleep(2, 3)
             search_key = content[:8] if len(content) > 8 else content
@@ -1752,7 +1826,7 @@ class HongguoOperations:
                 if attempt + 1 < 4:
                     self._close_comment_panel()
                     time.sleep(2)
-                    if not self._open_comment_panel(3):
+                    if not self.prepare_comment_window(episode_number):
                         continue
                     self._sleep(2.5, 4)
             return {"verified": False, "screenshot_path": screenshot_path}
@@ -1782,14 +1856,18 @@ class HongguoOperations:
     def _open_profile_tab(self) -> bool:
         try:
             self._close_popups_quick()
-            xml = self._xml()
-            if self._profile_visible(xml):
-                return True
-            if self._short_series_activity_active():
+            started_on_playback = self._short_series_activity_active()
+            if started_on_playback:
                 if not self._open_main_activity():
                     return False
                 time.sleep(1)
-            elif not self._open_main_tabs():
+            xml = self._xml()
+            if self._hierarchy_empty(xml):
+                if self._restart_uiautomator_server():
+                    xml = self._xml()
+            if self._profile_visible(xml):
+                return True
+            if not started_on_playback and not self._open_main_tabs():
                 return False
             for _ in range(3):
                 self._tap_bottom_tab("\u6211\u7684", 0.9)
@@ -1798,6 +1876,39 @@ class HongguoOperations:
                     return True
             return self._profile_visible()
         except Exception:
+            return False
+
+    @staticmethod
+    def _hierarchy_empty(xml: str) -> bool:
+        value = str(xml or "").strip()
+        return not value or "<node " not in value
+
+    def _restart_uiautomator_server(self) -> bool:
+        serial = str(getattr(self.d, "serial", "") or getattr(self.d, "_serial", "")).strip()
+        if not serial or serial.startswith("<"):
+            return False
+
+        def restart() -> bool:
+            response = self.d.shell(["ps", "-A", "-o", "PID,ARGS"], timeout=5)
+            output = str(getattr(response, "output", response) or "")
+            pids = []
+            for line in output.splitlines():
+                if "com.wetest.uia2.Main" not in line:
+                    continue
+                match = re.match(r"\s*(\d+)\s+", line)
+                if match and match.group(1) not in pids:
+                    pids.append(match.group(1))
+            if pids:
+                self.d.shell(["kill", "-9", *pids], timeout=5)
+            time.sleep(0.5)
+            self.d = connect_exact(serial)
+            return True
+
+        try:
+            logger.warning("Hongguo uiautomator hierarchy empty; restarting server: addr=%s", serial)
+            return bool(call_with_timeout(restart, 20, f"restart uiautomator {serial}"))
+        except Exception as exc:
+            logger.warning("Hongguo uiautomator restart failed: addr=%s error=%s", serial, exc)
             return False
 
     def _profile_visible(self, xml: Optional[str] = None) -> bool:
@@ -2735,6 +2846,15 @@ class HongguoOperations:
             and self._looks_like_specific_title(title)
         ]
         if keyword_has_variant:
+            canonical = [
+                title
+                for title in matches
+                if re.search(r"第[一二三四五六七八九十\d]+季", self._normalize_title_key(title))
+                and self._season_marker(self._normalize_title_key(title)) == self._season_marker(keyword_key)
+                and self._title_stem(self._normalize_title_key(title)) == self._title_stem(keyword_key)
+            ]
+            if canonical:
+                return min(canonical, key=lambda value: len(self._normalize_title_key(value)))
             if extended:
                 return max(extended, key=lambda value: len(self._normalize_title_key(value)))
             if exact:
@@ -2852,9 +2972,15 @@ class HongguoOperations:
             return True
         if "#" in text:
             return True
+        if "《" in text and "》" in text:
+            before, remainder = text.split("《", 1)
+            _, after = remainder.split("》", 1)
+            if before.strip() or after.strip():
+                return True
         non_drama_markers = (
             "即将上线",
             "预告",
+            "预约",
             "水墨山海",
             "共庆半周年",
             "官方正规接口",

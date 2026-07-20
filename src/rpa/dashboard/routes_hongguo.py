@@ -7,6 +7,7 @@ MySQL as the source of truth and defines the table contract by column name.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -49,6 +50,11 @@ from services.ai_config_service import (
 
 
 router = APIRouter(prefix="/api/v1/hongguo", tags=["hongguo"])
+logger = logging.getLogger("uvicorn.error")
+
+_MULTI_DEVICE_DETECTION_LOCK = threading.Lock()
+_multi_device_detection_cache: Optional[Dict[str, Any]] = None
+_multi_device_detection_cache_at = 0.0
 
 TASK_STATUSES = {
     "pending",
@@ -2531,11 +2537,20 @@ def _check_login_for_device(addr: str, mumu: Optional[Dict[str, Any]] = None) ->
     try:
         device = connect_exact(addr)
         ops = HongguoOperations(device)
-        info = ops.get_device_info()
         if mumu:
-            info["emulator"] = "MuMu 模拟器"
-            info["mumu_index"] = mumu.get("index")
-            info["mumu_name"] = mumu.get("name")
+            current = ops._safe_app_current()
+            info = {
+                "serial": addr,
+                "emulator": "MuMu 模拟器",
+                "model": mumu.get("name") or "",
+                "android_version": mumu.get("android_version") or "",
+                "current_package": current.get("package") or "",
+                "current_activity": current.get("activity") or "",
+                "mumu_index": mumu.get("index"),
+                "mumu_name": mumu.get("name"),
+            }
+        else:
+            info = ops.get_device_info()
         entry.update(
             {
                 "serial": info.get("serial") or addr,
@@ -2555,12 +2570,14 @@ def _check_login_for_device(addr: str, mumu: Optional[Dict[str, Any]] = None) ->
                 }
             )
             return entry
-        launched = True if info.get("current_package") == APP_PACKAGE else ops.launch_app()
-        info = ops.get_device_info()
-        if mumu:
-            info["emulator"] = "MuMu 模拟器"
-            info["mumu_index"] = mumu.get("index")
-            info["mumu_name"] = mumu.get("name")
+        app_already_foreground = info.get("current_package") == APP_PACKAGE
+        launched = True if app_already_foreground else ops.launch_app()
+        if mumu and not app_already_foreground:
+            current = ops._safe_app_current()
+            info["current_package"] = current.get("package") or ""
+            info["current_activity"] = current.get("activity") or ""
+        elif not mumu:
+            info = ops.get_device_info()
         entry["device"] = info
         if not launched and info.get("current_package") != "com.phoenix.read":
             entry.update(
@@ -2570,9 +2587,22 @@ def _check_login_for_device(addr: str, mumu: Optional[Dict[str, Any]] = None) ->
                 }
             )
             return entry
-        login = _check_hongguo_login(ops)
-        login_device = login.pop("device", {}) if isinstance(login.get("device"), dict) else {}
-        merged_device = {**login_device, **info}
+        if mumu:
+            account = ops.get_account_info()
+            logged_in = bool(account.get("logged_in"))
+            login = {
+                "logged_in": logged_in,
+                "status": "logged_in" if logged_in else "not_logged_in",
+                "message": account.get("message") or (
+                    "已识别红果账号" if logged_in else "请先在当前红果实例登录账号"
+                ),
+                "account": account,
+            }
+            merged_device = info
+        else:
+            login = _check_hongguo_login(ops)
+            login_device = login.pop("device", {}) if isinstance(login.get("device"), dict) else {}
+            merged_device = {**login_device, **info}
         entry.update(
             {
                 **login,
@@ -2684,25 +2714,55 @@ def _mark_task_waiting_login(task_id: int, message: str) -> Dict[str, Any]:
         return _serialize_task(_fetch_one_or_404(conn, task_id))
 
 
-@router.get("/multi/devices")
-def list_multi_devices():
-    devices = []
+def _detect_multi_devices_uncached() -> Dict[str, Any]:
+    devices: List[Dict[str, Any]] = []
     ignored_devices = []
     seen_addrs = set()
     mumu_instances = discover_mumu_instances(connect_adb=True)
-    for instance in mumu_instances:
+    device_slots: List[Optional[Dict[str, Any]]] = [None] * len(mumu_instances)
+    pending_checks: List[tuple[int, Dict[str, Any], str]] = []
+    for index, instance in enumerate(mumu_instances):
         addr = str(instance.get("addr") or "").strip()
         if not addr:
             if instance.get("is_process_started") and instance.get("is_android_started"):
                 instance["app_launch_attempt"] = launch_mumu_app(str(instance.get("index") or ""), APP_PACKAGE)
-            devices.append(_mumu_pending_entry(instance))
+            device_slots[index] = _mumu_pending_entry(instance)
             continue
         seen_addrs.add(addr)
+        pending_checks.append((index, instance, addr))
+
+    # uiautomator2 sessions share the host ADB server. Concurrent profile-page
+    # checks can block one another even when every device answers plain ADB.
+    # Keep login inspection ordered; duplicate emulator-* aliases are filtered
+    # below, so this no longer repeats the same physical VM work.
+    logger.info(
+        "Hongguo multi-device login detection started: instances=%d, online=%s",
+        len(mumu_instances),
+        [addr for _, _, addr in pending_checks],
+    )
+    for index, instance, addr in pending_checks:
+        check_started = time.monotonic()
         result = _safe_check_login_for_device(addr, mumu=instance, timeout=60)
-        devices.append(result)
+        result["check_duration_sec"] = round(time.monotonic() - check_started, 2)
+        device_slots[index] = result
+        logger.info(
+            "Hongguo multi-device login detection finished: addr=%s status=%s "
+            "logged_in=%s duration=%.2fs",
+            addr,
+            result.get("status"),
+            result.get("logged_in"),
+            result["check_duration_sec"],
+        )
+
+    devices = [item for item in device_slots if item is not None]
 
     for addr in discover_online_addrs():
         if addr in seen_addrs:
+            continue
+        # MuMu exposes each VM through both its configured localhost port and
+        # an emulator-* alias. The RPC-discovered localhost address above is
+        # authoritative; probing aliases repeats slow uiautomator login checks.
+        if str(addr).lower().startswith("emulator-"):
             continue
         result = _safe_check_login_for_device(addr, timeout=20)
         if result.get("online"):
@@ -2716,6 +2776,38 @@ def list_multi_devices():
         "online_count": sum(1 for item in devices if item.get("online")),
         "logged_in_count": sum(1 for item in devices if item.get("logged_in")),
     }
+
+
+@router.get("/multi/devices")
+def list_multi_devices():
+    global _multi_device_detection_cache, _multi_device_detection_cache_at
+
+    request_started = time.monotonic()
+    with _MULTI_DEVICE_DETECTION_LOCK:
+        # A second browser request can arrive while the first request is still
+        # inspecting profile pages. Reuse only the result completed after this
+        # request began; later user-initiated checks always run fresh.
+        if (
+            _multi_device_detection_cache is not None
+            and _multi_device_detection_cache_at >= request_started
+        ):
+            cached = dict(_multi_device_detection_cache)
+            cached["reused_concurrent_result"] = True
+            return cached
+
+        detection_started = time.monotonic()
+        result = _detect_multi_devices_uncached()
+        result["check_duration_sec"] = round(time.monotonic() - detection_started, 2)
+        result["reused_concurrent_result"] = False
+        _multi_device_detection_cache = result
+        _multi_device_detection_cache_at = time.monotonic()
+        logger.info(
+            "Hongguo multi-device login detection completed: online=%d logged_in=%d duration=%.2fs",
+            result["online_count"],
+            result["logged_in_count"],
+            result["check_duration_sec"],
+        )
+        return result
 
 
 @router.post("/multi/tasks")
