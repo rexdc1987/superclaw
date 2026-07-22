@@ -1536,6 +1536,15 @@ class TestHongguoPlaybackHeuristics:
         title = ops._choose_title("一品布衣2", ["一品布衣2", "一品布衣2：烽火篇", "一品布衣", "历史古代", "8.9分"])
         assert title == "一品布衣2：烽火篇"
 
+    def test_choose_title_maps_numeric_one_to_first_season(self):
+        ops = HongguoOperations(object())
+        titles = ["爆剧", "万妖图录传第一季", "万妖图录传第九季", "热播榜 No.1"]
+
+        assert ops._choose_title("万妖图录传1", titles) == "万妖图录传第一季"
+        assert ops._strict_title_matches("万妖图录传1", "万妖图录传第一季") is True
+        assert ops._strict_title_matches("万妖图录传1", "万妖图录传第九季") is False
+        assert ops._title_matches("万妖图录传1", "万妖图录传10") is False
+
     def test_choose_title_rejects_topic_video_result(self):
         ops = HongguoOperations(object())
         title = ops._choose_title(
@@ -3394,6 +3403,14 @@ class TestHongguoEngineWaits:
             "逆命谋臣",
             ["逆命谋臣：从赘婿到帝王"],
         ) == "逆命谋臣：从赘婿到帝王"
+
+    def test_choose_title_maps_numeric_one_to_first_season(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        titles = ["爆剧", "万妖图录传第九季", "热播榜 No.1", "万妖图录传第一季"]
+
+        assert engine._choose_title("万妖图录传1", titles) == "万妖图录传第一季"
+        assert engine._strict_title_matches("万妖图录传1", "万妖图录传第一季") is True
+        assert engine._strict_title_matches("万妖图录传1", "万妖图录传第九季") is False
 
     def test_choose_title_prefers_first_season_for_base_keyword(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")

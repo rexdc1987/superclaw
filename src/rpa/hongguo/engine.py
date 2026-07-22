@@ -2491,7 +2491,7 @@ class TaskEngine:
         match = re.search(r"第([一二三四五六七八九十\d]+)季", value)
         if match:
             return self._canonical_season_number(match.group(1))
-        shorthand = re.search(r"(.+?)([2-9])$", value)
+        shorthand = re.search(r"(.+?)([1-9])$", value)
         return shorthand.group(2) if shorthand else ""
 
     def _season_stem_matches(self, keyword_key: str, title_key: str) -> bool:
@@ -2503,7 +2503,7 @@ class TaskEngine:
 
     def _title_stem(self, value: str) -> str:
         stem = re.sub(r"第[一二三四五六七八九十\d]+季", "", value)
-        return re.sub(r"([^\d])([2-9])$", r"\1", stem)
+        return re.sub(r"([^\d])([1-9])$", r"\1", stem)
 
     def _canonical_season_number(self, value: str) -> str:
         text = str(value or "").strip()
