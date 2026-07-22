@@ -478,6 +478,30 @@ class TaskEngine:
                         f"全流程v3: 第{episode}集冷启动恢复后准备评论，当前集={current or 0}，"
                         f"暂停播放={paused}，评论面板={panel_ready}",
                     )
+                    if not panel_ready and current and current != episode:
+                        self._log(
+                            "warn",
+                            f"全流程v3: 第{episode}集冷启动评论重试时实际已到第{current}集，"
+                            "最后一次恢复目标集",
+                        )
+                        recovered = self._recover_to_verified_episode(
+                            ops,
+                            task,
+                            episode,
+                            expected_total,
+                            f"冷启动评论重试时实际集数已变为第{current}集",
+                            allow_reopen=True,
+                        )
+                        confirmed = self._confirm_current_episode(ops, episode) if recovered else 0
+                        if recovered and (confirmed == 0 or confirmed == episode):
+                            paused = ops.pause_playback_if_playing()
+                            panel_ready = ops.prepare_comment_window(episode)
+                            current = self._confirm_current_episode(ops, episode)
+                            self._log(
+                                "info" if panel_ready else "error",
+                                f"全流程v3: 第{episode}集最终恢复后准备评论，当前集={current or 0}，"
+                                f"暂停播放={paused}，评论面板={panel_ready}",
+                            )
             if not panel_ready:
                 failed_path = ops.take_screenshot(f"ep{episode}_comment_panel_open_failed", self.screenshot_dir)
                 resumed = ops.resume_playback_safely()

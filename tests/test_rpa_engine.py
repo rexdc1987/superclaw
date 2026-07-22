@@ -1021,7 +1021,7 @@ class TestHongguoPlaybackHeuristics:
         ops.d = device
         panel_states = iter([False] * 5 + [True])
         with patch.object(ops, "_recover_anr_dialog"):
-            with patch.object(ops, "_comment_panel_open", side_effect=lambda: next(panel_states)):
+            with patch.object(ops, "_comment_panel_open", side_effect=lambda *_: next(panel_states)):
                 with patch.object(ops, "_exists", return_value=False):
                     with patch.object(ops, "_playback_visible", return_value=True):
                         with patch("rpa.hongguo.operations.time.sleep"):
@@ -1031,24 +1031,93 @@ class TestHongguoPlaybackHeuristics:
     def test_open_comment_panel_waits_for_anr_and_reuses_open_panel(self):
         ops = HongguoOperations(object())
         with patch.object(ops, "_recover_anr_dialog", return_value=True) as recover:
-            with patch.object(ops, "_comment_panel_open", return_value=True):
-                assert ops._open_comment_panel() is True
+            with patch.object(ops, "_close_xiaoguo_ai_panel", return_value=False):
+                with patch.object(ops, "_comment_panel_open", return_value=True):
+                    assert ops._open_comment_panel() is True
         recover.assert_called_once()
+
+    def test_xiaoguo_ai_panel_is_not_mistaken_for_comment_panel(self):
+        ops = HongguoOperations(object())
+        xml = 'text="小果AI" text="说点什么" text="还想了解什么" text="发送"'
+
+        assert ops._xiaoguo_ai_panel_open(xml) is True
+        assert ops._comment_panel_open(xml) is False
+
+    def test_open_comment_panel_closes_xiaoguo_ai_after_wrong_coordinate_tap(self):
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 720, 1280
+        ops.d = MagicMock()
+        xml_states = iter(
+            [
+                'text="第6集" text="全屏观看"',
+                'text="小果AI" text="还想了解什么" text="发送"',
+                'text="第6集" text="全屏观看"',
+                'text="有趣评论" text="说点什么"',
+            ]
+        )
+        with patch.object(ops, "_xml", side_effect=lambda: next(xml_states)):
+            with patch.object(ops, "_recover_anr_dialog"):
+                with patch.object(ops, "_comment_button_obstructed", return_value=False):
+                    with patch("rpa.hongguo.operations.time.sleep"):
+                        assert ops._open_comment_panel_by_coordinate() is True
+
+        ops.d.press.assert_called_once_with("back")
+        assert ops.d.click.call_count == 2
 
     def test_verify_comment_reopens_stale_comment_panel_before_succeeding(self):
         ops = HongguoOperations(object())
         with patch.object(ops, "d"):
-            with patch.object(ops, "ensure_playback_page", return_value=True):
-                with patch.object(ops, "prepare_comment_window", return_value=True) as prepare_panel:
-                    with patch.object(ops, "_sleep"):
-                        with patch.object(ops, "_exists", side_effect=[False, True]):
-                            with patch.object(ops, "_xml", return_value=""):
-                                with patch.object(ops, "take_screenshot", return_value="scan.png"):
-                                    with patch.object(ops, "_close_comment_panel"):
-                                        with patch("rpa.hongguo.operations.time.sleep"):
-                                            result = ops.verify_comment("一步一步修炼变强的过程太爽了", 9, "C:/tmp")
+            with patch.object(ops, "_comment_panel_open", return_value=False):
+                with patch.object(ops, "ensure_playback_page", return_value=True):
+                    with patch.object(ops, "prepare_comment_window", return_value=True) as prepare_panel:
+                        with patch.object(ops, "_sleep"):
+                            with patch.object(ops, "_exists", side_effect=[False, True]):
+                                with patch.object(ops, "_xml", return_value=""):
+                                    with patch.object(ops, "take_screenshot", return_value="scan.png"):
+                                        with patch.object(ops, "_close_comment_panel"):
+                                            with patch("rpa.hongguo.operations.time.sleep"):
+                                                result = ops.verify_comment("一步一步修炼变强的过程太爽了", 9, "C:/tmp")
         assert result["verified"] is True
         assert prepare_panel.call_count == 2
+
+    def test_verify_comment_reuses_panel_left_open_after_send(self):
+        ops = HongguoOperations(object())
+        with patch.object(ops, "d") as device:
+            with patch.object(ops, "_login_prompt_visible", return_value=False):
+                with patch.object(ops, "_comment_panel_open", return_value=True):
+                    with patch.object(ops, "ensure_playback_page") as ensure_page:
+                        with patch.object(ops, "prepare_comment_window") as prepare_panel:
+                            with patch.object(ops, "_exists", return_value=True):
+                                with patch.object(ops, "take_screenshot", return_value="verified.png"):
+                                    with patch.object(ops, "_close_comment_panel"):
+                                        result = ops.verify_comment("刚发出的评论内容", 9, "C:/tmp")
+
+        assert result == {"verified": True, "screenshot_path": "verified.png"}
+        ensure_page.assert_called_once_with(9)
+        prepare_panel.assert_not_called()
+        device.assert_called_with(textContains="刚发出的评论内容")
+
+    def test_post_comment_keeps_panel_open_for_immediate_verification(self):
+        ops = HongguoOperations(object())
+        selector = MagicMock()
+        with patch.object(ops, "d", return_value=selector):
+            with patch.object(ops, "exit_fullscreen"):
+                with patch.object(ops, "_open_comment_panel", return_value=True):
+                    with patch.object(ops, "_login_prompt_visible", return_value=False):
+                        with patch.object(ops, "_comment_panel_open", return_value=True):
+                            with patch.object(ops, "_focus_comment_input", return_value=True):
+                                with patch.object(ops, "_exists", return_value=True):
+                                    with patch.object(
+                                        ops,
+                                        "_set_input_text",
+                                        return_value={"success": True, "actual_text": "测试评论"},
+                                    ):
+                                        with patch.object(ops, "_sleep"):
+                                            with patch.object(ops, "_close_comment_panel") as close_panel:
+                                                result = ops.post_comment("测试评论")
+
+        assert result == {"success": True, "message": "评论已发送"}
+        close_panel.assert_not_called()
 
     def test_close_comment_panel_never_presses_back_more_than_once(self):
         ops = HongguoOperations(object())
@@ -2949,15 +3018,63 @@ def test_comment_panel_toggles_layout_when_reward_overlay_blocks_button():
     ops.width, ops.height = 720, 1280
     ops.d = MagicMock()
     with patch.object(ops, "_comment_button_obstructed", return_value=True):
-        with patch.object(ops, "_comment_panel_open", return_value=True):
+        with patch.object(ops, "_player_layout_toggle_point", return_value=(660, 1224)):
+            with patch.object(ops, "_comment_button_point", return_value=(666, 760)):
+                with patch.object(ops, "_comment_panel_open", return_value=True):
+                    with patch("rpa.hongguo.operations.time.sleep"):
+                        assert ops._open_comment_panel_by_coordinate() is True
+
+    assert ops.d.click.call_args_list == [
+        call(660, 1224),
+        call(660, 1224),
+        call(666, 760),
+    ]
+    ops.d.press.assert_not_called()
+
+
+def test_player_layout_toggle_point_uses_current_player_control_bounds():
+    ops = HongguoOperations(object())
+    ops.width, ops.height = 720, 1280
+    xml = (
+        '<node resource-id="com.phoenix.read:id/e_o" class="android.widget.LinearLayout" '
+        'bounds="[632,1196][688,1252]" />'
+    )
+
+    assert ops._player_layout_toggle_point(xml) == (660, 1224)
+
+
+def test_hidden_comment_action_rail_is_restored_before_clicking_comment():
+    ops = HongguoOperations(object())
+    ops.width, ops.height = 720, 1280
+    ops.d = MagicMock()
+    hidden_xml = (
+        '<node text="选集" />'
+        '<node resource-id="com.phoenix.read:id/e_o" bounds="[632,1196][688,1252]" />'
+    )
+    visible_xml = (
+        '<node resource-id="com.phoenix.read:id/cdw" clickable="true" '
+        'bounds="[620,707][712,832]" />'
+    )
+    xml_states = iter([hidden_xml, visible_xml, '<node text="有趣评论" />'])
+
+    with patch.object(ops, "_xml", side_effect=lambda: next(xml_states)):
+        with patch.object(ops, "_comment_button_obstructed", return_value=False):
             with patch("rpa.hongguo.operations.time.sleep"):
                 assert ops._open_comment_panel_by_coordinate() is True
 
-    assert ops.d.click.call_args_list == [
-        call(662, 1222),
-        call(662, 1222),
-        call(666, 768),
-    ]
+    assert ops.d.click.call_args_list == [call(660, 1224), call(666, 769)]
+
+
+def test_close_live_lite_page_uses_visible_back_arrow_first():
+    ops = HongguoOperations(object())
+    ops.width, ops.height = 720, 1280
+    ops.d = MagicMock()
+    with patch.object(ops, "_live_lite_activity_active", side_effect=[True, False]):
+        with patch("rpa.hongguo.operations.time.sleep"):
+            assert ops._close_live_lite_page() is True
+
+    ops.d.click.assert_called_once_with(50, 89)
+    ops.d.press.assert_not_called()
 
 
 def test_comment_button_obstruction_detects_reward_compose_layer():
@@ -3035,6 +3152,35 @@ def test_comment_panel_cold_restarts_after_repeated_overlay_obstruction():
     assert ops.prepare_comment_window.call_count == 3
     assert any("冷启动后恢复" in call.args[4] for call in engine._recover_to_verified_episode.call_args_list)
     ops.post_comment.assert_called_once_with("好看", 14)
+
+
+def test_comment_panel_cold_restart_recovers_episode_drift_once_more():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._confirm_current_episode = MagicMock(side_effect=[4, 4, 4, 5, 4, 4])
+    ops = MagicMock()
+    ops.pause_playback_if_playing.return_value = True
+    ops.prepare_comment_window.side_effect = [False, False, False, True]
+    ops.restart_app.return_value = True
+    ops.get_current_episode.return_value = 4
+    ops.post_comment.return_value = {"success": True}
+    ops.verify_comment.return_value = {"verified": True, "screenshot_path": "verified.png"}
+    ops.is_playback_paused.return_value = False
+
+    with patch.object(CommentGenerator, "generate_with_usage", return_value=("好看", "local", None)):
+        with patch.object(engine, "_save_record"):
+            with patch.object(engine, "_increment_counter"):
+                with patch.object(engine, "_restore_playback_after_comment"):
+                    engine._handle_verified_comment(ops, {}, "万妖图录传第八季", 4, 109)
+
+    assert engine._recover_to_verified_episode.call_count == 3
+    assert ops.prepare_comment_window.call_count == 4
+    assert any(
+        "冷启动评论重试时实际集数已变为第5集" in call.args[4]
+        for call in engine._recover_to_verified_episode.call_args_list
+    )
+    ops.post_comment.assert_called_once_with("好看", 4)
 
 
 def test_final_comment_compensation_retries_without_incrementing_sent_count():

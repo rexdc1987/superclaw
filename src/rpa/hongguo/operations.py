@@ -1593,7 +1593,12 @@ class HongguoOperations:
     def _close_live_lite_page(self) -> bool:
         if not self._live_lite_activity_active():
             return False
-        for x_ratio, y_ratio in ((0.94, 0.04), (0.94, 0.07), (0.90, 0.05)):
+        for x_ratio, y_ratio in (
+            (0.07, 0.07),
+            (0.94, 0.04),
+            (0.94, 0.07),
+            (0.90, 0.05),
+        ):
             try:
                 self.d.click(int(self.width * x_ratio), int(self.height * y_ratio))
                 time.sleep(1)
@@ -1610,6 +1615,7 @@ class HongguoOperations:
 
     def _open_comment_panel(self, timeout: float = 2, prefer_coordinate: bool = False) -> bool:
         self._recover_anr_dialog()
+        self._close_xiaoguo_ai_panel()
         if self._comment_panel_open():
             return True
         if prefer_coordinate and self._open_comment_panel_by_coordinate():
@@ -1621,7 +1627,11 @@ class HongguoOperations:
                 for _ in range(4):
                     time.sleep(0.5)
                     self._recover_anr_dialog()
-                    if self._comment_panel_open():
+                    xml = self._xml()
+                    if self._xiaoguo_ai_panel_open(xml):
+                        self._close_xiaoguo_ai_panel(xml)
+                        break
+                    if self._comment_panel_open(xml):
                         return True
         if (self._playback_visible() or self._short_series_activity_active()) and self._open_comment_panel_by_coordinate():
             return True
@@ -1630,15 +1640,41 @@ class HongguoOperations:
     def _open_comment_panel_by_coordinate(self) -> bool:
         # Surface-rendered playback pages do not always expose the comment
         # bubble in the hierarchy. Try its stable right-side positions first.
-        if self._comment_button_obstructed():
+        xml = self._xml()
+        if self._comment_button_obstructed(xml):
             return self._open_comment_after_layout_toggle()
+        if self._comment_action_rail_hidden(xml):
+            toggle_point = self._player_layout_toggle_point(xml)
+            if not toggle_point:
+                return False
+            self.d.click(*toggle_point)
+            time.sleep(0.8)
+            xml = self._xml()
+            if self._comment_action_rail_hidden(xml):
+                return False
+
+        comment_point = self._comment_button_point(xml)
+        if comment_point:
+            self.d.click(*comment_point)
+            for _ in range(4):
+                time.sleep(0.4)
+                xml = self._xml()
+                if self._xiaoguo_ai_panel_open(xml):
+                    self._close_xiaoguo_ai_panel(xml)
+                    break
+                if self._comment_panel_open(xml):
+                    return True
         y_ratios = (0.60, 0.64, 0.67) if self.width <= 760 else (0.67, 0.64, 0.60)
         for y_ratio in y_ratios:
             self.d.click(int(self.width * 0.94), int(self.height * y_ratio))
             for _ in range(3):
                 time.sleep(0.4)
                 self._recover_anr_dialog()
-                if self._comment_panel_open():
+                xml = self._xml()
+                if self._xiaoguo_ai_panel_open(xml):
+                    self._close_xiaoguo_ai_panel(xml)
+                    break
+                if self._comment_panel_open(xml):
                     return True
         return False
 
@@ -1662,24 +1698,70 @@ class HongguoOperations:
                 return True
         return False
 
+    def _comment_button_point(self, xml: Optional[str] = None) -> Optional[tuple[int, int]]:
+        xml = self._xml() if xml is None else xml
+        if not isinstance(xml, str):
+            return None
+        for node in re.findall(r"<node\b[^>]+>", xml or ""):
+            if not any(f'resource-id="{resource_id}"' in node for resource_id in COMMENT_BUTTON_IDS):
+                continue
+            bounds = self._node_bounds(node)
+            if bounds:
+                left, top, right, bottom = bounds
+                return ((left + right) // 2, (top + bottom) // 2)
+        return None
+
+    def _comment_action_rail_hidden(self, xml: Optional[str] = None) -> bool:
+        xml = self._xml() if xml is None else xml
+        if not isinstance(xml, str) or not xml or any(resource_id in xml for resource_id in COMMENT_BUTTON_IDS):
+            return False
+        return self._player_layout_toggle_point(xml) is not None
+
     def _open_comment_after_layout_toggle(self) -> bool:
         # The reward widget can install a transparent Compose touch layer over
-        # the comment bubble. Toggling the player layout clears that layer long
-        # enough to open comments without interacting with the reward page.
-        toggle_x = int(self.width * 0.92)
-        toggle_y = int(self.height * 0.955)
-        self.d.click(toggle_x, toggle_y)
-        time.sleep(0.4)
-        self.d.click(toggle_x, toggle_y)
-        time.sleep(0.35)
+        # the comment bubble. Rebuilding the player layout can clear it. Back
+        # is unsafe here because it exits ShortSeriesActivity to SearchActivity.
+        toggle_point = self._player_layout_toggle_point()
+        if not toggle_point:
+            toggle_point = (int(self.width * 0.92), int(self.height * 0.955))
+        self.d.click(*toggle_point)
+        time.sleep(0.5)
+        self.d.click(*toggle_point)
+        time.sleep(0.5)
 
-        for y_ratio in (0.60, 0.64):
-            self.d.click(int(self.width * 0.925), int(self.height * y_ratio))
+        xml = self._xml()
+        comment_point = self._comment_button_point(xml)
+        points = [comment_point] if comment_point else []
+        points.extend(
+            (int(self.width * 0.925), int(self.height * y_ratio))
+            for y_ratio in (0.58, 0.60, 0.64, 0.67)
+        )
+        for point in points:
+            if point is None:
+                continue
+            self.d.click(*point)
             for _ in range(4):
                 time.sleep(0.4)
-                if self._comment_panel_open():
+                xml = self._xml()
+                if self._xiaoguo_ai_panel_open(xml):
+                    self._close_xiaoguo_ai_panel(xml)
+                    break
+                if self._comment_panel_open(xml):
                     return True
         return False
+
+    def _player_layout_toggle_point(self, xml: Optional[str] = None) -> Optional[tuple[int, int]]:
+        xml = self._xml() if xml is None else xml
+        for node in re.findall(r"<node\b[^>]+>", xml or ""):
+            if 'resource-id="com.phoenix.read:id/e_o"' not in node:
+                continue
+            bounds = self._node_bounds(node)
+            if not bounds:
+                continue
+            left, top, right, bottom = bounds
+            if left >= self.width * 0.75 and top >= self.height * 0.82:
+                return ((left + right) // 2, (top + bottom) // 2)
+        return None
 
     def exit_fullscreen(self) -> bool:
         if not self._short_series_activity_active():
@@ -1731,12 +1813,20 @@ class HongguoOperations:
             return True
         if self._ad_continue_visible():
             return False
+        if episode_number:
+            current = self.get_current_episode()
+            if current and current != episode_number:
+                return False
 
         # Under multi-instance load the first coordinate tap can only reveal
         # Surface controls. Normalize the layout and make one final panel try.
         self.exit_fullscreen()
         self._reveal_playback_controls()
         time.sleep(0.8)
+        if episode_number:
+            current = self.get_current_episode()
+            if current and current != episode_number:
+                return False
         return self._open_comment_panel(5, prefer_coordinate=True)
 
     def post_comment(self, content: str, episode_number: int = 0) -> Dict[str, Any]:
@@ -1786,7 +1876,6 @@ class HongguoOperations:
                     self._sleep(2, 3)
                     if self._login_prompt_visible():
                         return {"success": False, "message": "当前红果实例未登录，评论发送被登录页拦截"}
-                    self._close_comment_panel()
                     return {"success": True, "message": "评论已发送"}
             return {"success": False, "message": "未找到评论发送按钮"}
         except Exception as exc:
@@ -1801,7 +1890,8 @@ class HongguoOperations:
                     "screenshot_path": screenshot_path,
                     "message": "当前红果实例未登录，无法验证评论",
                 }
-            if episode_number and not self.ensure_playback_page(episode_number):
+            panel_ready = self._comment_panel_open()
+            if episode_number and not panel_ready and not self.ensure_playback_page(episode_number):
                 time.sleep(1)
                 if not self.ensure_playback_page(episode_number):
                     return {
@@ -1809,7 +1899,7 @@ class HongguoOperations:
                         "screenshot_path": screenshot_path,
                         "message": f"未回到第{episode_number}集播放页",
                     }
-            if not self.prepare_comment_window(episode_number):
+            if not panel_ready and not self.prepare_comment_window(episode_number):
                 return {"verified": False, "screenshot_path": "", "message": "未找到评论按钮"}
             self._sleep(2, 3)
             search_key = content[:8] if len(content) > 8 else content
@@ -3086,8 +3176,25 @@ class HongguoOperations:
             return False
         return True
 
-    def _comment_panel_open(self) -> bool:
-        xml = self._xml()
+    def _xiaoguo_ai_panel_open(self, xml: Optional[str] = None) -> bool:
+        xml = self._xml() if xml is None else xml
+        return "小果AI" in xml and any(marker in xml for marker in ("还想了解什么", "发送"))
+
+    def _close_xiaoguo_ai_panel(self, xml: Optional[str] = None) -> bool:
+        xml = self._xml() if xml is None else xml
+        if not self._xiaoguo_ai_panel_open(xml):
+            return False
+        try:
+            self.d.press("back")
+            time.sleep(0.8)
+        except Exception:
+            return False
+        return not self._xiaoguo_ai_panel_open()
+
+    def _comment_panel_open(self, xml: Optional[str] = None) -> bool:
+        xml = self._xml() if xml is None else xml
+        if self._xiaoguo_ai_panel_open(xml):
+            return False
         return any(text in xml for text in ["有趣评论", "说点什么", "条评论", "写评论"])
 
     def _login_prompt_visible(self, xml: Optional[str] = None) -> bool:
