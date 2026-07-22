@@ -321,12 +321,69 @@ def _mumu_adb_addr_from_bridge(index: str, android_version: str) -> Tuple[str, D
     return "", attempt
 
 
+def _discover_mumu_instances_from_config(connect_adb: bool = True) -> List[Dict[str, Any]]:
+    """Recover local MuMu instances when MuMuManager RPC is unavailable."""
+    vm_root = DEFAULT_MUMU_ROOT / "vms"
+    try:
+        vm_dirs = list(vm_root.iterdir())
+    except OSError:
+        return []
+
+    online_addrs = discover_online_addrs()
+    instances: List[Dict[str, Any]] = []
+    for vm_dir in vm_dirs:
+        if not vm_dir.is_dir():
+            continue
+        match = re.fullmatch(r"MuMuPlayer-(\d+(?:\.\d+)?)-(\d+)", vm_dir.name)
+        if not match:
+            continue
+        android_version, index = match.groups()
+        configured_ports = _mumu_configured_ports(index, android_version)
+        addr = _mumu_adb_addr_from_devices(configured_ports, online_addrs)
+        port_attempts: List[Dict[str, Any]] = []
+        if not addr and connect_adb and configured_ports:
+            addr, port_attempts = _mumu_adb_addr_from_configured_ports(configured_ports)
+            if addr:
+                online_addrs = discover_online_addrs()
+
+        extra_config = _read_json(vm_dir / "configs" / "extra_config.json")
+        name = str(extra_config.get("playerName") or f"MuMu #{index}")
+        port_is_open = any(bool(item.get("port_open")) for item in port_attempts)
+        is_started = bool(addr or port_is_open)
+        message = "ADB connected via local MuMu config" if addr else "MuMu instance is not running"
+        instances.append(
+            {
+                "index": index,
+                "name": name,
+                "android_version": android_version,
+                "is_process_started": is_started,
+                "is_android_started": bool(addr),
+                "addr": addr,
+                "adb_ready": bool(addr),
+                "adb_message": message,
+                "configured_adb_ports": configured_ports,
+                "adb_port_attempts": port_attempts,
+                "bridge_attempt": {},
+                "info": {
+                    "index": index,
+                    "name": name,
+                    "android_version": android_version,
+                    "is_process_started": is_started,
+                    "is_android_started": bool(addr),
+                    "info_source": "local_config_fallback",
+                },
+                "connect": {},
+            }
+        )
+    return sorted(instances, key=lambda item: int(item["index"]))
+
+
 def discover_mumu_instances(connect_adb: bool = True) -> List[Dict[str, Any]]:
     """Discover MuMu multi-player instances through MuMuManager."""
     info_result = _run_mumu_manager(["info", "--vmindex", "all"])
     data = info_result.get("data")
     if not info_result.get("success") or not isinstance(data, dict):
-        return []
+        return _discover_mumu_instances_from_config(connect_adb=connect_adb)
 
     connect_data: Dict[str, Any] = {}
     if connect_adb:

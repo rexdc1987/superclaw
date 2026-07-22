@@ -55,6 +55,42 @@ def test_check_connection_accepts_online_adb_device_without_device_info():
     connect_device.assert_not_called()
 
 
+def test_discover_mumu_instances_falls_back_to_local_config(tmp_path):
+    from rpa.hongguo import device as device_module
+
+    mumu_root = tmp_path / "MuMu"
+    vm_dir = mumu_root / "vms" / "MuMuPlayer-15.0-2" / "configs"
+    vm_dir.mkdir(parents=True)
+    (vm_dir / "vm_config.json").write_text(
+        json.dumps({"vm": {"nat": {"port_forward": {"adb": {"host_port": "16448"}}}}}),
+        encoding="utf-8",
+    )
+    (vm_dir / "extra_config.json").write_text(
+        json.dumps({"playerName": "redmiK70pro"}),
+        encoding="utf-8",
+    )
+
+    with patch.object(device_module, "DEFAULT_MUMU_ROOT", mumu_root):
+        with patch.object(
+            device_module,
+            "_run_mumu_manager",
+            return_value={"success": False, "message": "RPC unavailable"},
+        ):
+            with patch.object(
+                device_module,
+                "discover_online_addrs",
+                return_value=["127.0.0.1:16448"],
+            ):
+                instances = device_module.discover_mumu_instances(connect_adb=False)
+
+    assert len(instances) == 1
+    assert instances[0]["index"] == "2"
+    assert instances[0]["name"] == "redmiK70pro"
+    assert instances[0]["addr"] == "127.0.0.1:16448"
+    assert instances[0]["adb_ready"] is True
+    assert instances[0]["info"]["info_source"] == "local_config_fallback"
+
+
 def test_hongguo_task_device_addr_prefers_bound_instance():
     from rpa.dashboard import routes_hongguo
 
