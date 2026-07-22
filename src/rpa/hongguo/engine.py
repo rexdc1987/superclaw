@@ -857,6 +857,45 @@ class TaskEngine:
             if not self._has_playback_context(state):
                 if self._restore_foreground_if_needed(ops, episode):
                     time.sleep(2)
+                    restored_state = self._page_state(ops, task)
+                    restored_app = restored_state.get("app") or {}
+                    restored_current = int(restored_state.get("current_episode") or 0)
+                    restored_total = int(restored_state.get("total_episodes") or 0)
+                    restored_playback = (
+                        restored_app.get("activity") == SHORT_SERIES_ACTIVITY
+                        and self._has_playback_context(restored_state)
+                        and not self._total_mismatch_is_fatal(
+                            ops,
+                            task,
+                            restored_state,
+                            expected_total,
+                            restored_total,
+                            current=restored_current,
+                            target=target,
+                        )
+                    )
+                    if restored_playback and restored_current == target:
+                        self._log("info", f"全流程v3: 拉回红果前台后已进入第{target}集")
+                        return True
+                    if restored_playback and restored_current in (0, episode):
+                        advanced = bool(ops.play_episode(target))
+                        self._log(
+                            "info" if advanced else "warn",
+                            f"全流程v3: 拉回红果前台后直接切换第{target}集={advanced}",
+                        )
+                        if advanced:
+                            return True
+                    if (
+                        restored_playback
+                        and restored_current > target
+                        and not self._pending_comment_episodes_between(task, target, restored_current)
+                    ):
+                        self._log(
+                            "info",
+                            f"全流程v3: 拉回红果前台后已播放到第{restored_current}集，"
+                            f"第{target}-{restored_current - 1}集无待评论任务，顺延观察",
+                        )
+                        return True
                     if self._recover_to_verified_episode(
                         ops,
                         task,
@@ -925,6 +964,20 @@ class TaskEngine:
                                     f"全流程v3: 关闭红果内部直播页后回到第{restored_current or episode}集，"
                                     f"主动切换第{target}集={advanced}",
                                 )
+                                if not advanced:
+                                    resume = getattr(ops, "resume_playback_safely", None)
+                                    resumed = bool(resume()) if callable(resume) else False
+                                    self._log(
+                                        "info" if resumed else "warn",
+                                        f"全流程v3: 直播页关闭后目标集直切未确认，先恢复上一集播放={resumed}，"
+                                        f"再次尝试第{target}集",
+                                    )
+                                    time.sleep(1)
+                                    advanced = bool(ops.play_episode(target))
+                                    self._log(
+                                        "info" if advanced else "warn",
+                                        f"全流程v3: 直播页关闭后第二次主动切换第{target}集={advanced}",
+                                    )
                                 if advanced:
                                     return True
                                 if self._recover_to_verified_episode(
@@ -1284,6 +1337,12 @@ class TaskEngine:
                         return True
             except RuntimeError as exc:
                 self._log("warn", f"全流程v3: 常规恢复第{target}集失败: {exc}")
+                if any(marker in str(exc) for marker in ("总集数不匹配", "非目标合集")):
+                    self._log(
+                        "info",
+                        f"全流程v3: 第{target}集已确认是错误合集，跳过重复常规恢复并重新搜索",
+                    )
+                    break
             if attempt == 0:
                 time.sleep(2)
 
@@ -2526,16 +2585,34 @@ class TaskEngine:
         manager = TaskEngineManager.get_instance()
         return dict(manager.ai_config or self.ai_config or {})
 
+    @staticmethod
+    def _structured_log_context(message: str) -> tuple[Optional[int], Optional[str]]:
+        text = str(message or "")
+        episode_match = re.search(r"第\s*(\d+)\s*集", text)
+        screenshot_match = re.search(r"(?:已截图|截图)\s+([^，,\s]+)", text)
+        episode = int(episode_match.group(1)) if episode_match else None
+        screenshot_path = screenshot_match.group(1).rstrip("。.;；") if screenshot_match else None
+        return episode, screenshot_path
+
     def _log(self, level: str, message: str) -> None:
+        episode_number, screenshot_path = self._structured_log_context(message)
         try:
             with self._connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO hongguo_execution_logs (task_id, level, message, created_at)
-                        VALUES (%s, %s, %s, %s)
+                        INSERT INTO hongguo_execution_logs (
+                            task_id, level, message, episode_number, screenshot_path, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
                         """,
-                        (self.task_id, level, message, datetime.now()),
+                        (
+                            self.task_id,
+                            level,
+                            message,
+                            episode_number,
+                            screenshot_path,
+                            datetime.now(),
+                        ),
                     )
         except Exception:
             pass

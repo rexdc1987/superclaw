@@ -32,6 +32,20 @@ def test_connect_exact_does_not_block_on_device_info():
     fake_u2.connect.assert_called_once_with("192.168.3.209:5555")
 
 
+def test_hongguo_log_context_extracts_episode_and_screenshot_path():
+    from rpa.hongguo.engine import TaskEngine
+
+    message = "全流程v3: 第82集后出现广告，已截图 E:/screenshots/82_ad.png，跳过广告=True"
+
+    assert TaskEngine._structured_log_context(message) == (82, "E:/screenshots/82_ad.png")
+
+
+def test_hongguo_log_context_allows_task_level_messages():
+    from rpa.hongguo.engine import TaskEngine
+
+    assert TaskEngine._structured_log_context("全流程v3: 任务执行完成") == (None, None)
+
+
 def test_check_connection_accepts_online_adb_device_without_device_info():
     from rpa.hongguo import device as device_module
 
@@ -2575,7 +2589,7 @@ class TestHongguoPlaybackHeuristics:
                                     with patch("rpa.hongguo.operations.time.sleep"):
                                         assert ops.ensure_playback_page(17) is True
 
-        ops.d.click.assert_called_with(846, 64)
+        ops.d.click.assert_called_with(63, 112)
 
 
 class TestHongguoLoginDetails:
@@ -3592,6 +3606,24 @@ class TestHongguoEngineWaits:
 
         assert events == ["detect_live", "close_live", "open_search"]
 
+    def test_recover_to_verified_episode_skips_duplicate_retry_for_wrong_collection(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        ops = MagicMock()
+        ops.ensure_playback_page.side_effect = RuntimeError("切集时短剧总集数不匹配: 期望 109，实际 85")
+        engine._reopen_target_episode = MagicMock(return_value=True)
+
+        assert engine._recover_to_verified_episode(
+            ops,
+            {"drama_name": "万妖图录传8"},
+            14,
+            109,
+            "前台恢复后校验失败",
+        ) is True
+
+        ops.ensure_playback_page.assert_called_once_with(14)
+        engine._reopen_target_episode.assert_called_once_with(ops, {"drama_name": "万妖图录传8"}, 14, 109)
+
     def test_reopen_target_episode_retries_search_after_forcing_main_page(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
         engine._log = MagicMock()
@@ -3817,6 +3849,46 @@ class TestHongguoEngineWaits:
         engine._recover_to_verified_episode.assert_not_called()
         assert any("检测到红果内部直播页" in call.args[1] for call in engine._log.call_args_list)
 
+    def test_verified_next_episode_uses_restored_foreground_before_full_recovery(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._restore_foreground_if_needed = MagicMock(return_value=True)
+        engine._recover_to_verified_episode = MagicMock(return_value=True)
+        engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+        engine._page_state = MagicMock(
+            side_effect=[
+                {
+                    "current_episode": 0,
+                    "total_episodes": 0,
+                    "app_foreground": False,
+                    "launcher_visible": True,
+                    "hongguo_visible_area_ratio": 0.0,
+                    "app": {"package": "app.lawnchair", "activity": "app.lawnchair.Launcher"},
+                },
+                {
+                    "current_episode": 79,
+                    "total_episodes": 109,
+                    "app_foreground": True,
+                    "launcher_visible": False,
+                    "playback_visible": True,
+                    "app": {
+                        "package": "com.phoenix.read",
+                        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                    },
+                },
+            ]
+        )
+        ops = MagicMock()
+        ops.play_episode.return_value = True
+
+        with patch("rpa.hongguo.engine.time.time", return_value=0):
+            with patch("rpa.hongguo.engine.time.sleep"):
+                assert engine._wait_for_next_episode_verified(ops, {}, 79, 80, 109) is True
+
+        ops.play_episode.assert_called_once_with(80)
+        engine._recover_to_verified_episode.assert_not_called()
+
     def test_verified_next_episode_advances_after_live_lite_returns_to_previous_episode(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
         engine._log = MagicMock()
@@ -3894,8 +3966,50 @@ class TestHongguoEngineWaits:
         with patch("rpa.hongguo.engine.time.sleep"):
             assert engine._wait_for_next_episode_verified(ops, {}, 5, 6, 68) is True
 
-        ops.play_episode.assert_called_once_with(6)
+        assert ops.play_episode.call_args_list == [call(6), call(6)]
+        ops.resume_playback_safely.assert_called_once_with()
         assert "直播页反复拦截自动连播" in engine._recover_to_verified_episode.call_args.args[4]
+
+    def test_verified_next_episode_retries_direct_advance_after_resuming_previous_episode(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._has_playback_context = MagicMock(return_value=True)
+        engine._recover_to_verified_episode = MagicMock(return_value=True)
+        engine._page_state = MagicMock(
+            side_effect=[
+                {
+                    "current_episode": 0,
+                    "total_episodes": 0,
+                    "ad_visible": False,
+                    "app": {
+                        "package": "com.phoenix.read",
+                        "activity": "com.dragon.read.component.biz.impl.live.ui.LiveLiteActivity",
+                    },
+                },
+                {
+                    "current_episode": 5,
+                    "total_episodes": 68,
+                    "playback_visible": True,
+                    "ad_visible": False,
+                    "app": {
+                        "package": "com.phoenix.read",
+                        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                    },
+                },
+            ]
+        )
+        ops = MagicMock()
+        ops._close_live_lite_page.return_value = True
+        ops.play_episode.side_effect = [False, True]
+        ops.resume_playback_safely.return_value = True
+
+        with patch("rpa.hongguo.engine.time.sleep"):
+            assert engine._wait_for_next_episode_verified(ops, {}, 5, 6, 68) is True
+
+        assert ops.play_episode.call_args_list == [call(6), call(6)]
+        ops.resume_playback_safely.assert_called_once_with()
+        engine._recover_to_verified_episode.assert_not_called()
 
     def test_verified_next_episode_falls_back_when_live_lite_cannot_close(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
