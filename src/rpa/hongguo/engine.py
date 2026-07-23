@@ -28,6 +28,7 @@ DEFAULT_SCREENSHOT_ROOT = os.environ.get(
     "SUPERCLAW_SCREENSHOT_ROOT",
     str((Path(__file__).resolve().parents[3] / "screenshots" / "hongguo").as_posix()),
 )
+REGULAR_RECOVERY_BUDGET_SECONDS = 90
 
 
 class TaskEngine:
@@ -157,7 +158,8 @@ class TaskEngine:
             )
             task["execution_plan_json"] = execution_plan_json
             self._log("info", f"全流程v3: 准备完成，短剧={drama_title}，总集数={total}，评论集数={sorted(comment_episodes)}")
-            self._resume_if_paused(ops, 1)
+            if 1 not in comment_episodes or self._comment_already_verified(1):
+                self._resume_if_paused(ops, 1)
 
             for episode in range(1, total + 1):
                 self._check_pause_stop()
@@ -198,20 +200,15 @@ class TaskEngine:
 
                 self._update_task(current_episode=episode, updated_at=datetime.now())
                 self._log("info", f"全流程v3: 正在观察第{episode}集")
-                self._resume_if_paused(ops, episode)
-
-                if episode in comment_episodes:
-                    if self._comment_already_verified(episode):
-                        self._log("info", f"全流程v3: 第{episode}集已有成功评论记录，跳过重复评论")
-                    else:
-                        self._handle_verified_comment(
-                            ops,
-                            task,
-                            drama_title,
-                            episode,
-                            total,
-                            avoid_contents=self._comment_contents_for_batch(),
-                        )
+                if not self._process_comment_episode(
+                    ops,
+                    task,
+                    drama_title,
+                    episode,
+                    total,
+                    comment_episodes,
+                ):
+                    self._resume_if_paused(ops, episode)
 
                 if episode >= total:
                     break
@@ -273,6 +270,30 @@ class TaskEngine:
                 updated_at=completed_at,
             )
             self._log("error", f"任务失败: {exc}")
+
+    def _process_comment_episode(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        drama_title: str,
+        episode: int,
+        expected_total: int,
+        comment_episodes: set[int],
+    ) -> bool:
+        if episode not in comment_episodes:
+            return False
+        if self._comment_already_verified(episode):
+            self._log("info", f"全流程v3: 第{episode}集已有成功评论记录，跳过重复评论")
+            return False
+        self._handle_verified_comment(
+            ops,
+            task,
+            drama_title,
+            episode,
+            expected_total,
+            avoid_contents=self._comment_contents_for_batch(),
+        )
+        return True
 
     def _prepare_verified_playback(self, ops: HongguoOperations, task: Dict[str, Any]) -> Dict[str, Any]:
         keyword = str(task.get("drama_name") or "").strip()
@@ -576,11 +597,19 @@ class TaskEngine:
             self._log("warn", f"全流程v3: 第{episode}集评论验证仍未通过，准备回到目标集重发一次")
             try:
                 if self._recover_to_verified_episode(ops, task, episode, expected_total, "评论验证失败后重发"):
-                    retry_post = ops.post_comment(content, episode)
-                    if retry_post.get("success"):
-                        verify = self._verify_comment_with_retry(ops, task, content, episode, expected_total)
+                    self._log("info", f"全流程v3: 第{episode}集重发前等待评论列表同步并再次验证")
+                    time.sleep(4)
+                    delayed_verify = ops.verify_comment(content, episode, self.screenshot_dir)
+                    if delayed_verify.get("verified"):
+                        verify = delayed_verify
+                        self._log("info", f"全流程v3: 第{episode}集重发前延迟验证成功，取消重发")
                     else:
-                        self._log("warn", f"全流程v3: 第{episode}集评论重发失败 - {retry_post.get('message')}")
+                        self._log("warn", f"全流程v3: 第{episode}集重发前仍未找到评论，执行第2次发送")
+                        retry_post = ops.post_comment(content, episode)
+                        if retry_post.get("success"):
+                            verify = self._verify_comment_with_retry(ops, task, content, episode, expected_total)
+                        else:
+                            self._log("warn", f"全流程v3: 第{episode}集评论重发失败 - {retry_post.get('message')}")
                 else:
                     self._log("warn", f"全流程v3: 第{episode}集评论重发前恢复目标集失败")
             except Exception as exc:
@@ -1367,19 +1396,27 @@ class TaskEngine:
         allow_reopen: bool = True,
     ) -> bool:
         self._log("warn", f"全流程v3: 恢复目标第{target}集，原因={reason}")
+        regular_deadline = time.monotonic() + REGULAR_RECOVERY_BUDGET_SECONDS
         for attempt in range(2):
             self._check_pause_stop()
+            if time.monotonic() >= regular_deadline:
+                self._log("warn", f"全流程v3: 常规恢复第{target}集已用尽90秒总预算，转为重新搜索")
+                break
             if self._skip_ad_if_present(ops):
                 self._log("info", f"全流程v3: 恢复第{target}集前检测到广告，已上滑继续观看")
                 time.sleep(2)
             try:
                 if ops.ensure_playback_page(target):
+                    remaining = regular_deadline - time.monotonic()
+                    if remaining < 20:
+                        self._log("warn", f"全流程v3: 常规恢复第{target}集剩余预算不足20秒，转为重新搜索")
+                        break
                     if self._wait_for_episode_verified(
                         ops,
                         task,
                         target,
                         expected_total,
-                        timeout=45,
+                        timeout=min(45, int(remaining)),
                         allow_reopen=False,
                     ):
                         self._log("info", f"全流程v3: 已恢复到第{target}集")
@@ -1393,6 +1430,9 @@ class TaskEngine:
                     )
                     break
             if attempt == 0:
+                if regular_deadline - time.monotonic() <= 2:
+                    self._log("warn", f"全流程v3: 常规恢复第{target}集总预算即将耗尽，转为重新搜索")
+                    break
                 time.sleep(2)
 
         if not allow_reopen:

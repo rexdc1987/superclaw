@@ -2315,7 +2315,7 @@ class TestHongguoPlaybackHeuristics:
         assert sleep.call_args_list[0] == call(16)
         device.swipe.assert_called_once()
 
-    def test_resume_playback_clicks_center_overlay_without_text(self):
+    def test_resume_playback_clicks_center_overlay_with_play_semantic(self):
         class DummyDevice:
             def __init__(self):
                 self.clicks = []
@@ -2326,7 +2326,8 @@ class TestHongguoPlaybackHeuristics:
             def dump_hierarchy(self):
                 return (
                     '<node package="com.phoenix.read" text="第3集" />'
-                    '<node package="com.phoenix.read" clickable="true" bounds="[386,680][514,808]" />'
+                    '<node package="com.phoenix.read" clickable="true" content-desc="播放" '
+                    'bounds="[386,680][514,808]" />'
                 )
 
             def __call__(self, **kwargs):
@@ -3162,6 +3163,35 @@ def test_comment_panel_failure_resumes_playback_before_task_fails():
     ops.resume_playback_safely.assert_called_once_with()
 
 
+def test_comment_episode_is_processed_before_generic_resume_check():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._comment_already_verified = MagicMock(return_value=False)
+    engine._comment_contents_for_batch = MagicMock(return_value={"已使用"})
+    engine._handle_verified_comment = MagicMock()
+    engine._resume_if_paused = MagicMock()
+    ops = MagicMock()
+
+    processed = engine._process_comment_episode(
+        ops,
+        {"drama_name": "万妖图录传5"},
+        "万妖图录传第五季",
+        20,
+        53,
+        {20, 40},
+    )
+
+    assert processed is True
+    engine._handle_verified_comment.assert_called_once_with(
+        ops,
+        {"drama_name": "万妖图录传5"},
+        "万妖图录传第五季",
+        20,
+        53,
+        avoid_contents={"已使用"},
+    )
+    engine._resume_if_paused.assert_not_called()
+
+
 def test_comment_panel_retry_rechecks_episode_and_recovers_before_failing():
     engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
     engine._log = MagicMock()
@@ -3222,6 +3252,32 @@ def test_comment_generation_falls_back_to_unused_local_text():
 
     fallback.assert_called_once_with("万妖图录传第一季", {"重复评论"})
     ops.post_comment.assert_called_once_with("新的评论", 9)
+
+
+def test_comment_repost_is_cancelled_when_delayed_verification_succeeds():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._confirm_current_episode = MagicMock(return_value=9)
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._verify_comment_with_retry = MagicMock(return_value={"verified": False, "message": "暂未找到"})
+    engine._save_record = MagicMock()
+    engine._increment_counter = MagicMock()
+    engine._restore_playback_after_comment = MagicMock()
+    ops = MagicMock()
+    ops.pause_playback_if_playing.return_value = True
+    ops.prepare_comment_window.return_value = True
+    ops.get_current_episode.return_value = 9
+    ops.take_screenshot.return_value = "C:/tmp/comment.png"
+    ops.post_comment.return_value = {"success": True}
+    ops.verify_comment.return_value = {"verified": True, "screenshot_path": "C:/tmp/delayed.png"}
+
+    with patch.object(CommentGenerator, "generate_with_usage", return_value=("好看", "local", None)):
+        with patch("rpa.hongguo.engine.time.sleep"):
+            engine._handle_verified_comment(ops, {}, "万妖图录传第一季", 9, 81)
+
+    ops.post_comment.assert_called_once_with("好看", 9)
+    ops.verify_comment.assert_called_once_with("好看", 9, "C:/tmp")
+    assert any("延迟验证成功，取消重发" in logged.args[1] for logged in engine._log.call_args_list)
 
 
 def test_comment_contents_for_batch_includes_sibling_tasks():
@@ -3748,6 +3804,29 @@ class TestHongguoEngineWaits:
         ) is True
 
         ops.ensure_playback_page.assert_called_once_with(14)
+        engine._reopen_target_episode.assert_called_once_with(ops, {"drama_name": "万妖图录传8"}, 14, 109)
+
+    def test_recover_to_verified_episode_reopens_when_regular_budget_is_exhausted(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._skip_ad_if_present = MagicMock(return_value=False)
+        engine._wait_for_episode_verified = MagicMock(return_value=True)
+        engine._reopen_target_episode = MagicMock(return_value=True)
+        ops = MagicMock()
+        ops.ensure_playback_page.return_value = True
+
+        with patch("rpa.hongguo.engine.time.monotonic", side_effect=[0, 0, 95]):
+            assert engine._recover_to_verified_episode(
+                ops,
+                {"drama_name": "万妖图录传8"},
+                14,
+                109,
+                "预算测试",
+            ) is True
+
+        ops.ensure_playback_page.assert_called_once_with(14)
+        engine._wait_for_episode_verified.assert_not_called()
         engine._reopen_target_episode.assert_called_once_with(ops, {"drama_name": "万妖图录传8"}, 14, 109)
 
     def test_reopen_target_episode_retries_search_after_forcing_main_page(self):
@@ -4378,6 +4457,46 @@ class TestHongguoEngineWaits:
         )
 
         assert ops._center_play_overlay_visible(xml) is True
+
+    def test_center_pause_control_means_video_is_playing(self):
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 900, 1600
+        ops.d = MagicMock()
+        xml = (
+            '<node package="com.phoenix.read" clickable="true" '
+            'content-desc="暂停" bounds="[400,680][500,780]" />'
+        )
+
+        assert ops._center_play_overlay_visible(xml) is False
+        ops.d.screenshot.assert_not_called()
+
+    def test_center_square_clickable_without_play_icon_is_not_paused(self):
+        from PIL import Image
+
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 900, 1600
+        ops.d = MagicMock()
+        ops.d.screenshot.return_value = Image.new("RGB", (900, 1600), (30, 30, 30))
+        xml = (
+            '<node package="com.phoenix.read" clickable="true" '
+            'bounds="[400,680][500,780]" />'
+        )
+
+        assert ops._center_play_overlay_visible(xml) is False
+
+    def test_center_pause_bars_are_not_mistaken_for_play_triangle(self):
+        from PIL import Image, ImageDraw
+
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 900, 1600
+        ops.d = MagicMock()
+        image = Image.new("RGB", (900, 1600), (30, 30, 30))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((420, 710, 440, 790), fill=(255, 255, 255))
+        draw.rectangle((470, 710, 490, 790), fill=(255, 255, 255))
+        ops.d.screenshot.return_value = image
+
+        assert ops._center_play_overlay_visible('<node package="com.phoenix.read" />') is False
 
     def test_click_play_overlay_falls_back_to_visual_center_button(self):
         from PIL import Image, ImageDraw

@@ -1067,28 +1067,22 @@ class HongguoOperations:
 
     def _click_play_overlay(self) -> bool:
         xml = self._xml()
-        overlay_bounds: List[tuple[int, int, int, int]] = []
-        for node in self._hongguo_nodes(xml):
-            if 'clickable="true"' not in node:
-                continue
-            bounds_match = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
-            if not bounds_match:
-                continue
-            left, top, right, bottom = (int(value) for value in bounds_match.groups())
-            width = right - left
-            height = bottom - top
-            center_x = (left + right) // 2
-            center_y = (top + bottom) // 2
-            if width < 40 or height < 40:
-                continue
-            if abs(center_x - self.width // 2) <= self.width * 0.18 and self.height * 0.28 <= center_y <= self.height * 0.58:
-                overlay_bounds.append((left, top, right, bottom))
-        if not overlay_bounds:
+        candidates = self._center_play_candidates(xml)
+        explicit_play = [bounds for bounds, semantic in candidates if semantic is True]
+        if explicit_play:
+            left, top, right, bottom = min(
+                explicit_play,
+                key=lambda item: (item[2] - item[0]) * (item[3] - item[1]),
+            )
+            self.d.click((left + right) // 2, (top + bottom) // 2)
+            return True
+        if any(semantic is False for _, semantic in candidates):
             return False
-        overlay_bounds.sort(key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))
-        for left, top, right, bottom in overlay_bounds:
-            bounds = (left, top, right, bottom)
-            if self._center_play_icon_visible_by_screenshot(bounds) or self._center_play_bounds_look_like_button(bounds):
+
+        unlabeled_bounds = [bounds for bounds, semantic in candidates if semantic is None]
+        unlabeled_bounds.sort(key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))
+        for left, top, right, bottom in unlabeled_bounds:
+            if self._center_play_icon_visible_by_screenshot((left, top, right, bottom)):
                 self.d.click((left + right) // 2, (top + bottom) // 2)
                 return True
         if self._center_play_icon_visible_by_screenshot():
@@ -1311,38 +1305,56 @@ class HongguoOperations:
 
     def _center_play_overlay_visible(self, xml: Optional[str] = None) -> bool:
         xml = self._xml() if xml is None else xml
-        candidate_bounds: List[tuple[int, int, int, int]] = []
+        candidates = self._center_play_candidates(xml)
+        if any(semantic is True for _, semantic in candidates):
+            return True
+        if any(semantic is False for _, semantic in candidates):
+            return False
+        candidates.sort(key=lambda item: abs(((item[0][0] + item[0][2]) // 2) - self.width // 2))
+        for bounds, _ in candidates:
+            if self._center_play_icon_visible_by_screenshot(bounds):
+                return True
+        return self._center_play_icon_visible_by_screenshot()
+
+    def _center_play_candidates(
+        self,
+        xml: str,
+    ) -> List[tuple[tuple[int, int, int, int], Optional[bool]]]:
+        candidates: List[tuple[tuple[int, int, int, int], Optional[bool]]] = []
         for node in self._hongguo_nodes(xml):
             if 'clickable="true"' not in node:
                 continue
-            bounds_match = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
-            if not bounds_match:
+            bounds = self._node_bounds(node)
+            if not bounds:
                 continue
-            left, top, right, bottom = (int(value) for value in bounds_match.groups())
+            left, top, right, bottom = bounds
             width = right - left
             height = bottom - top
             center_x = (left + right) // 2
             center_y = (top + bottom) // 2
             if width < 40 or height < 40:
                 continue
-            if abs(center_x - self.width // 2) <= self.width * 0.18 and self.height * 0.28 <= center_y <= self.height * 0.58:
-                candidate_bounds.append((left, top, right, bottom))
-        if not candidate_bounds:
-            return self._center_play_icon_visible_by_screenshot()
-        candidate_bounds.sort(key=lambda item: abs(((item[0] + item[2]) // 2) - self.width // 2))
-        for bounds in candidate_bounds:
-            if self._center_play_icon_visible_by_screenshot(bounds) or self._center_play_bounds_look_like_button(bounds):
-                return True
-        return self._center_play_icon_visible_by_screenshot()
+            if abs(center_x - self.width // 2) > self.width * 0.18:
+                continue
+            if not self.height * 0.28 <= center_y <= self.height * 0.58:
+                continue
+            candidates.append((bounds, self._playback_control_semantic(node)))
+        return candidates
 
-    def _center_play_bounds_look_like_button(self, bounds: tuple[int, int, int, int]) -> bool:
-        left, top, right, bottom = bounds
-        width = right - left
-        height = bottom - top
-        if width <= 0 or height <= 0:
+    @staticmethod
+    def _playback_control_semantic(node: str) -> Optional[bool]:
+        labels = {
+            re.sub(r"\s+", "", html.unescape(value)).lower()
+            for value in re.findall(r'(?:text|content-desc)="([^"]*)"', node)
+            if value.strip()
+        }
+        playing_labels = {"暂停", "点击暂停", "暂停播放", "播放中", "正在播放"}
+        paused_labels = {"播放", "点击播放", "继续播放", "恢复播放", "播放按钮"}
+        if labels & playing_labels:
             return False
-        ratio = width / max(1, height)
-        return 64 <= width <= 220 and 64 <= height <= 220 and 0.55 <= ratio <= 1.8
+        if labels & paused_labels:
+            return True
+        return None
 
     def _center_play_icon_visible_by_screenshot(self, bounds: Optional[tuple[int, int, int, int]] = None) -> bool:
         try:
@@ -1366,12 +1378,45 @@ class HongguoOperations:
                 min(self.height, bottom + pad_y),
             )
         )
-        white_pixels = 0
-        for red, green, blue in crop.getdata():
-            if red >= 235 and green >= 235 and blue >= 235:
-                white_pixels += 1
-        threshold = 1500 if bounds is None else 900
-        return white_pixels >= threshold
+        white_points = [
+            (index % crop.width, index // crop.width)
+            for index, (red, green, blue) in enumerate(crop.getdata())
+            if red >= 235 and green >= 235 and blue >= 235
+        ]
+        if len(white_points) < 180:
+            return False
+
+        min_x = min(point[0] for point in white_points)
+        max_x = max(point[0] for point in white_points)
+        min_y = min(point[1] for point in white_points)
+        max_y = max(point[1] for point in white_points)
+        icon_width = max_x - min_x + 1
+        icon_height = max_y - min_y + 1
+        if icon_width < 18 or icon_height < 18:
+            return False
+        if icon_width > crop.width * 0.72 or icon_height > crop.height * 0.72:
+            return False
+
+        occupancy = len(white_points) / max(1, icon_width * icon_height)
+        if not 0.12 <= occupancy <= 0.72:
+            return False
+
+        row_max_x: Dict[int, int] = {}
+        for x, y in white_points:
+            row_max_x[y] = max(x, row_max_x.get(y, x))
+
+        # A right-facing play triangle reaches its furthest-right point in the middle band.
+        band_max_x: List[List[int]] = [[], [], []]
+        for y, max_row_x in row_max_x.items():
+            relative_y = (y - min_y) / max(1, icon_height - 1)
+            band = 0 if relative_y < 0.30 else 2 if relative_y > 0.70 else 1
+            band_max_x[band].append(max_row_x)
+        if any(not values for values in band_max_x):
+            return False
+
+        averages = [sum(values) / len(values) for values in band_max_x]
+        tip_bulge = min(averages[1] - averages[0], averages[1] - averages[2])
+        return tip_bulge >= icon_width * 0.14
 
     def _ad_continue_visible(self, xml: Optional[str] = None) -> bool:
         # A stale hierarchy may retain an ad prompt after the app has returned
