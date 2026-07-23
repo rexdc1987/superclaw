@@ -4441,6 +4441,33 @@ class TestHongguoEngineWaits:
 
         assert ops._center_play_overlay_visible('<node package="com.phoenix.read" />') is True
 
+    def test_center_play_overlay_detects_triangle_amid_bright_video_details(self):
+        from PIL import Image, ImageDraw
+
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 720, 1280
+        ops.d = MagicMock()
+        image = Image.new("RGB", (720, 1280), (30, 30, 30))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((385, 390, 450, 430), fill=(255, 255, 255))
+        draw.polygon([(324, 550), (324, 620), (396, 585)], fill=(255, 255, 255))
+        ops.d.screenshot.return_value = image
+
+        assert ops._center_play_overlay_visible('<node package="com.phoenix.read" />') is True
+
+    def test_pause_playback_uses_media_pause_before_coordinate_fallback(self):
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 720, 1280
+        ops.d = MagicMock()
+
+        with patch.object(ops, "_short_series_activity_active", return_value=True):
+            with patch.object(ops, "is_playback_paused", side_effect=[False, True]):
+                with patch("rpa.hongguo.operations.time.sleep"):
+                    assert ops.pause_playback_if_playing() is True
+
+        ops.d.shell.assert_called_once_with("input keyevent 127")
+        ops.d.click.assert_not_called()
+
     def test_center_play_overlay_falls_back_when_center_clickable_is_search_chip(self):
         from PIL import Image, ImageDraw
 

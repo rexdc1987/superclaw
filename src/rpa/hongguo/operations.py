@@ -1006,6 +1006,13 @@ class HongguoOperations:
             return False
         if self.is_playback_paused():
             return True
+        try:
+            self.d.shell("input keyevent 127")
+            time.sleep(1)
+            if self.is_playback_paused():
+                return True
+        except Exception:
+            pass
         self.d.click(int(self.width * 0.5), int(self.height * 0.42))
         time.sleep(0.8)
         return self.is_playback_paused()
@@ -1378,14 +1385,45 @@ class HongguoOperations:
                 min(self.height, bottom + pad_y),
             )
         )
-        white_points = [
+        white_points = {
             (index % crop.width, index // crop.width)
             for index, (red, green, blue) in enumerate(crop.getdata())
             if red >= 235 and green >= 235 and blue >= 235
-        ]
+        }
         if len(white_points) < 180:
             return False
+        if len(white_points) > crop.width * crop.height * 0.48:
+            return False
 
+        remaining = set(white_points)
+        while remaining:
+            seed = remaining.pop()
+            stack = [seed]
+            component = [seed]
+            while stack:
+                x, y = stack.pop()
+                for neighbor_y in (y - 1, y, y + 1):
+                    for neighbor_x in (x - 1, x, x + 1):
+                        neighbor = (neighbor_x, neighbor_y)
+                        if neighbor not in remaining:
+                            continue
+                        remaining.remove(neighbor)
+                        stack.append(neighbor)
+                        component.append(neighbor)
+            if len(component) >= 180 and self._white_component_looks_like_play(
+                component,
+                crop.width,
+                crop.height,
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _white_component_looks_like_play(
+        white_points: List[tuple[int, int]],
+        crop_width: int,
+        crop_height: int,
+    ) -> bool:
         min_x = min(point[0] for point in white_points)
         max_x = max(point[0] for point in white_points)
         min_y = min(point[1] for point in white_points)
@@ -1394,11 +1432,21 @@ class HongguoOperations:
         icon_height = max_y - min_y + 1
         if icon_width < 18 or icon_height < 18:
             return False
-        if icon_width > crop.width * 0.72 or icon_height > crop.height * 0.72:
+        if icon_width > crop_width * 0.72 or icon_height > crop_height * 0.72:
+            return False
+        ratio = icon_width / max(1, icon_height)
+        if not 0.55 <= ratio <= 1.60:
+            return False
+
+        center_x = (min_x + max_x) / 2
+        center_y = (min_y + max_y) / 2
+        if abs(center_x - crop_width / 2) > crop_width * 0.28:
+            return False
+        if abs(center_y - crop_height / 2) > crop_height * 0.28:
             return False
 
         occupancy = len(white_points) / max(1, icon_width * icon_height)
-        if not 0.12 <= occupancy <= 0.72:
+        if not 0.12 <= occupancy <= 0.78:
             return False
 
         row_max_x: Dict[int, int] = {}
