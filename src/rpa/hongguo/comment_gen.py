@@ -65,6 +65,21 @@ class CommentGenerator:
         "这剧比想象中好看多了",
         "追了追了，期待后面的剧情",
         "剧情反转太精彩了，意想不到",
+        "人物关系越来越有意思了",
+        "细节埋得很巧，越看越有味道",
+        "节奏把握得不错，看得很投入",
+        "后面的发展完全猜不到",
+        "每一集都有新看点",
+        "氛围感拉满了，追起来很过瘾",
+        "角色塑造得挺鲜活",
+        "故事越往后越精彩",
+        "这个转折处理得很自然",
+        "剧情铺垫很扎实，值得继续追",
+        "台词和表演都很有代入感",
+        "冲突一环接一环，确实抓人",
+        "刚看几集就已经入坑了",
+        "镜头和节奏都很舒服",
+        "期待接下来怎么圆这个伏笔",
     ]
 
     def __init__(self, ai_config: Dict[str, Any] | None = None):
@@ -257,7 +272,7 @@ class CommentGenerator:
         for keyword, comments in self.GENRE_COMMENTS.items():
             if keyword in (title or ""):
                 matched.extend(comments)
-        return matched or self.GENERIC_COMMENTS
+        return list(dict.fromkeys([*matched, *self.GENERIC_COMMENTS]))
 
     def _strip_preamble(self, content: str) -> str:
         text = (content or "").strip()

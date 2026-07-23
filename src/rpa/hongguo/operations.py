@@ -111,7 +111,7 @@ class HongguoOperations:
         try:
             self._start_app()
             time.sleep(1.5)
-            self._close_popups()
+            self._close_popups_quick()
             return self._is_app_foreground() or self._wait_app_ready(5)
         except Exception:
             return False

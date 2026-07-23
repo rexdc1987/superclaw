@@ -3254,6 +3254,42 @@ def test_comment_generation_falls_back_to_unused_local_text():
     ops.post_comment.assert_called_once_with("新的评论", 9)
 
 
+def test_local_comment_pool_covers_multi_device_batch_without_duplicates():
+    generator = CommentGenerator({})
+    used = set()
+
+    for _ in range(15):
+        comment = generator.generate_local_comment_excluding("胭脂念念不忘", used)
+        assert comment not in used
+        used.add(comment)
+
+
+def test_genre_comment_candidates_include_generic_fallbacks():
+    generator = CommentGenerator({})
+
+    candidates = generator._local_comment_candidates("重生之再来一次")
+
+    assert CommentGenerator.GENRE_COMMENTS["重生"][0] in candidates
+    assert CommentGenerator.GENERIC_COMMENTS[0] in candidates
+    assert len(candidates) == len(set(candidates))
+
+
+def test_bring_to_foreground_uses_quick_popup_cleanup():
+    ops = HongguoOperations.__new__(HongguoOperations)
+    ops._start_app = MagicMock()
+    ops._close_popups = MagicMock()
+    ops._close_popups_quick = MagicMock()
+    ops._is_app_foreground = MagicMock(return_value=True)
+    ops._wait_app_ready = MagicMock(return_value=False)
+
+    with patch("rpa.hongguo.operations.time.sleep"):
+        assert ops.bring_to_foreground() is True
+
+    ops._close_popups_quick.assert_called_once_with()
+    ops._close_popups.assert_not_called()
+    ops._wait_app_ready.assert_not_called()
+
+
 def test_comment_repost_is_cancelled_when_delayed_verification_succeeds():
     engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
     engine._log = MagicMock()
