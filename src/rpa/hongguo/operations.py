@@ -546,10 +546,17 @@ class HongguoOperations:
 
     def _wait_selected_drama_title(self, expected: str, clicked_title: str, attempts: int = 8) -> str:
         """Wait for the Surface player metadata to settle after opening a result."""
+        fallback_confirmations = 0
         for attempt in range(max(1, attempts)):
-            drama_title = self._verified_detail_title(expected, allow_clicked_title=True)
+            drama_title = self._verified_detail_title(expected)
             if drama_title:
                 return drama_title
+            if self._mismatched_collection_title(expected):
+                fallback_confirmations = 0
+                if attempt + 1 < attempts:
+                    self._sleep(1, 1.5)
+                    continue
+                return ""
             if clicked_title and self._strict_title_matches(expected, clicked_title):
                 observed_title = self._extract_detail_title()
                 if observed_title and not self._strict_title_matches(expected, observed_title):
@@ -557,19 +564,16 @@ class HongguoOperations:
                 current = self._safe_app_current()
                 current_episode = self.get_current_episode()
                 total_episodes = self.get_total_episodes()
-                if (
+                playback_context = (
                     current.get("package") == APP_PACKAGE
                     and current.get("activity") == SHORT_SERIES_ACTIVITY
-                    and current_episode > 0
-                    and total_episodes >= current_episode
-                ):
-                    return clicked_title
-                if (
-                    attempt + 1 >= max(1, attempts)
-                    and current.get("package") == APP_PACKAGE
-                    and current.get("activity") == SHORT_SERIES_ACTIVITY
-                    and self._playback_visible()
-                ):
+                    and (
+                        (current_episode > 0 and total_episodes >= current_episode)
+                        or self._playback_visible()
+                    )
+                )
+                fallback_confirmations = fallback_confirmations + 1 if playback_context else 0
+                if fallback_confirmations >= 2:
                     return clicked_title
             if attempt + 1 < attempts:
                 self._sleep(1, 1.5)

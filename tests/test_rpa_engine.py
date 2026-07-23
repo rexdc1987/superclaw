@@ -1935,6 +1935,35 @@ class TestHongguoPlaybackHeuristics:
                                     )
         assert result == selected_title
 
+    def test_wait_selected_drama_title_rejects_late_wrong_collection_metadata(self):
+        ops = HongguoOperations(object())
+        selected_title = "胭脂念念不忘"
+        with patch.object(ops, "_verified_detail_title", return_value=""):
+            with patch.object(
+                ops,
+                "_mismatched_collection_title",
+                side_effect=["", "神奇宇宙", "神奇宇宙"],
+            ):
+                with patch.object(ops, "_extract_detail_title", return_value=""):
+                    with patch.object(
+                        ops,
+                        "_safe_app_current",
+                        return_value={
+                            "package": "com.phoenix.read",
+                            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                        },
+                    ):
+                        with patch.object(ops, "get_current_episode", return_value=1):
+                            with patch.object(ops, "get_total_episodes", return_value=483):
+                                with patch.object(ops, "_playback_visible", return_value=True):
+                                    with patch.object(ops, "_sleep"):
+                                        result = ops._wait_selected_drama_title(
+                                            "胭脂念念不忘",
+                                            selected_title,
+                                            attempts=3,
+                                        )
+        assert result == ""
+
     def test_select_drama_keeps_healthy_device_session_after_click(self):
         ops = HongguoOperations(object())
         selected_title = "云渺1：我修仙多年强亿点怎么了"
@@ -3799,6 +3828,54 @@ class TestHongguoEngineWaits:
                         77,
                     ) is True
         assert ops.submit_search.call_count == 3
+
+    def test_prepare_playback_retries_wrong_collection_without_known_total(self):
+        engine = TaskEngine(task_id=139, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._check_login = MagicMock(return_value={"logged_in": True, "message": "已登录"})
+        engine._retry_reopen_target_from_main = MagicMock(return_value=True)
+        engine._wait_for_episode_verified = MagicMock(return_value=True)
+        engine._page_state_with_empty_retry = MagicMock(
+            return_value={"total_episodes": 40, "current_episode": 1}
+        )
+        engine._assert_target_playback = MagicMock()
+        ops = MagicMock()
+        ops.launch_app.return_value = True
+        ops.open_search_page.return_value = {"success": True, "message": "已进入搜索框"}
+        ops.input_search_keyword.return_value = {"success": True, "message": "关键词已填入"}
+        ops.submit_search.return_value = {"success": True, "message": "搜索完成"}
+        ops._extract_drama_titles.return_value = ["胭脂念念不忘"]
+        ops._choose_title.return_value = "胭脂念念不忘"
+        ops.select_drama.return_value = {
+            "success": True,
+            "drama_title": "胭脂念念不忘",
+            "message": "已进入短剧详情",
+        }
+        ops._mismatched_collection_title.return_value = "神奇宇宙"
+        ops.take_screenshot.return_value = "C:/tmp/wrong_collection.png"
+        ops.skip_ad_if_present.return_value = False
+        ops.get_total_episodes.return_value = 40
+        ops._safe_app_current.return_value = {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        }
+        ops.play_episode.return_value = True
+
+        result = engine._prepare_verified_playback(
+            ops,
+            {"drama_name": "胭脂念念不忘", "playback_speed": "1.0x"},
+        )
+
+        engine._retry_reopen_target_from_main.assert_called_once_with(
+            ops,
+            "胭脂念念不忘",
+            1,
+            0,
+            {"drama_name": "胭脂念念不忘", "playback_speed": "1.0x"},
+        )
+        assert result["drama_title"] == "胭脂念念不忘"
+        assert result["total_episodes"] == 40
 
     def test_reopen_target_episode_closes_live_lite_before_opening_search(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")

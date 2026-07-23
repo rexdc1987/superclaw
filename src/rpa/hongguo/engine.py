@@ -347,7 +347,7 @@ class TaskEngine:
                 "warn",
                 f"全流程v3: 首次选剧失败，已截图 {shot}，尝试强制重搜目标短剧",
             )
-            if task_total and self._retry_reopen_target_from_main(ops, keyword, 1, task_total, task):
+            if self._retry_reopen_target_from_main(ops, keyword, 1, task_total, task):
                 drama_title = keyword
                 selected = {"success": True, "drama_title": drama_title}
             else:
@@ -356,9 +356,16 @@ class TaskEngine:
         wrong_collection = ops._mismatched_collection_title(keyword)
         if wrong_collection:
             shot = ops.take_screenshot("select_drama_wrong_collection", self.screenshot_dir)
-            raise RuntimeError(
-                f"进入的合集与目标短剧不匹配: 期望 {keyword}，实际 {wrong_collection}，已截图 {shot}"
+            self._log(
+                "warn",
+                f"全流程v3: 进入错误合集，期望 {keyword}，实际 {wrong_collection}，已截图 {shot}，尝试强制重搜",
             )
+            if self._retry_reopen_target_from_main(ops, keyword, 1, task_total, task):
+                drama_title = keyword
+            else:
+                raise RuntimeError(
+                    f"进入的合集与目标短剧不匹配: 期望 {keyword}，实际 {wrong_collection}，已截图 {shot}"
+                )
 
         playback_speed = str(task.get("playback_speed") or "1.0x")
         if playback_speed != "1.0x":
