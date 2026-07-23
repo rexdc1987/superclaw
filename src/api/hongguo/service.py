@@ -22,6 +22,8 @@ def create_task(db: Session, data: TaskCreate) -> HongguoTask:
         random_comment_count=data.random_comment_count,
         random_min_interval=data.random_min_interval,
         random_max_interval=data.random_max_interval,
+        random_like_count=data.random_like_count,
+        random_favorite_count=data.random_favorite_count,
         content_source=data.content_source,
         templates_json=json.dumps(data.templates, ensure_ascii=False),
         created_at=datetime.now(),
@@ -83,6 +85,9 @@ def start_task(db: Session, task_id: int) -> HongguoTask:
     task.total_episodes = 0
     task.comments_sent = 0
     task.comments_verified = 0
+    task.likes_completed = 0
+    task.favorites_completed = 0
+    task.completion_screenshot_path = None
     task.updated_at = datetime.now()
     db.commit()
     db.refresh(task)

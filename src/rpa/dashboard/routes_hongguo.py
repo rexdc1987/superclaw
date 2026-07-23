@@ -283,6 +283,11 @@ def _ensure_task_schema(conn) -> None:
         "worker_id",
         "dispatch_requested_at",
         "control_command",
+        "random_like_count",
+        "random_favorite_count",
+        "likes_completed",
+        "favorites_completed",
+        "completion_screenshot_path",
     }
     with conn.cursor() as cur:
         existing: set[str] = set()
@@ -377,6 +382,46 @@ def _ensure_task_schema(conn) -> None:
                 ALTER TABLE hongguo_comment_tasks
                 ADD COLUMN control_command VARCHAR(16) DEFAULT NULL
                 AFTER dispatch_requested_at
+                """
+            )
+        if "random_like_count" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN random_like_count INT DEFAULT 5
+                AFTER random_max_interval
+                """
+            )
+        if "random_favorite_count" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN random_favorite_count INT DEFAULT 1
+                AFTER random_like_count
+                """
+            )
+        if "likes_completed" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN likes_completed INT DEFAULT 0
+                AFTER comments_verified
+                """
+            )
+        if "favorites_completed" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN favorites_completed INT DEFAULT 0
+                AFTER likes_completed
+                """
+            )
+        if "completion_screenshot_path" not in existing:
+            cur.execute(
+                """
+                ALTER TABLE hongguo_comment_tasks
+                ADD COLUMN completion_screenshot_path VARCHAR(500) DEFAULT NULL
+                AFTER favorites_completed
                 """
             )
 
@@ -512,6 +557,7 @@ def _serialize_task(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     row["playback_speed"] = _normalize_playback_speed(row.get("playback_speed") or "1.0x")
     row["templates"] = _json_loads(row.get("templates_json"))
     row["execution_plan"] = _json_loads(row.get("execution_plan_json"))
+    row["completion_screenshot_url"] = _public_screenshot_url(row.get("completion_screenshot_path"))
     return row
 
 
@@ -575,6 +621,8 @@ class TaskBase(BaseModel):
     random_comment_count: int = Field(default=10, ge=1)
     random_min_interval: int = Field(default=20, ge=0)
     random_max_interval: int = Field(default=60, ge=0)
+    random_like_count: int = Field(default=5, ge=0)
+    random_favorite_count: int = Field(default=1, ge=0)
     templates: List[str] = Field(default_factory=list)
 
     @field_validator("comment_mode")
@@ -675,12 +723,17 @@ class TaskUpdate(BaseModel):
     random_comment_count: Optional[int] = Field(default=None, ge=1)
     random_min_interval: Optional[int] = Field(default=None, ge=0)
     random_max_interval: Optional[int] = Field(default=None, ge=0)
+    random_like_count: Optional[int] = Field(default=None, ge=0)
+    random_favorite_count: Optional[int] = Field(default=None, ge=0)
     templates: Optional[List[str]] = None
     status: Optional[str] = None
     total_episodes: Optional[int] = Field(default=None, ge=0)
     current_episode: Optional[int] = Field(default=None, ge=0)
     comments_sent: Optional[int] = Field(default=None, ge=0)
     comments_verified: Optional[int] = Field(default=None, ge=0)
+    likes_completed: Optional[int] = Field(default=None, ge=0)
+    favorites_completed: Optional[int] = Field(default=None, ge=0)
+    completion_screenshot_path: Optional[str] = None
     error_message: Optional[str] = None
 
     @field_validator("comment_mode")
@@ -758,6 +811,8 @@ def _task_insert_values(payload: TaskBase) -> tuple[Any, ...]:
         payload.random_comment_count,
         payload.random_min_interval,
         payload.random_max_interval,
+        payload.random_like_count,
+        payload.random_favorite_count,
         _json_dumps(payload.templates),
         payload.playback_speed,
     )
@@ -781,10 +836,11 @@ def _insert_task_record(
                 drama_name, comment_mode, content_source,
                 start_episode, episode_interval, comment_interval_sec,
                 random_comment_count, random_min_interval, random_max_interval,
+                random_like_count, random_favorite_count,
                 templates_json, playback_speed, status,
                 device_addr, device_label, multi_run_id, owner_user_id, worker_id,
                 created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 *_task_insert_values(payload),
@@ -869,12 +925,17 @@ async def update_task(task_id: int, payload: TaskUpdate):
         "random_comment_count",
         "random_min_interval",
         "random_max_interval",
+        "random_like_count",
+        "random_favorite_count",
         "templates_json",
         "status",
         "total_episodes",
         "current_episode",
         "comments_sent",
         "comments_verified",
+        "likes_completed",
+        "favorites_completed",
+        "completion_screenshot_path",
         "error_message",
         "device_addr",
         "device_label",
@@ -2426,6 +2487,7 @@ def _start_task_on_device(task_id: int, device_addr: Optional[str] = None) -> Di
                     SET status='pending', dispatch_requested_at=%s, control_command='start',
                         completed_at=NULL, duration_seconds=NULL, error_message=NULL,
                         current_episode=0, comments_sent=0, comments_verified=0,
+                        likes_completed=0, favorites_completed=0, completion_screenshot_path=NULL,
                         device_addr=%s, updated_at=%s
                     WHERE id=%s
                     """,
@@ -2446,6 +2508,9 @@ def _start_task_on_device(task_id: int, device_addr: Optional[str] = None) -> Di
                     current_episode=0,
                     comments_sent=0,
                     comments_verified=0,
+                    likes_completed=0,
+                    favorites_completed=0,
+                    completion_screenshot_path=NULL,
                     device_addr=%s,
                     updated_at=%s
                 WHERE id=%s
@@ -2987,6 +3052,8 @@ def _serialize_multi_run(run_id: str, tasks: List[Dict[str, Any]]) -> Dict[str, 
         "stopped_count": statuses.get("stopped", 0),
         "comments_sent": sum(int(task.get("comments_sent") or 0) for task in serialized if task),
         "comments_verified": sum(int(task.get("comments_verified") or 0) for task in serialized if task),
+        "likes_completed": sum(int(task.get("likes_completed") or 0) for task in serialized if task),
+        "favorites_completed": sum(int(task.get("favorites_completed") or 0) for task in serialized if task),
         "tasks": serialized,
     }
 

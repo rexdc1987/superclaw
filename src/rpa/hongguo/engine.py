@@ -52,6 +52,10 @@ class TaskEngine:
         self._stop_event = threading.Event()
         self._resume_playback_check = False
         self._comment_recovered_at: Dict[int, float] = {}
+        self._completed_engagement_episodes: Dict[str, set[int]] = {
+            "like": set(),
+            "favorite": set(),
+        }
         self._device_info_cache: Dict[str, Any] = {}
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -120,6 +124,9 @@ class TaskEngine:
                 current_episode=0,
                 comments_sent=0,
                 comments_verified=0,
+                likes_completed=0,
+                favorites_completed=0,
+                completion_screenshot_path=None,
                 updated_at=now,
             )
             self._log("info", "全流程v3: 开始执行，从打开红果到刷完整部短剧")
@@ -138,6 +145,11 @@ class TaskEngine:
                 raise RuntimeError("未识别到短剧总集数")
             drama_title = str(prepare.get("drama_title") or task.get("drama_name") or "")
             comment_episodes = set(self._comment_episode_plan(task, total))
+            like_episodes = set(self._engagement_episode_plan(task, total, "random_like_count", 5))
+            favorite_episodes = set(
+                self._engagement_episode_plan(task, total, "random_favorite_count", 1)
+            )
+            self._completed_engagement_episodes = {"like": set(), "favorite": set()}
             completed_episodes = self._completed_comment_episodes()
             if completed_episodes:
                 comment_episodes -= completed_episodes
@@ -145,6 +157,8 @@ class TaskEngine:
             execution_plan = {
                 "watch_episodes": list(range(1, total + 1)),
                 "comment_episodes": sorted(comment_episodes),
+                "like_episodes": sorted(like_episodes),
+                "favorite_episodes": sorted(favorite_episodes),
                 "skipped_comment_episodes": sorted(completed_episodes),
                 "rule": self._task_rule_snapshot(task),
                 "flow": "verified_v3_full",
@@ -157,7 +171,12 @@ class TaskEngine:
                 updated_at=datetime.now(),
             )
             task["execution_plan_json"] = execution_plan_json
-            self._log("info", f"全流程v3: 准备完成，短剧={drama_title}，总集数={total}，评论集数={sorted(comment_episodes)}")
+            self._log(
+                "info",
+                f"全流程v3: 准备完成，短剧={drama_title}，总集数={total}，"
+                f"评论集数={sorted(comment_episodes)}，点赞集数={sorted(like_episodes)}，"
+                f"收藏集数={sorted(favorite_episodes)}",
+            )
             if 1 not in comment_episodes or self._comment_already_verified(1):
                 self._resume_if_paused(ops, 1)
 
@@ -182,7 +201,7 @@ class TaskEngine:
                     if current > episode and not self._pending_comment_episodes_between(task, episode, current):
                         self._log(
                             "info",
-                            f"全流程v3: 第{episode}集已自然播放越过到第{current}集，未命中评论规则，顺延观察",
+                            f"全流程v3: 第{episode}集已自然播放越过到第{current}集，未命中评论或互动计划，顺延观察",
                         )
                         continue
                     self._log("warn", f"全流程v3: 期望第{episode}集，当前识别第{current}集，尝试恢复目标集")
@@ -192,7 +211,7 @@ class TaskEngine:
                     if current > episode and not self._pending_comment_episodes_between(task, episode, current):
                         self._log(
                             "info",
-                            f"全流程v3: 恢复确认时已播放到第{current}集，跳过的集数未命中评论规则，顺延观察",
+                            f"全流程v3: 恢复确认时已播放到第{current}集，跳过的集数未命中评论或互动计划，顺延观察",
                         )
                         continue
                     if current and current != episode:
@@ -200,6 +219,12 @@ class TaskEngine:
 
                 self._update_task(current_episode=episode, updated_at=datetime.now())
                 self._log("info", f"全流程v3: 正在观察第{episode}集")
+                self._process_engagement_episode(
+                    ops,
+                    episode,
+                    like_episodes,
+                    favorite_episodes,
+                )
                 if not self._process_comment_episode(
                     ops,
                     task,
@@ -232,6 +257,20 @@ class TaskEngine:
                     missing_comments,
                 )
                 completed_at = datetime.now()
+            completion_screenshot = ops.take_screenshot("task_completed_summary", self.screenshot_dir)
+            likes_completed = len(self._completed_engagement_episodes["like"])
+            favorites_completed = len(self._completed_engagement_episodes["favorite"])
+            self._update_task(completion_screenshot_path=completion_screenshot, updated_at=completed_at)
+            engagement_level = (
+                "info"
+                if likes_completed == len(like_episodes) and favorites_completed == len(favorite_episodes)
+                else "warn"
+            )
+            self._log(
+                engagement_level,
+                f"全流程v3: 互动统计 点赞={likes_completed}/{len(like_episodes)}，"
+                f"收藏={favorites_completed}/{len(favorite_episodes)}，完成截图 {completion_screenshot}",
+            )
             if missing_comments:
                 message = f"评论验证未达标: 未验证成功集数={missing_comments}，计划评论集数={sorted(comment_episodes)}"
                 self._update_task(
@@ -294,6 +333,32 @@ class TaskEngine:
             avoid_contents=self._comment_contents_for_batch(),
         )
         return True
+
+    def _process_engagement_episode(
+        self,
+        ops: HongguoOperations,
+        episode: int,
+        like_episodes: set[int],
+        favorite_episodes: set[int],
+    ) -> None:
+        actions = (
+            ("like", "点赞", like_episodes, ops.like_current_episode),
+            ("favorite", "收藏", favorite_episodes, ops.favorite_current_episode),
+        )
+        for action, label, planned, operation in actions:
+            if episode not in planned or episode in self._completed_engagement_episodes[action]:
+                continue
+            self._check_pause_stop()
+            result = operation()
+            success = bool(result.get("success"))
+            self._log(
+                "info" if success else "warn",
+                f"全流程v3: 第{episode}集随机{label}={'成功' if success else '失败'}，"
+                f"已验证={bool(result.get('verified'))}，{result.get('message') or '-'}",
+            )
+            if success:
+                self._completed_engagement_episodes[action].add(episode)
+                self._increment_engagement_counter(action)
 
     def _prepare_verified_playback(self, ops: HongguoOperations, task: Dict[str, Any]) -> Dict[str, Any]:
         keyword = str(task.get("drama_name") or "").strip()
@@ -1380,17 +1445,33 @@ class TaskEngine:
             plan = json.loads(task.get("execution_plan_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             plan = {}
+        planned_comments = {
+            int(value)
+            for value in plan.get("comment_episodes") or []
+            if str(value).isdigit()
+        }
+        planned_engagements: set[int] = set()
+        for action, key in (("like", "like_episodes"), ("favorite", "favorite_episodes")):
+            planned_engagements.update(
+                int(value)
+                for value in plan.get(key) or []
+                if str(value).isdigit()
+                and int(value) not in self._completed_engagement_episodes[action]
+            )
         planned = sorted(
             {
-                int(value)
-                for value in plan.get("comment_episodes") or []
-                if str(value).isdigit()
+                *planned_engagements,
+                *(
+                    episode
+                    for episode in planned_comments
+                    if not self._comment_already_verified(episode)
+                ),
             }
         )
         return [
             episode
             for episode in planned
-            if start_episode <= episode < end_episode and not self._comment_already_verified(episode)
+            if start_episode <= episode < end_episode
         ]
 
     def _recover_to_verified_episode(
@@ -2449,6 +2530,19 @@ class TaskEngine:
         interval = max(1, int(task.get("episode_interval") or 1))
         return list(range(start, total + 1, interval))
 
+    @staticmethod
+    def _engagement_episode_plan(
+        task: Dict[str, Any],
+        total: int,
+        field: str,
+        default: int,
+    ) -> List[int]:
+        total = max(1, int(total or 1))
+        raw_count = task.get(field)
+        count = max(0, int(default if raw_count is None else raw_count))
+        count = min(count, total)
+        return sorted(random.sample(range(1, total + 1), count)) if count else []
+
     def _task_rule_snapshot(self, task: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "comment_mode": task.get("comment_mode"),
@@ -2458,6 +2552,8 @@ class TaskEngine:
             "random_comment_count": task.get("random_comment_count"),
             "random_min_interval": task.get("random_min_interval"),
             "random_max_interval": task.get("random_max_interval"),
+            "random_like_count": task.get("random_like_count"),
+            "random_favorite_count": task.get("random_favorite_count"),
             "content_source": task.get("content_source"),
             "playback_speed": task.get("playback_speed"),
         }
@@ -2749,6 +2845,18 @@ class TaskEngine:
         if counter not in {"sent", "verified"}:
             return
         column = "comments_verified" if counter == "verified" else "comments_sent"
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE hongguo_comment_tasks SET {column}={column}+1 WHERE id=%s",
+                    (self.task_id,),
+                )
+
+    def _increment_engagement_counter(self, action: str) -> None:
+        columns = {"like": "likes_completed", "favorite": "favorites_completed"}
+        column = columns.get(action)
+        if not column:
+            return
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(

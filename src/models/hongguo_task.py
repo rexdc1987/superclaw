@@ -22,6 +22,8 @@ class HongguoTask(Base):
     random_comment_count = Column(Integer, default=10, comment="随机评论总次数")
     random_min_interval = Column(Integer, default=20, comment="随机最小间隔秒")
     random_max_interval = Column(Integer, default=60, comment="随机最大间隔秒")
+    random_like_count = Column(Integer, default=5, comment="随机点赞总次数")
+    random_favorite_count = Column(Integer, default=1, comment="随机收藏总次数")
 
     # 评论内容配置
     content_source = Column(String(20), default="ai", comment="内容来源: ai/template/mixed")
@@ -34,6 +36,9 @@ class HongguoTask(Base):
     total_episodes = Column(Integer, default=0, comment="总集数")
     comments_sent = Column(Integer, default=0, comment="已发送评论数")
     comments_verified = Column(Integer, default=0, comment="已验证评论数")
+    likes_completed = Column(Integer, default=0, comment="已完成点赞数")
+    favorites_completed = Column(Integer, default=0, comment="已完成收藏数")
+    completion_screenshot_path = Column(String(500), nullable=True, comment="任务完成截图")
     error_message = Column(Text, nullable=True, comment="错误信息")
 
     # 时间

@@ -95,6 +95,14 @@
               <el-radio value="random">随机集数</el-radio>
             </el-radio-group>
           </el-form-item>
+          <el-form-item label="随机点赞">
+            <el-input-number v-model="form.random_like_count" :min="0" />
+            <span class="field-hint">次</span>
+          </el-form-item>
+          <el-form-item label="随机收藏">
+            <el-input-number v-model="form.random_favorite_count" :min="0" />
+            <span class="field-hint">次</span>
+          </el-form-item>
           <template v-if="form.comment_mode === 'specified'">
             <el-form-item label="起始集数">
               <el-input-number v-model="form.start_episode" :min="1" />
@@ -173,6 +181,8 @@
         <el-tag type="danger">失败 {{ activeRun.failed_count }}</el-tag>
         <el-tag type="info">已发 {{ activeRun.comments_sent }}</el-tag>
         <el-tag type="success">已验证 {{ activeRun.comments_verified }}</el-tag>
+        <el-tag type="primary">点赞 {{ activeRun.likes_completed || 0 }}</el-tag>
+        <el-tag type="warning">收藏 {{ activeRun.favorites_completed || 0 }}</el-tag>
       </div>
       <el-table :data="activeRun?.tasks || []" v-loading="loadingRunDetail" style="width: 100%">
         <el-table-column prop="id" label="任务" width="80" />
@@ -199,6 +209,15 @@
         </el-table-column>
         <el-table-column label="评论" width="120">
           <template #default="{ row }">{{ row.comments_sent || 0 }} / {{ row.comments_verified || 0 }}</template>
+        </el-table-column>
+        <el-table-column label="互动" width="130">
+          <template #default="{ row }">赞 {{ row.likes_completed || 0 }} / 藏 {{ row.favorites_completed || 0 }}</template>
+        </el-table-column>
+        <el-table-column label="完成截图" width="100">
+          <template #default="{ row }">
+            <el-link v-if="row.completion_screenshot_url" :href="row.completion_screenshot_url" target="_blank" type="primary">查看</el-link>
+            <span v-else>-</span>
+          </template>
         </el-table-column>
         <el-table-column label="最近过程" min-width="220" show-overflow-tooltip>
           <template #default="{ row }">{{ latestLogText(row.id) }}</template>
@@ -276,6 +295,8 @@ const form = reactive({
   random_comment_count: 10,
   random_min_interval: 20,
   random_max_interval: 60,
+  random_like_count: 5,
+  random_favorite_count: 1,
   content_source: 'ai',
   playback_speed: '2.0x',
   templates: [],
@@ -490,6 +511,8 @@ function ruleFromTask(task) {
     random_comment_count: task?.random_comment_count || 10,
     random_min_interval: task?.random_min_interval || 20,
     random_max_interval: task?.random_max_interval || 60,
+    random_like_count: task?.random_like_count ?? 5,
+    random_favorite_count: task?.random_favorite_count ?? 1,
     content_source: task?.content_source || 'ai',
     playback_speed: task?.playback_speed || '2.0x',
     templates: task?.templates || [],

@@ -18,6 +18,8 @@
           </el-descriptions-item>
           <el-descriptions-item label="已发送">{{ task.comments_sent || 0 }} 条</el-descriptions-item>
           <el-descriptions-item label="已验证">{{ task.comments_verified || 0 }} 条</el-descriptions-item>
+          <el-descriptions-item label="随机点赞">{{ task.likes_completed || 0 }} / {{ task.random_like_count ?? 5 }} 次</el-descriptions-item>
+          <el-descriptions-item label="随机收藏">{{ task.favorites_completed || 0 }} / {{ task.random_favorite_count ?? 1 }} 次</el-descriptions-item>
           <el-descriptions-item label="播放倍速">{{ task.playback_speed || '1.0x' }}</el-descriptions-item>
           <el-descriptions-item label="创建时间">{{ formatTime(displayCreatedAt) }}</el-descriptions-item>
           <el-descriptions-item label="启动时间">{{ formatTime(displayStartedAt) }}</el-descriptions-item>
@@ -39,6 +41,23 @@
             <span class="plan-label">本次评论集数计划</span>
             <span>{{ commentPlanSummary }}</span>
           </div>
+          <div class="plan-row">
+            <span class="plan-label">本次点赞集数计划</span>
+            <span>{{ engagementPlanSummary('like_episodes') }}</span>
+          </div>
+          <div class="plan-row">
+            <span class="plan-label">本次收藏集数计划</span>
+            <span>{{ engagementPlanSummary('favorite_episodes') }}</span>
+          </div>
+        </div>
+
+        <div v-if="task.completion_screenshot_url" class="completion-shot">
+          <span class="plan-label">完成截图</span>
+          <el-image
+            :src="task.completion_screenshot_url"
+            :preview-src-list="[task.completion_screenshot_url]"
+            fit="contain"
+          />
         </div>
 
         <div class="actions">
@@ -256,22 +275,31 @@ const ruleSummary = computed(() => {
   const mode = rule.comment_mode || t.comment_mode
   const source = rule.content_source || t.content_source || 'ai'
   const speed = rule.playback_speed || t.playback_speed || '1.0x'
+  const likeCount = rule.random_like_count ?? t.random_like_count ?? 5
+  const favoriteCount = rule.random_favorite_count ?? t.random_favorite_count ?? 1
+  const engagement = `点赞 ${likeCount} 次，收藏 ${favoriteCount} 次`
   if (mode === 'random') {
     const count = rule.random_comment_count ?? t.random_comment_count ?? '-'
     const min = rule.random_min_interval ?? t.random_min_interval ?? '-'
     const max = rule.random_max_interval ?? t.random_max_interval ?? '-'
-    return `随机评论 ${count} 次，间隔 ${min}-${max} 秒，内容 ${source}，倍速 ${speed}`
+    return `随机评论 ${count} 次，间隔 ${min}-${max} 秒，${engagement}，内容 ${source}，倍速 ${speed}`
   }
   const start = rule.start_episode ?? t.start_episode ?? 1
   const interval = rule.episode_interval ?? t.episode_interval ?? 1
   const delay = rule.comment_interval_sec ?? t.comment_interval_sec ?? 0
-  return `从第 ${start} 集开始，每隔 ${interval} 集评论，固定等待 ${delay} 秒，内容 ${source}，倍速 ${speed}`
+  return `从第 ${start} 集开始，每隔 ${interval} 集评论，固定等待 ${delay} 秒，${engagement}，内容 ${source}，倍速 ${speed}`
 })
 const commentPlanSummary = computed(() => {
   const episodes = executionPlan.value.comment_episodes
   if (!Array.isArray(episodes) || episodes.length === 0) return '-'
   return episodes.map((item) => `第${item}集`).join('、')
 })
+
+function engagementPlanSummary(key) {
+  const episodes = executionPlan.value[key]
+  if (!Array.isArray(episodes) || episodes.length === 0) return '关闭'
+  return episodes.map((item) => `第${item}集`).join('、')
+}
 
 async function loadData() {
   loading.value = true
@@ -475,6 +503,22 @@ onUnmounted(() => {
 .plan-label {
   color: var(--text-secondary);
   font-weight: 600;
+}
+.completion-shot {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: 130px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+.completion-shot .el-image {
+  width: min(240px, 100%);
+  aspect-ratio: 9 / 16;
+  max-height: 360px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: zoom-in;
 }
 .detail-tabs {
   margin-top: 18px;

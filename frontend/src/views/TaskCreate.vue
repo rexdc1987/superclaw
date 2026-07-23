@@ -18,6 +18,15 @@
           </el-radio-group>
         </el-form-item>
 
+        <el-form-item label="随机点赞">
+          <el-input-number v-model="form.random_like_count" :min="0" />
+          <span class="field-hint">次</span>
+        </el-form-item>
+        <el-form-item label="随机收藏">
+          <el-input-number v-model="form.random_favorite_count" :min="0" />
+          <span class="field-hint">次</span>
+        </el-form-item>
+
         <template v-if="form.comment_mode === 'specified'">
           <el-form-item label="起始集数">
             <el-input-number v-model="form.start_episode" :min="1" />
@@ -99,6 +108,8 @@ const form = reactive({
   random_comment_count: 10,
   random_min_interval: 20,
   random_max_interval: 60,
+  random_like_count: 5,
+  random_favorite_count: 1,
   content_source: 'ai',
   playback_speed: '1.0x',
   templates: []
@@ -125,6 +136,8 @@ async function loadTaskForEdit() {
     random_comment_count: task.random_comment_count || 10,
     random_min_interval: task.random_min_interval || 20,
     random_max_interval: task.random_max_interval || 60,
+    random_like_count: task.random_like_count ?? 5,
+    random_favorite_count: task.random_favorite_count ?? 1,
     content_source: task.content_source || 'ai',
     playback_speed: task.playback_speed || '1.0x',
     templates: task.templates || [],

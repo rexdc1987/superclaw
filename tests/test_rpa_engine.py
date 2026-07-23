@@ -4964,6 +4964,117 @@ def test_verified_next_episode_recovers_paused_player_after_static_frame_confirm
     ops.play_episode.assert_called_once_with(53)
 
 
+def test_favorite_current_episode_keeps_existing_favorite_active():
+    ops = HongguoOperations.__new__(HongguoOperations)
+    ops.width, ops.height = 720, 1280
+    ops.d = MagicMock()
+    xml = (
+        '<node package="com.phoenix.read" visible-to-user="true" '
+        'content-desc="已收藏" bounds="[630,560][700,650]" />'
+    )
+    ops._comment_panel_open = MagicMock(return_value=False)
+    ops._xml = MagicMock(return_value=xml)
+    ops._short_series_activity_active = MagicMock(return_value=True)
+    ops._playback_visible = MagicMock(return_value=True)
+    ops._ad_continue_visible = MagicMock(return_value=False)
+    ops._engagement_selected_visual = MagicMock()
+
+    result = ops.favorite_current_episode()
+
+    assert result == {
+        "success": True,
+        "verified": True,
+        "already_active": True,
+        "message": "当前视频已经收藏",
+    }
+    ops.d.click.assert_not_called()
+    ops._engagement_selected_visual.assert_not_called()
+
+
+def test_like_current_episode_clicks_control_and_verifies_selected_state():
+    ops = HongguoOperations.__new__(HongguoOperations)
+    ops.width, ops.height = 720, 1280
+    ops.d = MagicMock()
+    before = (
+        '<node package="com.phoenix.read" visible-to-user="true" '
+        'content-desc="点赞" bounds="[630,840][700,930]" />'
+    )
+    after = before.replace('content-desc="点赞"', 'content-desc="已点赞"')
+    ops._comment_panel_open = MagicMock(return_value=False)
+    ops._xml = MagicMock(side_effect=[before, after])
+    ops._short_series_activity_active = MagicMock(return_value=True)
+    ops._playback_visible = MagicMock(return_value=True)
+    ops._ad_continue_visible = MagicMock(return_value=False)
+    ops._engagement_selected_visual = MagicMock(return_value=False)
+
+    with patch("rpa.hongguo.operations.time.sleep"):
+        result = ops.like_current_episode()
+
+    assert result["success"] is True
+    assert result["verified"] is True
+    assert result["already_active"] is False
+    ops.d.click.assert_called_once_with(665, 885)
+
+
+def test_engagement_episode_plan_respects_count_total_and_zero():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+
+    with patch("rpa.hongguo.engine.random.sample", return_value=[2, 4, 6]):
+        assert engine._engagement_episode_plan({"random_like_count": 3}, 10, "random_like_count", 5) == [2, 4, 6]
+    assert engine._engagement_episode_plan({"random_favorite_count": 0}, 10, "random_favorite_count", 1) == []
+
+    capped = engine._engagement_episode_plan({"random_like_count": 99}, 4, "random_like_count", 5)
+    assert capped == [1, 2, 3, 4]
+
+
+def test_process_engagement_episode_updates_success_counters_once():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._check_pause_stop = MagicMock()
+    engine._log = MagicMock()
+    engine._increment_engagement_counter = MagicMock()
+    ops = MagicMock()
+    ops.like_current_episode.return_value = {
+        "success": True,
+        "verified": True,
+        "message": "点赞成功",
+    }
+    ops.favorite_current_episode.return_value = {
+        "success": True,
+        "verified": True,
+        "message": "收藏成功",
+    }
+
+    engine._process_engagement_episode(ops, 7, {7}, {7})
+    engine._process_engagement_episode(ops, 7, {7}, {7})
+
+    assert engine._completed_engagement_episodes == {"like": {7}, "favorite": {7}}
+    assert engine._increment_engagement_counter.call_args_list == [call("like"), call("favorite")]
+    ops.like_current_episode.assert_called_once_with()
+    ops.favorite_current_episode.assert_called_once_with()
+
+
+def test_pending_episode_check_includes_unfinished_engagements():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    task = {
+        "execution_plan_json": json.dumps(
+            {"comment_episodes": [], "like_episodes": [3], "favorite_episodes": [4]}
+        )
+    }
+
+    assert engine._pending_comment_episodes_between(task, 2, 5) == [3, 4]
+    engine._completed_engagement_episodes["like"].add(3)
+    assert engine._pending_comment_episodes_between(task, 2, 5) == [4]
+
+
+def test_hongguo_task_payload_defaults_enable_random_engagements():
+    from rpa.dashboard.routes_hongguo import TaskBase
+
+    payload = TaskBase(drama_name="胭脂念念不忘")
+
+    assert payload.random_like_count == 5
+    assert payload.random_favorite_count == 1
+
+
 # TASK_COMPLETE: phase2_rpa_engine
 
 

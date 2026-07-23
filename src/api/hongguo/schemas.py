@@ -16,6 +16,8 @@ class TaskCreate(BaseModel):
     random_comment_count: int = Field(default=10, ge=1, description="随机评论总次数")
     random_min_interval: int = Field(default=20, ge=1, description="随机最小间隔秒")
     random_max_interval: int = Field(default=60, ge=1, description="随机最大间隔秒")
+    random_like_count: int = Field(default=5, ge=0, description="随机点赞总次数")
+    random_favorite_count: int = Field(default=1, ge=0, description="随机收藏总次数")
     content_source: str = Field(default="ai", description="内容来源: ai/template/mixed")
     templates: List[str] = Field(default=[], description="模板列表")
 
@@ -30,6 +32,8 @@ class TaskUpdate(BaseModel):
     random_comment_count: Optional[int] = None
     random_min_interval: Optional[int] = None
     random_max_interval: Optional[int] = None
+    random_like_count: Optional[int] = None
+    random_favorite_count: Optional[int] = None
     content_source: Optional[str] = None
     templates: Optional[List[str]] = None
 
@@ -45,6 +49,8 @@ class TaskResponse(BaseModel):
     random_comment_count: int
     random_min_interval: int
     random_max_interval: int
+    random_like_count: int
+    random_favorite_count: int
     content_source: str
     templates_json: str
     status: str
@@ -52,6 +58,9 @@ class TaskResponse(BaseModel):
     total_episodes: int
     comments_sent: int
     comments_verified: int
+    likes_completed: int
+    favorites_completed: int
+    completion_screenshot_path: Optional[str]
     error_message: Optional[str]
     started_at: Optional[datetime]
     completed_at: Optional[datetime]

@@ -1860,6 +1860,149 @@ class HongguoOperations:
                 return ((left + right) // 2, (top + bottom) // 2)
         return None
 
+    def like_current_episode(self) -> Dict[str, Any]:
+        return self._set_current_episode_engagement("like")
+
+    def favorite_current_episode(self) -> Dict[str, Any]:
+        return self._set_current_episode_engagement("favorite")
+
+    def _set_current_episode_engagement(self, action: str) -> Dict[str, Any]:
+        labels = {"like": "点赞", "favorite": "收藏"}
+        label = labels.get(action)
+        if not label:
+            return {"success": False, "verified": False, "message": "不支持的互动动作"}
+        try:
+            if self._comment_panel_open():
+                self._close_comment_panel()
+                time.sleep(0.6)
+            xml = self._xml()
+            if (
+                not self._short_series_activity_active()
+                or not self._playback_visible(xml)
+                or self._ad_continue_visible(xml)
+            ):
+                return {"success": False, "verified": False, "message": f"当前不在可{label}的播放页"}
+
+            point = self._engagement_control_point(action, xml)
+            selected = self._engagement_selected_from_xml(action, xml)
+            if selected is None:
+                selected = self._engagement_selected_visual(action, point)
+            if selected is True:
+                return {
+                    "success": True,
+                    "verified": True,
+                    "already_active": True,
+                    "message": f"当前视频已经{label}",
+                }
+
+            self.d.click(*point)
+            time.sleep(1)
+            after_xml = self._xml()
+            after_selected = self._engagement_selected_from_xml(action, after_xml)
+            if after_selected is not True and self._engagement_selected_visual(action, point) is True:
+                after_selected = True
+            if after_selected is True:
+                return {
+                    "success": True,
+                    "verified": True,
+                    "already_active": False,
+                    "message": f"{label}成功",
+                }
+
+            current = self._safe_app_current()
+            still_playing = bool(
+                current.get("package") == APP_PACKAGE
+                and current.get("activity") == SHORT_SERIES_ACTIVITY
+                and self._playback_visible(after_xml)
+            )
+            if after_selected is None and still_playing:
+                return {
+                    "success": True,
+                    "verified": False,
+                    "already_active": False,
+                    "message": f"{label}点击已发送，控件状态不可读",
+                }
+            return {"success": False, "verified": False, "message": f"{label}后未检测到生效状态"}
+        except Exception as exc:
+            return {"success": False, "verified": False, "message": f"{label}失败: {exc}"}
+
+    def _engagement_control_point(self, action: str, xml: str) -> tuple[int, int]:
+        markers = ("点赞", "赞") if action == "like" else ("收藏",)
+        candidates: List[tuple[int, int, int, int]] = []
+        for node in self._visible_hongguo_nodes(xml):
+            values = " ".join(
+                html.unescape(value)
+                for value in re.findall(r'(?:text|content-desc|resource-id)="([^"]*)"', node)
+            ).lower()
+            if not any(marker in values for marker in markers):
+                continue
+            bounds = self._node_bounds(node)
+            if not bounds:
+                continue
+            left, top, right, bottom = bounds
+            center_x = (left + right) // 2
+            center_y = (top + bottom) // 2
+            if center_x < self.width * 0.72 or not self.height * 0.25 <= center_y <= self.height * 0.82:
+                continue
+            candidates.append(bounds)
+        if candidates:
+            target_y = self.height * (0.70 if action == "like" else 0.48)
+            left, top, right, bottom = min(
+                candidates,
+                key=lambda bounds: abs(((bounds[1] + bounds[3]) // 2) - target_y),
+            )
+            return (left + right) // 2, (top + bottom) // 2
+        return int(self.width * 0.925), int(self.height * (0.70 if action == "like" else 0.48))
+
+    def _engagement_selected_from_xml(self, action: str, xml: str) -> Optional[bool]:
+        selected_markers = ("取消点赞", "已点赞") if action == "like" else ("取消收藏", "已收藏")
+        unselected_markers = ("点赞", "点赞按钮") if action == "like" else ("收藏", "收藏按钮")
+        for node in self._visible_hongguo_nodes(xml):
+            bounds = self._node_bounds(node)
+            if not bounds or (bounds[0] + bounds[2]) // 2 < self.width * 0.72:
+                continue
+            values = {
+                re.sub(r"\s+", "", html.unescape(value))
+                for value in re.findall(r'(?:text|content-desc)="([^"]*)"', node)
+                if value.strip()
+            }
+            if any(marker in value for marker in selected_markers for value in values):
+                return True
+            if any(value in unselected_markers for value in values):
+                return False
+        return None
+
+    def _engagement_selected_visual(self, action: str, point: tuple[int, int]) -> Optional[bool]:
+        try:
+            image = call_with_timeout(lambda: self.d.screenshot(), 8, f"{action} state screenshot").convert("RGB")
+        except Exception:
+            return None
+        center_x, center_y = point
+        radius_x = max(24, int(self.width * 0.055))
+        radius_y = max(24, int(self.height * 0.035))
+        crop = image.crop(
+            (
+                max(0, center_x - radius_x),
+                max(0, center_y - radius_y),
+                min(self.width, center_x + radius_x),
+                min(self.height, center_y + radius_y),
+            )
+        )
+        pixels = list(crop.getdata())
+        if not pixels:
+            return None
+        if action == "like":
+            colored = sum(
+                1 for red, green, blue in pixels
+                if red >= 175 and green <= 145 and blue <= 165 and red - green >= 55
+            )
+        else:
+            colored = sum(
+                1 for red, green, blue in pixels
+                if red >= 175 and green >= 105 and blue <= 125 and red - blue >= 65
+            )
+        return colored >= 18
+
     def exit_fullscreen(self) -> bool:
         if not self._short_series_activity_active():
             return False
