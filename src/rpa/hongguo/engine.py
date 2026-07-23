@@ -475,7 +475,21 @@ class TaskEngine:
 
         state = self._page_state_with_empty_retry(ops, task)
         total = int(state.get("total_episodes") or total_before or task_total or 0)
-        self._assert_target_playback(ops, task, state, total)
+        try:
+            self._assert_target_playback(ops, task, state, total)
+        except RuntimeError as exc:
+            if "非目标合集" not in str(exc):
+                raise
+            shot = ops.take_screenshot("select_drama_late_wrong_collection", self.screenshot_dir)
+            self._log(
+                "warn",
+                f"全流程v3: 首集播放后延迟识别到错误合集，已截图 {shot}，尝试精确标题重搜",
+            )
+            if not self._retry_reopen_target_from_main(ops, keyword, 1, task_total, task):
+                raise RuntimeError(f"{exc}，重搜目标短剧失败，已截图 {shot}") from exc
+            state = self._page_state_with_empty_retry(ops, task)
+            total = int(state.get("total_episodes") or total)
+            self._assert_target_playback(ops, task, state, total)
         return {
             "drama_title": drama_title,
             "total_episodes": total,
@@ -1618,7 +1632,7 @@ class TaskEngine:
             self._log("info", f"全流程v3: 恢复搜索结果={titles[:5]}，命中={selected_title or '-'}")
             if not selected_title:
                 self._log("warn", "全流程v3: 恢复搜索未找到可读文字标题命中，尝试无文字海报兜底校验")
-            selected = ops.select_drama(selected_title, keyword=keyword)
+            selected = ops.select_drama(selected_title, keyword=keyword, prefer_exact_title=True)
             if not selected.get("success"):
                 self._log("warn", selected.get("message") or "重新进入目标短剧失败")
                 if self._retry_reopen_target_from_main(ops, keyword, target, expected_total, task):
@@ -1675,7 +1689,7 @@ class TaskEngine:
         titles = ops._extract_drama_titles()
         selected_title = ops._choose_title(keyword, titles)
         self._log("info", f"全流程v3: 恢复重试搜索结果={titles[:5]}，命中={selected_title or '-'}")
-        selected = ops.select_drama(selected_title, keyword=keyword)
+        selected = ops.select_drama(selected_title, keyword=keyword, prefer_exact_title=True)
         if not selected.get("success"):
             self._log("warn", selected.get("message") or "恢复重试进入目标短剧失败")
             return False
@@ -1685,7 +1699,7 @@ class TaskEngine:
             self._log("info" if speed_set else "warn", f"全流程v3: 恢复重试倍速设置 {playback_speed} = {speed_set}")
         if not ops.play_episode(target):
             self._log("warn", f"全流程v3: 恢复重试第{target}集播放触发未确认")
-        return self._wait_for_episode_verified(
+        verified = self._wait_for_episode_verified(
             ops,
             task,
             target,
@@ -1693,6 +1707,15 @@ class TaskEngine:
             timeout=90,
             allow_reopen=False,
         )
+        if not verified:
+            return False
+        state = self._page_state_with_empty_retry(ops, task)
+        try:
+            self._assert_target_playback(ops, task, state, expected_total)
+        except RuntimeError as exc:
+            self._log("warn", f"全流程v3: 精确标题重搜后仍未通过目标合集校验: {exc}")
+            return False
+        return True
 
     def _page_state(self, ops: HongguoOperations, task: Dict[str, Any]) -> Dict[str, Any]:
         keyword = str(task.get("drama_name") or "").strip()

@@ -3877,6 +3877,68 @@ class TestHongguoEngineWaits:
         assert result["drama_title"] == "胭脂念念不忘"
         assert result["total_episodes"] == 40
 
+    def test_prepare_playback_recovers_late_wrong_collection_after_first_episode(self):
+        engine = TaskEngine(task_id=142, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._check_login = MagicMock(return_value={"logged_in": True})
+        engine._wait_for_episode_verified = MagicMock(return_value=True)
+        engine._retry_reopen_target_from_main = MagicMock(return_value=True)
+        engine._page_state_with_empty_retry = MagicMock(
+            side_effect=[
+                {
+                    "app": {
+                        "package": "com.phoenix.read",
+                        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                    },
+                    "playback_visible": True,
+                    "current_episode": 1,
+                    "total_episodes": 86,
+                    "collection_title": "小伙情书",
+                },
+                {
+                    "app": {
+                        "package": "com.phoenix.read",
+                        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                    },
+                    "playback_visible": True,
+                    "current_episode": 1,
+                    "total_episodes": 40,
+                    "collection_title": "胭脂念念不忘",
+                },
+            ]
+        )
+        engine._assert_target_playback = MagicMock(
+            side_effect=[RuntimeError("检测到非目标合集"), None]
+        )
+        ops = MagicMock()
+        ops.launch_app.return_value = True
+        ops.open_search_page.return_value = {"success": True}
+        ops.input_search_keyword.return_value = {"success": True}
+        ops.submit_search.return_value = {"success": True}
+        ops._extract_drama_titles.return_value = ["胭脂念念不忘"]
+        ops._choose_title.return_value = "胭脂念念不忘"
+        ops.select_drama.return_value = {"success": True, "drama_title": "胭脂念念不忘"}
+        ops._mismatched_collection_title.return_value = ""
+        ops.take_screenshot.return_value = "C:/tmp/late_wrong_collection.png"
+        ops.skip_ad_if_present.return_value = False
+        ops.get_total_episodes.return_value = 86
+        ops._safe_app_current.return_value = {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        }
+        ops._is_app_foreground.return_value = True
+        ops._launcher_visible.return_value = False
+        ops.play_episode.return_value = True
+
+        result = engine._prepare_verified_playback(
+            ops,
+            {"drama_name": "胭脂念念不忘", "playback_speed": "1.0x"},
+        )
+
+        engine._retry_reopen_target_from_main.assert_called_once()
+        assert result["total_episodes"] == 40
+
     def test_reopen_target_episode_closes_live_lite_before_opening_search(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
         engine._log = MagicMock()

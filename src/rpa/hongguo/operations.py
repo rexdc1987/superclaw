@@ -450,7 +450,12 @@ class HongguoOperations:
             "message": message,
         }
 
-    def select_drama(self, title: str, keyword: str = "") -> Dict[str, Any]:
+    def select_drama(
+        self,
+        title: str,
+        keyword: str = "",
+        prefer_exact_title: bool = False,
+    ) -> Dict[str, Any]:
         try:
             if not self._is_app_foreground():
                 return {"success": False, "drama_title": title, "playable": False, "message": "红果不在前台，取消选择短剧"}
@@ -466,10 +471,14 @@ class HongguoOperations:
                     "playable": False,
                     "message": "未进入搜索结果页 tabs，仍停留在搜索候选页，取消选择短剧",
                 }
-            clicked_card = self._click_matching_result_card(title, expected) if title else False
-            clicked = clicked_card
-            if not clicked:
+            clicked_card = False
+            if prefer_exact_title:
                 clicked = self._click_matching_title(title, expected) if title else False
+            else:
+                clicked_card = self._click_matching_result_card(title, expected) if title else False
+                clicked = clicked_card
+                if not clicked:
+                    clicked = self._click_matching_title(title, expected) if title else False
             if not clicked:
                 poster_result = self._try_unlabeled_poster_results(expected)
                 if poster_result:
