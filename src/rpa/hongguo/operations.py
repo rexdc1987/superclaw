@@ -3455,7 +3455,14 @@ class HongguoOperations:
 
     def _exists(self, el: Any, timeout: float = 3) -> bool:
         try:
-            return bool(el.exists(timeout=timeout))
+            # A selector timeout does not bound a wedged uiautomator HTTP call.
+            return bool(
+                call_with_timeout(
+                    lambda: el.exists(timeout=timeout),
+                    max(1.0, float(timeout) + 2.0),
+                    "element exists",
+                )
+            )
         except TypeError:
             start = time.time()
             while time.time() - start < timeout:

@@ -243,11 +243,21 @@ class CommentGenerator:
         return ""
 
     def _generate_local_comment(self, title: str) -> str:
+        return random.choice(self._local_comment_candidates(title))
+
+    def generate_local_comment_excluding(self, title: str, excluded: Iterable[str]) -> str:
+        """Return a local fallback that avoids known comments when possible."""
+        excluded_set = {str(value).strip() for value in excluded if str(value).strip()}
+        candidates = self._local_comment_candidates(title)
+        available = [comment for comment in candidates if comment not in excluded_set]
+        return random.choice(available or candidates)
+
+    def _local_comment_candidates(self, title: str) -> List[str]:
         matched: List[str] = []
         for keyword, comments in self.GENRE_COMMENTS.items():
             if keyword in (title or ""):
                 matched.extend(comments)
-        return random.choice(matched or self.GENERIC_COMMENTS)
+        return matched or self.GENERIC_COMMENTS
 
     def _strip_preamble(self, content: str) -> str:
         text = (content or "").strip()

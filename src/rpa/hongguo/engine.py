@@ -204,7 +204,14 @@ class TaskEngine:
                     if self._comment_already_verified(episode):
                         self._log("info", f"全流程v3: 第{episode}集已有成功评论记录，跳过重复评论")
                     else:
-                        self._handle_verified_comment(ops, task, drama_title, episode, total)
+                        self._handle_verified_comment(
+                            ops,
+                            task,
+                            drama_title,
+                            episode,
+                            total,
+                            avoid_contents=self._comment_contents_for_batch(),
+                        )
 
                 if episode >= total:
                     break
@@ -425,7 +432,7 @@ class TaskEngine:
             paused = ops.pause_playback_if_playing()
             panel_ready = ops.prepare_comment_window(episode)
             self._log(
-                "info" if panel_ready else "error",
+                "info" if panel_ready else "warn",
                 f"全流程v3: 第{episode}集恢复后准备评论，暂停播放={paused}，评论面板={panel_ready}",
             )
             if not panel_ready:
@@ -447,7 +454,7 @@ class TaskEngine:
                         paused = ops.pause_playback_if_playing()
                         panel_ready = ops.prepare_comment_window(episode)
                         self._log(
-                            "info" if panel_ready else "error",
+                            "info" if panel_ready else "warn",
                             f"全流程v3: 第{episode}集二次恢复后准备评论，当前集={confirmed or 0}，"
                             f"暂停播放={paused}，评论面板={panel_ready}",
                         )
@@ -474,7 +481,7 @@ class TaskEngine:
                     panel_ready = ops.prepare_comment_window(episode)
                     current = self._confirm_current_episode(ops, episode)
                     self._log(
-                        "info" if panel_ready else "error",
+                        "info" if panel_ready else "warn",
                         f"全流程v3: 第{episode}集冷启动恢复后准备评论，当前集={current or 0}，"
                         f"暂停播放={paused}，评论面板={panel_ready}",
                     )
@@ -498,7 +505,7 @@ class TaskEngine:
                             panel_ready = ops.prepare_comment_window(episode)
                             current = self._confirm_current_episode(ops, episode)
                             self._log(
-                                "info" if panel_ready else "error",
+                                "info" if panel_ready else "warn",
                                 f"全流程v3: 第{episode}集最终恢复后准备评论，当前集={current or 0}，"
                                 f"暂停播放={paused}，评论面板={panel_ready}",
                             )
@@ -525,6 +532,10 @@ class TaskEngine:
             )
             if not avoid_contents or content not in avoid_contents:
                 break
+        if avoid_contents and content in avoid_contents:
+            content = generator.generate_local_comment_excluding(drama_title, avoid_contents)
+            source = "local"
+            usage = {}
         if usage:
             record_usage(usage, context=f"task:{self.task_id}:episode:{episode}")
 
@@ -638,6 +649,44 @@ class TaskEngine:
                         """,
                         (self.task_id, episode),
                     )
+                    return {
+                        str(row.get("comment_text") or "").strip()
+                        for row in cur.fetchall() or []
+                        if str(row.get("comment_text") or "").strip()
+                    }
+        except Exception:
+            return set()
+
+    def _comment_contents_for_batch(self) -> set[str]:
+        """Collect comment text already used by this multi-device batch."""
+        try:
+            task = self._load_task() or {}
+            multi_run_id = str(task.get("multi_run_id") or "").strip()
+            with self._connection() as conn:
+                with conn.cursor() as cur:
+                    if multi_run_id:
+                        cur.execute(
+                            """
+                            SELECT record.comment_text
+                            FROM hongguo_comment_records AS record
+                            JOIN hongguo_comment_tasks AS task ON task.id=record.task_id
+                            WHERE task.multi_run_id=%s
+                              AND record.comment_text IS NOT NULL
+                              AND TRIM(record.comment_text) <> ''
+                            """,
+                            (multi_run_id,),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT comment_text
+                            FROM hongguo_comment_records
+                            WHERE task_id=%s
+                              AND comment_text IS NOT NULL
+                              AND TRIM(comment_text) <> ''
+                            """,
+                            (self.task_id,),
+                        )
                     return {
                         str(row.get("comment_text") or "").strip()
                         for row in cur.fetchall() or []

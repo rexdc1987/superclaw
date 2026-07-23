@@ -3185,6 +3185,64 @@ def test_comment_panel_retry_rechecks_episode_and_recovers_before_failing():
     assert engine._recover_to_verified_episode.call_count == 2
     assert ops.prepare_comment_window.call_count == 3
     ops.post_comment.assert_called_once_with("好看", 32)
+    assert not any(
+        logged.args[0] == "error" and "恢复后准备评论" in logged.args[1]
+        for logged in engine._log.call_args_list
+    )
+
+
+def test_comment_generation_falls_back_to_unused_local_text():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    ops = MagicMock()
+    ops.pause_playback_if_playing.return_value = True
+    ops.prepare_comment_window.return_value = True
+    ops.get_current_episode.return_value = 9
+    ops.post_comment.return_value = {"success": True}
+    ops.verify_comment.return_value = {"verified": True, "screenshot_path": "verified.png"}
+
+    with patch.object(CommentGenerator, "generate_with_usage", return_value=("重复评论", "ai", {})):
+        with patch.object(
+            CommentGenerator,
+            "generate_local_comment_excluding",
+            return_value="新的评论",
+        ) as fallback:
+            with patch.object(engine, "_save_record"):
+                with patch.object(engine, "_increment_counter"):
+                    with patch.object(engine, "_restore_playback_after_comment"):
+                        engine._handle_verified_comment(
+                            ops,
+                            {},
+                            "万妖图录传第一季",
+                            9,
+                            81,
+                            avoid_contents={"重复评论"},
+                        )
+
+    fallback.assert_called_once_with("万妖图录传第一季", {"重复评论"})
+    ops.post_comment.assert_called_once_with("新的评论", 9)
+
+
+def test_comment_contents_for_batch_includes_sibling_tasks():
+    engine = TaskEngine(task_id=127, db_config={}, screenshot_dir="C:/tmp")
+    engine._load_task = MagicMock(return_value={"multi_run_id": "batch-1"})
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        {"comment_text": "第一条"},
+        {"comment_text": "第二条"},
+        {"comment_text": "第一条"},
+    ]
+    cursor_context = MagicMock()
+    cursor_context.__enter__.return_value = cursor
+    connection = MagicMock()
+    connection.cursor.return_value = cursor_context
+    connection_context = MagicMock()
+    connection_context.__enter__.return_value = connection
+    engine._connection = MagicMock(return_value=connection_context)
+
+    assert engine._comment_contents_for_batch() == {"第一条", "第二条"}
+    assert cursor.execute.call_args.args[1] == ("batch-1",)
 
 
 def test_comment_panel_cold_restarts_after_repeated_overlay_obstruction():
@@ -3299,6 +3357,21 @@ def test_safe_resume_uses_final_playback_state_when_command_returns_false():
     assert engine._safe_resume_playback(ops, 4, "检查是否暂停") is True
 
     ops.resume_playback_if_paused.assert_not_called()
+
+
+def test_exists_has_a_hard_timeout_for_stale_uiautomator_selectors():
+    from rpa.hongguo.operations import HongguoOperations
+
+    ops = HongguoOperations.__new__(HongguoOperations)
+    element = MagicMock()
+    with patch("rpa.hongguo.operations.call_with_timeout", return_value=True) as timed:
+        assert ops._exists(element, timeout=0.5) is True
+
+    callback, hard_timeout, label = timed.call_args.args
+    assert hard_timeout == pytest.approx(2.5)
+    assert label == "element exists"
+    callback()
+    element.exists.assert_called_once_with(timeout=0.5)
 
 
 def test_verified_wait_throttles_persistent_ad_after_single_swipe():
