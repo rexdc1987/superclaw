@@ -85,6 +85,8 @@ class CommentGenerator:
     def __init__(self, ai_config: Dict[str, Any] | None = None):
         self.ai_config = dict(ai_config or {})
         self.last_usage: Dict[str, Any] = {}
+        self.last_source = "local"
+        self.last_error = ""
 
     def generate_ai_comment(self, title: str) -> str:
         comment, _ = self.generate_ai_comment_with_usage(title)
@@ -92,15 +94,21 @@ class CommentGenerator:
 
     def generate_ai_comment_with_usage(self, title: str) -> Tuple[str, Dict[str, Any]]:
         self.last_usage = {}
+        self.last_source = "local"
+        self.last_error = ""
         if self._ai_enabled():
             try:
                 comment, usage = self._generate_remote_comment(title)
                 self.last_usage = usage
+                self.last_source = "ai"
                 return comment, usage
             except Exception as exc:
+                self.last_error = str(exc)
                 if not self.ai_config.get("fallback_to_local", True):
                     raise CommentGenerationError(str(exc)) from exc
                 self.last_usage = {}
+        else:
+            self.last_error = "AI 未启用或未配置 API 密钥"
         return self._generate_local_comment(title), {}
 
     def pick_template(self, templates: Iterable[str]) -> str:
@@ -131,7 +139,7 @@ class CommentGenerator:
         if source == "template":
             return self.pick_template(templates or []), "template", {}
         comment, usage = self.generate_ai_comment_with_usage(title)
-        return comment, "ai", usage
+        return comment, self.last_source, usage
 
     def _ai_enabled(self) -> bool:
         return bool(self.ai_config.get("enabled", False) and self.ai_config.get("api_key"))

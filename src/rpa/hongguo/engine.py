@@ -224,6 +224,8 @@ class TaskEngine:
                     episode,
                     like_episodes,
                     favorite_episodes,
+                    total=total,
+                    task=task,
                 )
                 if not self._process_comment_episode(
                     ops,
@@ -266,13 +268,24 @@ class TaskEngine:
                 if likes_completed == len(like_episodes) and favorites_completed == len(favorite_episodes)
                 else "warn"
             )
+            engagement_complete = engagement_level == "info"
             self._log(
                 engagement_level,
                 f"全流程v3: 互动统计 点赞={likes_completed}/{len(like_episodes)}，"
                 f"收藏={favorites_completed}/{len(favorite_episodes)}，完成截图 {completion_screenshot}",
             )
-            if missing_comments:
-                message = f"评论验证未达标: 未验证成功集数={missing_comments}，计划评论集数={sorted(comment_episodes)}"
+            if missing_comments or not engagement_complete:
+                failures = []
+                if missing_comments:
+                    failures.append(
+                        f"评论验证未达标: 未验证成功集数={missing_comments}，计划评论集数={sorted(comment_episodes)}"
+                    )
+                if not engagement_complete:
+                    failures.append(
+                        f"互动未达标: 点赞={likes_completed}/{len(like_episodes)}，"
+                        f"收藏={favorites_completed}/{len(favorite_episodes)}"
+                    )
+                message = "；".join(failures)
                 self._update_task(
                     status="failed",
                     error_message=message,
@@ -340,6 +353,8 @@ class TaskEngine:
         episode: int,
         like_episodes: set[int],
         favorite_episodes: set[int],
+        total: int = 0,
+        task: Optional[Dict[str, Any]] = None,
     ) -> None:
         actions = (
             ("like", "点赞", like_episodes, ops.like_current_episode),
@@ -351,14 +366,75 @@ class TaskEngine:
             self._check_pause_stop()
             result = operation()
             success = bool(result.get("success"))
+            verified = bool(result.get("verified"))
             self._log(
-                "info" if success else "warn",
+                "info" if success and verified else "warn",
                 f"全流程v3: 第{episode}集随机{label}={'成功' if success else '失败'}，"
-                f"已验证={bool(result.get('verified'))}，{result.get('message') or '-'}",
+                f"已验证={verified}，{result.get('message') or '-'}",
             )
-            if success:
+            if success and verified:
+                if result.get("already_active"):
+                    replacement = self._reschedule_engagement_episode(
+                        action,
+                        label,
+                        episode,
+                        planned,
+                        total,
+                        task,
+                    )
+                    if replacement:
+                        self._log(
+                            "info",
+                            f"全流程v3: 第{episode}集原本已{label}，不消耗新增名额，顺延到第{replacement}集",
+                        )
+                    else:
+                        self._log(
+                            "warn",
+                            f"全流程v3: 第{episode}集原本已{label}，后续没有可顺延集数，不计入新增{label}",
+                        )
+                    continue
                 self._completed_engagement_episodes[action].add(episode)
                 self._increment_engagement_counter(action)
+
+    def _reschedule_engagement_episode(
+        self,
+        action: str,
+        label: str,
+        episode: int,
+        planned: set[int],
+        total: int,
+        task: Optional[Dict[str, Any]],
+    ) -> int:
+        candidates = [
+            value
+            for value in range(episode + 1, int(total or 0) + 1)
+            if value not in planned and value not in self._completed_engagement_episodes[action]
+        ]
+        if not candidates:
+            return 0
+        replacement = random.choice(candidates)
+        planned.discard(episode)
+        planned.add(replacement)
+        self._update_execution_plan_engagement(task, action, planned)
+        return replacement
+
+    def _update_execution_plan_engagement(
+        self,
+        task: Optional[Dict[str, Any]],
+        action: str,
+        planned: set[int],
+    ) -> None:
+        if not task:
+            return
+        try:
+            plan = json.loads(task.get("execution_plan_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            plan = {}
+        key = "like_episodes" if action == "like" else "favorite_episodes"
+        plan[key] = sorted(planned)
+        serialized = json.dumps(plan, ensure_ascii=False)
+        task["execution_plan_json"] = serialized
+        self._update_task(execution_plan_json=serialized, updated_at=datetime.now())
 
     def _prepare_verified_playback(self, ops: HongguoOperations, task: Dict[str, Any]) -> Dict[str, Any]:
         keyword = str(task.get("drama_name") or "").strip()
@@ -643,6 +719,14 @@ class TaskEngine:
             content = generator.generate_local_comment_excluding(drama_title, avoid_contents)
             source = "local"
             usage = {}
+            self._log("info", f"全流程v3: 第{episode}集AI评论重复，已改用本地去重内容")
+        requested_source = str(task.get("content_source") or "ai")
+        if source == "local" and requested_source in {"ai", "mixed"} and generator.last_error:
+            fallback_error = re.sub(r"\s+", " ", generator.last_error).strip()[:300]
+            self._log(
+                "warn",
+                f"全流程v3: 第{episode}集AI评论生成失败，已回退本地评论，原因={fallback_error}",
+            )
         if usage:
             record_usage(usage, context=f"task:{self.task_id}:episode:{episode}")
 
@@ -663,7 +747,7 @@ class TaskEngine:
                 self._restore_playback_after_comment(ops, task, current, expected_total)
                 return
 
-        self._log("info", f"全流程v3: 第{episode}集评论内容已生成，准备评论")
+        self._log("info", f"全流程v3: 第{episode}集评论内容已生成，来源={source or 'unknown'}，准备评论")
         input_path = ops.take_screenshot(f"ep{episode}_before_comment", self.screenshot_dir)
         post = ops.post_comment(content, episode)
         if not post.get("success"):
@@ -676,6 +760,11 @@ class TaskEngine:
                 self._log("warn", f"全流程v3: 第{episode}集评论失败后恢复播放异常: {exc}")
             return
 
+        sent_at = datetime.now()
+        try:
+            sent_path = ops.take_screenshot(f"ep{episode}_comment_sent", self.screenshot_dir)
+        except Exception:
+            sent_path = ""
         if count_sent:
             self._increment_counter("sent")
         verify = self._verify_comment_with_retry(ops, task, content, episode, expected_total)
@@ -706,7 +795,19 @@ class TaskEngine:
         )
         status = "success" if verify.get("verified") else "failed"
         error = None if verify.get("verified") else verify.get("message", "评论验证失败")
-        self._save_record(episode, content, source, status, input_path, verify_path, error)
+        verified_at = datetime.now() if verify.get("verified") else None
+        self._save_record(
+            episode,
+            content,
+            source,
+            status,
+            input_path,
+            verify_path,
+            error,
+            screenshot_sent=sent_path,
+            sent_at=sent_at,
+            verified_at=verified_at,
+        )
         if status == "success":
             self._increment_counter("verified")
         self._log(
@@ -1025,10 +1126,10 @@ class TaskEngine:
                     restored_app = restored_state.get("app") or {}
                     restored_current = int(restored_state.get("current_episode") or 0)
                     restored_total = int(restored_state.get("total_episodes") or 0)
-                    restored_playback = (
+                    restored_wrong_collection = bool(
                         restored_app.get("activity") == SHORT_SERIES_ACTIVITY
                         and self._has_playback_context(restored_state)
-                        and not self._total_mismatch_is_fatal(
+                        and self._total_mismatch_is_fatal(
                             ops,
                             task,
                             restored_state,
@@ -1037,6 +1138,19 @@ class TaskEngine:
                             current=restored_current,
                             target=target,
                         )
+                    )
+                    if restored_wrong_collection:
+                        self._log(
+                            "warn",
+                            f"全流程v3: 拉回前台后检测到错误合集，总集数={restored_total}，直接重新搜索目标短剧",
+                        )
+                        if self._reopen_target_episode(ops, task, target, expected_total):
+                            return True
+                        continue
+                    restored_playback = (
+                        restored_app.get("activity") == SHORT_SERIES_ACTIVITY
+                        and self._has_playback_context(restored_state)
+                        and not restored_wrong_collection
                     )
                     if restored_playback and restored_current == target:
                         self._log("info", f"全流程v3: 拉回红果前台后已进入第{target}集")
@@ -1903,13 +2017,17 @@ class TaskEngine:
         ):
             self._log("warn", f"全流程v3: 忽略播放页相关推荐标题 {detail_title}")
         if not current and bool(state.get("playback_visible") or ops._playback_visible()):
-            self._log("warn", "full_v3: playback visible but episode unreadable; continue observation")
+            try:
+                shot = ops.take_screenshot("playback_episode_unreadable", self.screenshot_dir)
+            except Exception:
+                shot = "截图失败"
+            self._log("warn", f"全流程v3: 播放页可见但当前集数不可读，继续观察，{shot}")
             return
         if not current:
             raise RuntimeError("未识别到当前集数")
         if not ops._playback_visible():
             if app.get("activity") == "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity":
-                self._log("info", "full_v3: playback controls hidden on short-series player; continue observation")
+                self._log("info", "全流程v3: 短剧播放页控件暂时隐藏，继续观察")
                 return
             raise RuntimeError("未检测到播放控件")
 
@@ -2034,6 +2152,13 @@ class TaskEngine:
             resumed = ops.resume_playback_if_paused(allow_center_fallback=True) or resumed
             time.sleep(1)
             still_paused = ops.is_playback_paused()
+        if not still_paused:
+            time.sleep(2)
+            still_paused = ops.is_playback_paused()
+            if still_paused:
+                resumed = ops.resume_playback_if_paused(allow_center_fallback=True) or resumed
+                time.sleep(1)
+                still_paused = ops.is_playback_paused()
         ok = not still_paused
         if ok:
             self._comment_recovered_at[int(episode)] = time.time()
@@ -2049,6 +2174,9 @@ class TaskEngine:
         if still_paused:
             resumed = ops.resume_playback_if_paused(allow_center_fallback=True) or resumed
             time.sleep(0.8)
+            still_paused = ops.is_playback_paused()
+        if still_paused:
+            time.sleep(1.5)
             still_paused = ops.is_playback_paused()
         ok = not still_paused
         self._log("info" if ok else "warn", f"全流程v3: 第{episode}集{reason}，安全播放={resumed}，仍暂停={still_paused}")
@@ -2841,6 +2969,9 @@ class TaskEngine:
         screenshot_input: str = "",
         screenshot_verified: str = "",
         error_message: Optional[str] = None,
+        screenshot_sent: str = "",
+        sent_at: Optional[datetime] = None,
+        verified_at: Optional[datetime] = None,
     ) -> None:
         with self._connection() as conn:
             with conn.cursor() as cur:
@@ -2848,8 +2979,9 @@ class TaskEngine:
                     """
                     INSERT INTO hongguo_comment_records (
                         task_id, episode_number, comment_text, generated_by,
-                        status, screenshot_input, screenshot_verified, error_message, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        status, sent_at, verified_at, screenshot_input, screenshot_sent,
+                        screenshot_verified, error_message, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         self.task_id,
@@ -2857,7 +2989,10 @@ class TaskEngine:
                         content,
                         source,
                         status,
+                        sent_at,
+                        verified_at,
                         screenshot_input or None,
+                        screenshot_sent or None,
                         screenshot_verified or None,
                         error_message,
                         datetime.now(),

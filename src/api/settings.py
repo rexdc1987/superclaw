@@ -113,7 +113,7 @@ async def test_ai_settings(payload: Optional[AISettingsUpdate] = None):
         current = payload.model_dump()
         api_key_env = current.get("api_key_env") or "OPENAI_API_KEY"
         current["api_key"] = current.get("api_key") or os.environ.get(api_key_env, "")
-        current["fallback_to_local"] = False
+    current["fallback_to_local"] = False
     try:
         content, source, usage = CommentGenerator(current).generate_with_usage("红果短剧", "ai")
         stats = record_usage(usage, context="settings:test") if usage else load_usage_stats()

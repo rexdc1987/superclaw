@@ -57,6 +57,7 @@ router = APIRouter(prefix="/api/v1/hongguo", tags=["hongguo"])
 logger = logging.getLogger("uvicorn.error")
 
 _MULTI_DEVICE_DETECTION_LOCK = threading.Lock()
+_MULTI_DEVICE_DETECTION_SUCCESS_TTL_SECONDS = 30
 _multi_device_detection_cache: Optional[Dict[str, Any]] = None
 _multi_device_detection_cache_at = 0.0
 
@@ -2441,7 +2442,7 @@ async def test_ai_settings(payload: Optional[AISettingsUpdate] = None, _=Depends
         ai = payload.model_dump()
         api_key_env = ai.get("api_key_env") or "OPENAI_API_KEY"
         ai["api_key"] = ai.get("api_key") or os.environ.get(api_key_env, "")
-        ai["fallback_to_local"] = False
+    ai["fallback_to_local"] = False
     try:
         content, source, usage = CommentGenerator(ai).generate_with_usage("红果短剧", "ai")
         from rpa.hongguo.ai_usage import record_usage
@@ -2960,6 +2961,13 @@ def _check_login_for_device(addr: str, mumu: Optional[Dict[str, Any]] = None) ->
             return entry
         if mumu:
             account = ops.get_account_info()
+            if not account.get("logged_in") and account.get("message") != "红果未登录":
+                # A freshly restarted uiautomator server can return one empty
+                # profile hierarchy before the accessibility tree settles.
+                time.sleep(1)
+                retry_account = ops.get_account_info()
+                if retry_account.get("logged_in") or retry_account.get("message") == "红果未登录":
+                    account = retry_account
             logged_in = bool(account.get("logged_in"))
             login = {
                 "logged_in": logged_in,
@@ -3246,20 +3254,35 @@ def list_multi_devices():
 
     request_started = time.monotonic()
     with _MULTI_DEVICE_DETECTION_LOCK:
+        cache_age = request_started - _multi_device_detection_cache_at
+        if (
+            _multi_device_detection_cache is not None
+            and 0 <= cache_age <= _MULTI_DEVICE_DETECTION_SUCCESS_TTL_SECONDS
+            and int(_multi_device_detection_cache.get("online_count") or 0) > 0
+            and int(_multi_device_detection_cache.get("logged_in_count") or 0)
+            == int(_multi_device_detection_cache.get("online_count") or 0)
+        ):
+            cached = _apply_device_lease_visibility(_multi_device_detection_cache)
+            cached["reused_recent_result"] = True
+            cached["reused_concurrent_result"] = False
+            return cached
+
         # A second browser request can arrive while the first request is still
-        # inspecting profile pages. Reuse only the result completed after this
-        # request began; later user-initiated checks always run fresh.
+        # inspecting profile pages. Reuse the result completed after this
+        # request began; successful results also have the short TTL above.
         if (
             _multi_device_detection_cache is not None
             and _multi_device_detection_cache_at >= request_started
         ):
             cached = _apply_device_lease_visibility(_multi_device_detection_cache)
+            cached["reused_recent_result"] = False
             cached["reused_concurrent_result"] = True
             return cached
 
         detection_started = time.monotonic()
         result = _detect_multi_devices_uncached()
         result["check_duration_sec"] = round(time.monotonic() - detection_started, 2)
+        result["reused_recent_result"] = False
         result["reused_concurrent_result"] = False
         _multi_device_detection_cache = result
         _multi_device_detection_cache_at = time.monotonic()

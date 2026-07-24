@@ -1905,18 +1905,21 @@ class HongguoOperations:
                 }
 
             self.d.click(*point)
-            time.sleep(1)
-            after_xml = self._xml()
-            after_selected = self._engagement_selected_from_xml(action, after_xml)
-            if after_selected is not True and self._engagement_selected_visual(action, point) is True:
-                after_selected = True
-            if after_selected is True:
-                return {
-                    "success": True,
-                    "verified": True,
-                    "already_active": False,
-                    "message": f"{label}成功",
-                }
+            after_xml = ""
+            after_selected: Optional[bool] = None
+            for _ in range(3):
+                time.sleep(1)
+                after_xml = self._xml()
+                after_selected = self._engagement_selected_from_xml(action, after_xml)
+                if after_selected is not True and self._engagement_selected_visual(action, point) is True:
+                    after_selected = True
+                if after_selected is True:
+                    return {
+                        "success": True,
+                        "verified": True,
+                        "already_active": False,
+                        "message": f"{label}成功",
+                    }
 
             current = self._safe_app_current()
             still_playing = bool(

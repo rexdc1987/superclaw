@@ -131,6 +131,63 @@ def test_multi_device_login_detection_allows_slow_mumu_profile_checks():
     assert all("check_duration_sec" in item for item in result["devices"])
 
 
+def test_mumu_login_detection_retries_ambiguous_profile_result():
+    from rpa.dashboard import routes_hongguo
+
+    ops = MagicMock()
+    ops._safe_app_current.return_value = {
+        "package": "com.phoenix.read",
+        "activity": "com.dragon.read.pages.main.MainFragmentActivity",
+    }
+    ops.get_account_info.side_effect = [
+        {
+            "logged_in": False,
+            "nickname": "",
+            "hongguo_id": "",
+            "message": "未识别红果账号信息",
+        },
+        {
+            "logged_in": True,
+            "nickname": "测试账号",
+            "hongguo_id": "123456",
+            "message": "已识别红果账号",
+        },
+    ]
+    instance = {"index": "2", "name": "RedmiK70", "android_version": "15.0"}
+
+    with patch.object(routes_hongguo, "connect_exact", return_value=object()):
+        with patch.object(routes_hongguo, "HongguoOperations", return_value=ops):
+            with patch.object(routes_hongguo.time, "sleep"):
+                result = routes_hongguo._check_login_for_device("127.0.0.1:16448", mumu=instance)
+
+    assert result["logged_in"] is True
+    assert result["status"] == "logged_in"
+    assert result["account"]["hongguo_id"] == "123456"
+    assert ops.get_account_info.call_count == 2
+
+
+def test_multi_device_login_detection_reuses_recent_all_logged_in_result():
+    from rpa.dashboard import routes_hongguo
+
+    cached = {
+        "success": True,
+        "devices": [{"addr": "127.0.0.1:16416", "logged_in": True}],
+        "ignored_devices": [],
+        "online_count": 1,
+        "logged_in_count": 1,
+    }
+    with patch.object(routes_hongguo, "_multi_device_detection_cache", cached):
+        with patch.object(routes_hongguo, "_multi_device_detection_cache_at", 100.0):
+            with patch.object(routes_hongguo.time, "monotonic", return_value=120.0):
+                with patch.object(routes_hongguo, "_apply_device_lease_visibility", side_effect=lambda value: dict(value)):
+                    with patch.object(routes_hongguo, "_detect_multi_devices_uncached") as detect:
+                        result = routes_hongguo.list_multi_devices()
+
+    assert result["reused_recent_result"] is True
+    assert result["reused_concurrent_result"] is False
+    detect.assert_not_called()
+
+
 def test_restart_uiautomator_server_kills_stale_processes_and_reconnects():
     from rpa.hongguo.operations import HongguoOperations
 
@@ -3283,6 +3340,59 @@ def test_comment_generation_falls_back_to_unused_local_text():
     ops.post_comment.assert_called_once_with("新的评论", 9)
 
 
+def test_ai_generation_reports_local_source_after_remote_fallback():
+    generator = CommentGenerator(
+        {
+            "enabled": True,
+            "api_key": "test-key",
+            "fallback_to_local": True,
+        }
+    )
+
+    with patch.object(generator, "_generate_remote_comment", side_effect=RuntimeError("network down")):
+        content, source, usage = generator.generate_with_usage("测试短剧", "ai")
+
+    assert content
+    assert source == "local"
+    assert usage == {}
+    assert generator.last_error == "network down"
+
+
+def test_save_comment_record_persists_send_and_verify_metadata():
+    engine = TaskEngine(task_id=7, db_config={}, screenshot_dir="C:/tmp")
+    cursor = MagicMock()
+    cursor_context = MagicMock()
+    cursor_context.__enter__.return_value = cursor
+    connection = MagicMock()
+    connection.cursor.return_value = cursor_context
+    connection_context = MagicMock()
+    connection_context.__enter__.return_value = connection
+    engine._connection = MagicMock(return_value=connection_context)
+
+    engine._save_record(
+        3,
+        "测试评论",
+        "ai",
+        "success",
+        "before.png",
+        "verified.png",
+        None,
+        screenshot_sent="sent.png",
+        sent_at="sent-at",
+        verified_at="verified-at",
+    )
+
+    sql, params = cursor.execute.call_args.args
+    assert "sent_at" in sql and "verified_at" in sql and "screenshot_sent" in sql
+    assert params[5:10] == (
+        "sent-at",
+        "verified-at",
+        "before.png",
+        "sent.png",
+        "verified.png",
+    )
+
+
 def test_local_comment_pool_covers_multi_device_batch_without_duplicates():
     generator = CommentGenerator({})
     used = set()
@@ -3478,6 +3588,51 @@ def test_safe_resume_uses_final_playback_state_when_command_returns_false():
     assert engine._safe_resume_playback(ops, 4, "检查是否暂停") is True
 
     ops.resume_playback_if_paused.assert_not_called()
+
+
+def test_safe_resume_suppresses_transient_pause_warning_after_delayed_recheck():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops.resume_playback_safely.return_value = False
+    ops.resume_playback_if_paused.return_value = False
+    ops.is_playback_paused.side_effect = [True, True, False]
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._safe_resume_playback(ops, 10, "仍停留当前集，检查是否暂停") is True
+
+    assert engine._log.call_args.args[0] == "info"
+
+
+def test_restore_playback_after_comment_recovers_delayed_pause():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._page_state = MagicMock(
+        return_value={
+            "current_episode": 4,
+            "total_episodes": 40,
+            "playback_visible": True,
+            "playback_paused": False,
+            "app_foreground": True,
+            "launcher_visible": False,
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+        }
+    )
+    engine._assert_target_playback = MagicMock()
+    ops = MagicMock()
+    ops.ensure_playback_page.return_value = True
+    ops.resume_playback_safely.return_value = False
+    ops.resume_playback_if_paused.return_value = True
+    ops.is_playback_paused.side_effect = [False, False, True, False]
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._restore_playback_after_comment(ops, {}, 4, 40) is True
+
+    ops.resume_playback_if_paused.assert_called_once_with(allow_center_fallback=True)
+    assert 4 in engine._comment_recovered_at
 
 
 def test_exists_has_a_hard_timeout_for_stale_uiautomator_selectors():
@@ -4267,6 +4422,46 @@ class TestHongguoEngineWaits:
                 assert engine._wait_for_next_episode_verified(ops, {}, 79, 80, 109) is True
 
         ops.play_episode.assert_called_once_with(80)
+        engine._recover_to_verified_episode.assert_not_called()
+
+    def test_verified_next_episode_reopens_immediately_after_foreground_restores_wrong_collection(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._restore_foreground_if_needed = MagicMock(return_value=True)
+        engine._recover_to_verified_episode = MagicMock(return_value=True)
+        engine._reopen_target_episode = MagicMock(return_value=True)
+        engine._has_playback_context = MagicMock(side_effect=[False, True])
+        engine._total_mismatch_is_fatal = MagicMock(return_value=True)
+        engine._page_state = MagicMock(
+            side_effect=[
+                {
+                    "current_episode": 0,
+                    "total_episodes": 0,
+                    "app_foreground": False,
+                    "launcher_visible": True,
+                    "app": {"package": "app.lawnchair", "activity": "app.lawnchair.Launcher"},
+                },
+                {
+                    "current_episode": 17,
+                    "total_episodes": 63,
+                    "app_foreground": True,
+                    "launcher_visible": False,
+                    "playback_visible": True,
+                    "app": {
+                        "package": "com.phoenix.read",
+                        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                    },
+                },
+            ]
+        )
+        ops = MagicMock()
+
+        with patch("rpa.hongguo.engine.time.time", return_value=0):
+            with patch("rpa.hongguo.engine.time.sleep"):
+                assert engine._wait_for_next_episode_verified(ops, {}, 16, 17, 40) is True
+
+        engine._reopen_target_episode.assert_called_once_with(ops, {}, 17, 40)
         engine._recover_to_verified_episode.assert_not_called()
 
     def test_verified_next_episode_advances_after_live_lite_returns_to_previous_episode(self):
@@ -5078,6 +5273,29 @@ def test_like_current_episode_clicks_control_and_verifies_selected_state():
     ops.d.click.assert_called_once_with(665, 885)
 
 
+def test_favorite_current_episode_waits_for_delayed_visual_confirmation():
+    ops = HongguoOperations.__new__(HongguoOperations)
+    ops.width, ops.height = 720, 1280
+    ops.d = MagicMock()
+    xml = (
+        '<node package="com.phoenix.read" visible-to-user="true" '
+        'content-desc="收藏" bounds="[630,560][700,650]" />'
+    )
+    ops._comment_panel_open = MagicMock(return_value=False)
+    ops._xml = MagicMock(return_value=xml)
+    ops._short_series_activity_active = MagicMock(return_value=True)
+    ops._playback_visible = MagicMock(return_value=True)
+    ops._ad_continue_visible = MagicMock(return_value=False)
+    ops._engagement_selected_visual = MagicMock(side_effect=[None, None, True])
+
+    with patch("rpa.hongguo.operations.time.sleep"):
+        result = ops.favorite_current_episode()
+
+    assert result["success"] is True
+    assert result["verified"] is True
+    assert ops._engagement_selected_visual.call_count == 3
+
+
 def test_engagement_episode_plan_respects_count_total_and_zero():
     engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
 
@@ -5113,6 +5331,56 @@ def test_process_engagement_episode_updates_success_counters_once():
     assert engine._increment_engagement_counter.call_args_list == [call("like"), call("favorite")]
     ops.like_current_episode.assert_called_once_with()
     ops.favorite_current_episode.assert_called_once_with()
+
+
+def test_process_engagement_episode_does_not_count_unverified_click():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._check_pause_stop = MagicMock()
+    engine._log = MagicMock()
+    engine._increment_engagement_counter = MagicMock()
+    ops = MagicMock()
+    ops.favorite_current_episode.return_value = {
+        "success": True,
+        "verified": False,
+        "message": "收藏点击已发送，控件状态不可读",
+    }
+
+    engine._process_engagement_episode(ops, 7, set(), {7})
+
+    assert engine._completed_engagement_episodes["favorite"] == set()
+    engine._increment_engagement_counter.assert_not_called()
+    assert engine._log.call_args.args[0] == "warn"
+
+
+def test_process_engagement_episode_reschedules_already_active_without_counting():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._check_pause_stop = MagicMock()
+    engine._log = MagicMock()
+    engine._update_task = MagicMock()
+    engine._increment_engagement_counter = MagicMock()
+    task = {
+        "execution_plan_json": json.dumps(
+            {"comment_episodes": [], "like_episodes": [], "favorite_episodes": [2, 5]}
+        )
+    }
+    favorites = {2, 5}
+    ops = MagicMock()
+    ops.favorite_current_episode.return_value = {
+        "success": True,
+        "verified": True,
+        "already_active": True,
+        "message": "当前视频已经收藏",
+    }
+
+    with patch("rpa.hongguo.engine.random.choice", return_value=3):
+        engine._process_engagement_episode(ops, 2, set(), favorites, total=6, task=task)
+
+    assert favorites == {3, 5}
+    assert engine._completed_engagement_episodes["favorite"] == set()
+    engine._increment_engagement_counter.assert_not_called()
+    updated_plan = json.loads(task["execution_plan_json"])
+    assert updated_plan["favorite_episodes"] == [3, 5]
+    assert "不消耗新增名额" in engine._log.call_args.args[1]
 
 
 def test_pending_episode_check_includes_unfinished_engagements():
