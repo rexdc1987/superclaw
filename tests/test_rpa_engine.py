@@ -3358,6 +3358,45 @@ def test_ai_generation_reports_local_source_after_remote_fallback():
     assert generator.last_error == "network down"
 
 
+def test_comment_generation_circuits_ai_after_auth_failure_for_remaining_task():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._current_ai_config = MagicMock(return_value={"enabled": True, "api_key": "bad-key"})
+    first_generator = MagicMock()
+    first_generator.generate_with_usage.return_value = ("本地兜底一", "local", {})
+    first_generator.last_error = "AI API HTTP 401: Invalid API Key (invalid_key)"
+    second_generator = MagicMock()
+    second_generator.generate_local_comment_excluding.return_value = "本地兜底二"
+
+    with patch(
+        "rpa.hongguo.engine.CommentGenerator",
+        side_effect=[first_generator, second_generator],
+    ):
+        first = engine._generate_comment_content(
+            {"content_source": "ai"},
+            "胭脂念念不忘",
+            3,
+            set(),
+        )
+        second = engine._generate_comment_content(
+            {"content_source": "ai"},
+            "胭脂念念不忘",
+            9,
+            {"本地兜底一"},
+        )
+
+    assert first == ("本地兜底一", "local", {})
+    assert second == ("本地兜底二", "local", {})
+    first_generator.generate_with_usage.assert_called_once()
+    second_generator.generate_with_usage.assert_not_called()
+    second_generator.generate_local_comment_excluding.assert_called_once_with(
+        "胭脂念念不忘",
+        {"本地兜底一"},
+    )
+    assert "401" in engine._ai_comment_disabled_reason
+    assert any("后续评论直接使用本地" in item.args[1] for item in engine._log.call_args_list)
+
+
 def test_save_comment_record_persists_send_and_verify_metadata():
     engine = TaskEngine(task_id=7, db_config={}, screenshot_dir="C:/tmp")
     cursor = MagicMock()
@@ -4719,6 +4758,43 @@ class TestHongguoEngineWaits:
 
         ops.play_episode.assert_not_called()
         engine._safe_resume_playback.assert_not_called()
+
+    def test_verified_next_episode_nudges_play_once_after_comment_even_when_pause_is_not_detected(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._has_playback_context = MagicMock(return_value=True)
+        engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+        engine._video_frames_are_static = MagicMock(return_value=False)
+        engine._comment_recovered_at[2] = 1
+        engine._page_state = MagicMock(
+            return_value={
+                "current_episode": 2,
+                "total_episodes": 40,
+                "playback_visible": True,
+                "playback_paused": False,
+                "ad_visible": False,
+                "app": {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                },
+            }
+        )
+        ops = MagicMock()
+        ops.resume_playback_safely.return_value = True
+        ops.take_screenshot.return_value = "C:/tmp/ep2_stale.png"
+        clock = {"value": -50}
+
+        def fake_time():
+            clock["value"] += 50
+            return clock["value"]
+
+        with patch("rpa.hongguo.engine.time.time", side_effect=fake_time):
+            with patch("rpa.hongguo.engine.time.sleep"):
+                assert engine._wait_for_next_episode_verified(ops, {}, 2, 3, 40) is False
+
+        ops.resume_playback_safely.assert_called_once_with()
+        assert any("主动发送播放命令" in item.args[1] for item in engine._log.call_args_list)
 
     def test_verified_wait_for_episode_accepts_skip_ahead_without_pending_comments(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")

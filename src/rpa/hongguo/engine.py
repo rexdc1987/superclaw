@@ -57,6 +57,7 @@ class TaskEngine:
             "favorite": set(),
         }
         self._device_info_cache: Dict[str, Any] = {}
+        self._ai_comment_disabled_reason = ""
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._generator = CommentGenerator(self.ai_config)
@@ -112,6 +113,7 @@ class TaskEngine:
 
     def _run_verified_flow(self) -> None:
         Path(self.screenshot_dir).mkdir(parents=True, exist_ok=True)
+        self._ai_comment_disabled_reason = ""
         try:
             os.environ.pop("PYTHONPATH", None)
             now = datetime.now()
@@ -676,6 +678,56 @@ class TaskEngine:
             "current_episode": int(state.get("current_episode") or 1),
         }
 
+    @staticmethod
+    def _is_ai_auth_error(message: str) -> bool:
+        value = str(message or "").lower()
+        return "401" in value or "invalid api key" in value or "invalid_key" in value
+
+    def _generate_comment_content(
+        self,
+        task: Dict[str, Any],
+        drama_title: str,
+        episode: int,
+        avoid_contents: Optional[set[str]],
+    ) -> tuple[str, str, Optional[Dict[str, Any]]]:
+        generator = CommentGenerator(self._current_ai_config())
+        requested_source = str(task.get("content_source") or "ai")
+        if self._ai_comment_disabled_reason and requested_source in {"ai", "mixed"}:
+            content = generator.generate_local_comment_excluding(drama_title, avoid_contents or set())
+            self._log(
+                "info",
+                f"全流程v3: 第{episode}集AI鉴权已熔断，本任务直接使用本地评论",
+            )
+            return content, "local", {}
+
+        content = ""
+        source = ""
+        usage: Optional[Dict[str, Any]] = None
+        for _ in range(3):
+            content, source, usage = generator.generate_with_usage(
+                drama_title,
+                requested_source,
+                self._templates(task),
+            )
+            if not avoid_contents or content not in avoid_contents:
+                break
+        if avoid_contents and content in avoid_contents:
+            content = generator.generate_local_comment_excluding(drama_title, avoid_contents)
+            source = "local"
+            usage = {}
+            self._log("info", f"全流程v3: 第{episode}集AI评论重复，已改用本地去重内容")
+        if source == "local" and requested_source in {"ai", "mixed"} and generator.last_error:
+            fallback_error = re.sub(r"\s+", " ", generator.last_error).strip()[:300]
+            auth_error = self._is_ai_auth_error(fallback_error)
+            if auth_error:
+                self._ai_comment_disabled_reason = fallback_error
+            suffix = "，本任务后续评论直接使用本地生成" if auth_error else ""
+            self._log(
+                "warn",
+                f"全流程v3: 第{episode}集AI评论生成失败，已回退本地评论，原因={fallback_error}{suffix}",
+            )
+        return content, source, usage
+
     def _handle_verified_comment(
         self,
         ops: HongguoOperations,
@@ -807,30 +859,12 @@ class TaskEngine:
                 )
                 raise RuntimeError(f"第{episode}集评论面板打开失败，已截图 {failed_path}")
 
-        generator = CommentGenerator(self._current_ai_config())
-        content = ""
-        source = ""
-        usage = None
-        for _ in range(3):
-            content, source, usage = generator.generate_with_usage(
-                drama_title,
-                task.get("content_source", "ai"),
-                self._templates(task),
-            )
-            if not avoid_contents or content not in avoid_contents:
-                break
-        if avoid_contents and content in avoid_contents:
-            content = generator.generate_local_comment_excluding(drama_title, avoid_contents)
-            source = "local"
-            usage = {}
-            self._log("info", f"全流程v3: 第{episode}集AI评论重复，已改用本地去重内容")
-        requested_source = str(task.get("content_source") or "ai")
-        if source == "local" and requested_source in {"ai", "mixed"} and generator.last_error:
-            fallback_error = re.sub(r"\s+", " ", generator.last_error).strip()[:300]
-            self._log(
-                "warn",
-                f"全流程v3: 第{episode}集AI评论生成失败，已回退本地评论，原因={fallback_error}",
-            )
+        content, source, usage = self._generate_comment_content(
+            task,
+            drama_title,
+            episode,
+            avoid_contents,
+        )
         if usage:
             record_usage(usage, context=f"task:{self.task_id}:episode:{episode}")
 
@@ -1221,6 +1255,7 @@ class TaskEngine:
         stale_observe_path = ""
         stale_observe_at = 0.0
         freeze_recovery_attempted = False
+        post_comment_play_nudged = False
         unreadable_since = 0.0
         last_episode_probe_at = 0.0
         while time.time() < deadline:
@@ -1498,6 +1533,18 @@ class TaskEngine:
                 observe_after = 60 if after_comment else 180
                 paused = bool(state.get("playback_paused"))
                 normal_playing = bool(state.get("playback_visible")) and not paused and not state.get("ad_visible")
+                if (
+                    after_comment
+                    and not post_comment_play_nudged
+                    and now - same_episode_since >= soft_recover_after
+                ):
+                    resumed = bool(ops.resume_playback_safely())
+                    post_comment_play_nudged = True
+                    self._log(
+                        "info",
+                        f"全流程v3: 第{episode}集评论后停留超过{soft_recover_after}秒，"
+                        f"主动发送播放命令={resumed}",
+                    )
                 if now - last_log_at >= log_interval:
                     if paused or not normal_playing:
                         self._log("info", f"全流程v3: 仍在第{episode}集，等待自动播放第{target}集")
@@ -1536,8 +1583,9 @@ class TaskEngine:
                     and not state.get("ad_visible")
                     and stale_observe_path
                     and not freeze_recovery_attempted
-                    and now - stale_observe_at >= 90
+                    and now - stale_observe_at >= (30 if after_comment else 90)
                 ):
+                    freeze_confirm_after = 30 if after_comment else 90
                     confirm_shot = ops.take_screenshot(f"ep{episode}_stale_confirm", self.screenshot_dir)
                     if self._video_frames_are_static(stale_observe_path, confirm_shot):
                         freeze_recovery_attempted = True
@@ -1552,7 +1600,7 @@ class TaskEngine:
                             )
                         self._log(
                             "warn",
-                            f"全流程v3: 第{episode}集视频区域连续90秒静止，截图 {confirm_shot}，"
+                            f"全流程v3: 第{episode}集视频区域连续{freeze_confirm_after}秒静止，截图 {confirm_shot}，"
                             f"恢复目标第{target}集={recovered}",
                         )
                         if recovered:
@@ -1567,6 +1615,7 @@ class TaskEngine:
                 stale_observe_path = ""
                 stale_observe_at = 0.0
                 freeze_recovery_attempted = False
+                post_comment_play_nudged = False
                 if getattr(ops, "_episode_list_panel_open", lambda: False)():
                     closed = getattr(ops, "_close_episode_list_panel", lambda _episode=0: False)(target)
                     self._log(
@@ -1586,6 +1635,7 @@ class TaskEngine:
                 stale_observe_path = ""
                 stale_observe_at = 0.0
                 freeze_recovery_attempted = False
+                post_comment_play_nudged = False
             if current > target:
                 pending_comments = self._pending_comment_episodes_between(task, target, current)
                 if not pending_comments:
