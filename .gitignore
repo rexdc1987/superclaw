@@ -9,6 +9,7 @@ env/
 *.egg-info/
 dist/
 build/
+artifacts/
 
 # Node
 node_modules/

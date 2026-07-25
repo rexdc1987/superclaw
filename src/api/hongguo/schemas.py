@@ -17,7 +17,7 @@ class TaskCreate(BaseModel):
     random_min_interval: int = Field(default=20, ge=1, description="随机最小间隔秒")
     random_max_interval: int = Field(default=60, ge=1, description="随机最大间隔秒")
     random_like_count: int = Field(default=5, ge=0, description="随机点赞总次数")
-    random_favorite_count: int = Field(default=1, ge=0, description="随机收藏总次数")
+    random_favorite_count: int = Field(default=1, ge=0, le=1, description="是否收藏短剧")
     content_source: str = Field(default="ai", description="内容来源: ai/template/mixed")
     templates: List[str] = Field(default=[], description="模板列表")
 
@@ -33,7 +33,7 @@ class TaskUpdate(BaseModel):
     random_min_interval: Optional[int] = None
     random_max_interval: Optional[int] = None
     random_like_count: Optional[int] = None
-    random_favorite_count: Optional[int] = None
+    random_favorite_count: Optional[int] = Field(default=None, ge=0, le=1)
     content_source: Optional[str] = None
     templates: Optional[List[str]] = None
 

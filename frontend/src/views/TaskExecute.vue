@@ -19,7 +19,7 @@
           <el-descriptions-item label="已发送">{{ task.comments_sent || 0 }} 条</el-descriptions-item>
           <el-descriptions-item label="已验证">{{ task.comments_verified || 0 }} 条</el-descriptions-item>
           <el-descriptions-item label="随机点赞">{{ task.likes_completed || 0 }} / {{ task.random_like_count ?? 5 }} 次</el-descriptions-item>
-          <el-descriptions-item label="随机收藏">{{ task.favorites_completed || 0 }} / {{ task.random_favorite_count ?? 1 }} 次</el-descriptions-item>
+          <el-descriptions-item label="短剧收藏">{{ task.favorites_completed || 0 }} / {{ Math.min(task.random_favorite_count ?? 1, 1) }}</el-descriptions-item>
           <el-descriptions-item label="播放倍速">{{ task.playback_speed || '1.0x' }}</el-descriptions-item>
           <el-descriptions-item label="创建时间">{{ formatTime(displayCreatedAt) }}</el-descriptions-item>
           <el-descriptions-item label="启动时间">{{ formatTime(displayStartedAt) }}</el-descriptions-item>

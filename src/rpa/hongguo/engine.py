@@ -195,7 +195,7 @@ class TaskEngine:
                     )
                     if self._recover_to_verified_episode(ops, task, episode, total, "主循环观察前离开播放页"):
                         state = self._page_state(ops, task)
-                self._assert_target_playback(ops, task, state, total)
+                state = self._ensure_target_playback_context(ops, task, state, episode, total)
                 current = int(state.get("current_episode") or 0)
                 if current and current != episode:
                     if current > episode and not self._pending_comment_episodes_between(task, episode, current):
@@ -259,6 +259,14 @@ class TaskEngine:
                     missing_comments,
                 )
                 completed_at = datetime.now()
+            self._retry_missing_engagements_before_completion(
+                ops,
+                task,
+                total,
+                like_episodes,
+                favorite_episodes,
+            )
+            completed_at = datetime.now()
             completion_screenshot = ops.take_screenshot("task_completed_summary", self.screenshot_dir)
             likes_completed = len(self._completed_engagement_episodes["like"])
             favorites_completed = len(self._completed_engagement_episodes["favorite"])
@@ -374,6 +382,11 @@ class TaskEngine:
             )
             if success and verified:
                 if result.get("already_active"):
+                    if action == "favorite":
+                        self._completed_engagement_episodes[action].add(episode)
+                        self._increment_engagement_counter(action)
+                        self._log("info", "全流程v3: 当前短剧原本已收藏，收藏目标已达成")
+                        continue
                     replacement = self._reschedule_engagement_episode(
                         action,
                         label,
@@ -395,6 +408,94 @@ class TaskEngine:
                     continue
                 self._completed_engagement_episodes[action].add(episode)
                 self._increment_engagement_counter(action)
+
+    def _retry_missing_engagements_before_completion(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        total: int,
+        like_episodes: set[int],
+        favorite_episodes: set[int],
+    ) -> None:
+        actions = (
+            ("like", "点赞", like_episodes, ops.like_current_episode),
+            ("favorite", "收藏", favorite_episodes, ops.favorite_current_episode),
+        )
+        for action, label, planned, operation in actions:
+            missing = len(planned) - len(self._completed_engagement_episodes[action])
+            if missing <= 0:
+                continue
+            attempted = set(planned) | set(self._completed_engagement_episodes[action])
+            candidates = [episode for episode in range(1, total + 1) if episode not in attempted]
+            random.shuffle(candidates)
+            self._log(
+                "warn",
+                f"全流程v3: 刷完后仍缺少{missing}次{label}，开始回访未尝试集数补偿",
+            )
+            for episode in candidates:
+                if len(self._completed_engagement_episodes[action]) >= len(planned):
+                    break
+                self._check_pause_stop()
+                if not self._recover_to_verified_episode(
+                    ops,
+                    task,
+                    episode,
+                    total,
+                    f"最终补偿{label}",
+                ):
+                    self._log("warn", f"全流程v3: 最终补偿{label}无法恢复到第{episode}集，继续尝试其他集")
+                    continue
+                result = operation()
+                success = bool(result.get("success"))
+                verified = bool(result.get("verified"))
+                already_active = bool(result.get("already_active"))
+                self._log(
+                    "info" if success and verified else "warn",
+                    f"全流程v3: 第{episode}集最终补偿{label}={'成功' if success else '失败'}，"
+                    f"已验证={verified}，{result.get('message') or '-'}",
+                )
+                if not success or not verified:
+                    continue
+                if action == "like" and already_active:
+                    continue
+                unresolved = sorted(planned - self._completed_engagement_episodes[action])
+                if unresolved:
+                    planned.discard(unresolved[0])
+                planned.add(episode)
+                self._completed_engagement_episodes[action].add(episode)
+                self._increment_engagement_counter(action)
+                self._update_execution_plan_engagement(task, action, planned)
+
+    def _ensure_target_playback_context(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        state: Dict[str, Any],
+        episode: int,
+        expected_total: int,
+    ) -> Dict[str, Any]:
+        try:
+            self._assert_target_playback(ops, task, state, expected_total)
+            return state
+        except RuntimeError as exc:
+            mismatch_markers = ("总集数不匹配", "非目标合集", "标题不匹配")
+            if not any(marker in str(exc) for marker in mismatch_markers):
+                raise
+            self._log(
+                "warn",
+                f"全流程v3: 第{episode}集观察前检测到错误合集，尝试恢复目标短剧，原因={exc}",
+            )
+            if not self._recover_to_verified_episode(
+                ops,
+                task,
+                episode,
+                expected_total,
+                f"主循环观察前目标短剧校验失败: {exc}",
+            ):
+                raise
+            recovered_state = self._page_state(ops, task)
+            self._assert_target_playback(ops, task, recovered_state, expected_total)
+            return recovered_state
 
     def _reschedule_engagement_episode(
         self,
@@ -450,6 +551,9 @@ class TaskEngine:
         self._log("info", f"全流程v3: 登录检测 - {login.get('message') or login.get('status')}")
         if not login.get("logged_in"):
             raise RuntimeError(login.get("message") or "登录检测失败")
+
+        if not self._reset_search_context(ops, "首次选剧"):
+            raise RuntimeError("首次选剧前无法重置到红果主页面")
 
         self._check_pause_stop()
         opened = ops.open_search_page(keyword)
@@ -953,6 +1057,7 @@ class TaskEngine:
         last_log_at = 0.0
         reseek_attempts = 0
         max_reseek_attempts = 8
+        stable_target_confirmations = 0
         while time.time() < deadline:
             self._check_pause_stop()
             state = self._page_state(ops, task)
@@ -1052,7 +1157,12 @@ class TaskEngine:
                     return True
                 raise RuntimeError(f"切集时短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
             if current == target:
-                return True
+                stable_target_confirmations += 1
+                if stable_target_confirmations >= 2:
+                    return True
+                time.sleep(2)
+                continue
+            stable_target_confirmations = 0
             if current > target and not self._pending_comment_episodes_between(task, target, current):
                 self._log(
                     "info",
@@ -1655,10 +1765,29 @@ class TaskEngine:
             self._log("warn", f"全流程v3: 常规恢复第{target}集失败，当前上下文禁止重新搜索")
             return False
 
-        reopened = self._reopen_target_episode(ops, task, target, expected_total)
-        if reopened:
-            self._log("info", f"全流程v3: 重新进入短剧后已恢复到第{target}集")
-        return reopened
+        for reopen_attempt in range(3):
+            prefer_exact_title = reopen_attempt != 1
+            reopened = self._reopen_target_episode(
+                ops,
+                task,
+                target,
+                expected_total,
+                prefer_exact_title=prefer_exact_title,
+            )
+            if reopened:
+                self._log(
+                    "info",
+                    f"全流程v3: 第{reopen_attempt + 1}轮重新进入短剧后已恢复到第{target}集",
+                )
+                return True
+            if reopen_attempt >= 2:
+                break
+            self._log(
+                "warn",
+                f"全流程v3: 第{reopen_attempt + 1}轮重新进入目标短剧未通过稳定校验，下一轮将冷重置后重试",
+            )
+            time.sleep(2)
+        return False
 
     def _reopen_target_episode(
         self,
@@ -1666,6 +1795,7 @@ class TaskEngine:
         task: Dict[str, Any],
         target: int,
         expected_total: int,
+        prefer_exact_title: bool = True,
     ) -> bool:
         keyword = str(task.get("drama_name") or "").strip()
         if not keyword:
@@ -1700,6 +1830,8 @@ class TaskEngine:
                 self._log("info" if foreground else "warn", f"全流程v3: 重新搜索前拉回红果前台={foreground}")
                 if not foreground:
                     return False
+            if not self._reset_search_context(ops, f"恢复第{target}集"):
+                return False
             opened = ops.open_search_page(keyword)
             self._log("info" if opened.get("success") else "warn", opened.get("message") or "重新进入搜索框")
             if not opened.get("success"):
@@ -1746,7 +1878,11 @@ class TaskEngine:
             self._log("info", f"全流程v3: 恢复搜索结果={titles[:5]}，命中={selected_title or '-'}")
             if not selected_title:
                 self._log("warn", "全流程v3: 恢复搜索未找到可读文字标题命中，尝试无文字海报兜底校验")
-            selected = ops.select_drama(selected_title, keyword=keyword, prefer_exact_title=True)
+            selected = ops.select_drama(
+                selected_title,
+                keyword=keyword,
+                prefer_exact_title=prefer_exact_title,
+            )
             if not selected.get("success"):
                 self._log("warn", selected.get("message") or "重新进入目标短剧失败")
                 if self._retry_reopen_target_from_main(ops, keyword, target, expected_total, task):
@@ -1779,10 +1915,8 @@ class TaskEngine:
         task: Dict[str, Any],
     ) -> bool:
         self._log("warn", f"全流程v3: 恢复选剧失败，强制回主页面后重试第{target}集")
-        open_main = getattr(ops, "_open_main_activity", None)
-        if callable(open_main):
-            opened_main = bool(open_main())
-            self._log("info" if opened_main else "warn", f"全流程v3: 恢复重试打开红果主页面={opened_main}")
+        if not self._reset_search_context(ops, f"恢复重试第{target}集"):
+            return False
         opened = ops.open_search_page(keyword)
         self._log("info" if opened.get("success") else "warn", opened.get("message") or "恢复重试进入搜索框")
         if not opened.get("success"):
@@ -1830,6 +1964,26 @@ class TaskEngine:
             self._log("warn", f"全流程v3: 精确标题重搜后仍未通过目标合集校验: {exc}")
             return False
         return True
+
+    def _reset_search_context(self, ops: HongguoOperations, reason: str) -> bool:
+        stop_app = getattr(ops, "_stop_app", None)
+        open_main = getattr(ops, "_open_main_activity", None)
+        if not callable(open_main):
+            self._log("warn", f"全流程v3: {reason}前无法调用红果主页面重置")
+            return False
+        try:
+            if callable(stop_app):
+                stop_app()
+                time.sleep(1)
+            opened_main = bool(open_main())
+        except Exception as exc:
+            self._log("warn", f"全流程v3: {reason}前重置红果主页面异常: {exc}")
+            return False
+        self._log(
+            "info" if opened_main else "warn",
+            f"全流程v3: {reason}前冷重置红果主页面={opened_main}",
+        )
+        return opened_main
 
     def _page_state(self, ops: HongguoOperations, task: Dict[str, Any]) -> Dict[str, Any]:
         keyword = str(task.get("drama_name") or "").strip()
@@ -2692,6 +2846,8 @@ class TaskEngine:
         raw_count = task.get(field)
         count = max(0, int(default if raw_count is None else raw_count))
         count = min(count, total)
+        if field == "random_favorite_count":
+            count = min(count, 1)
         return sorted(random.sample(range(1, total + 1), count)) if count else []
 
     def _task_rule_snapshot(self, task: Dict[str, Any]) -> Dict[str, Any]:

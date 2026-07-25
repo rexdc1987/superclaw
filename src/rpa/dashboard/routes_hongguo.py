@@ -623,7 +623,7 @@ class TaskBase(BaseModel):
     random_min_interval: int = Field(default=20, ge=0)
     random_max_interval: int = Field(default=60, ge=0)
     random_like_count: int = Field(default=5, ge=0)
-    random_favorite_count: int = Field(default=1, ge=0)
+    random_favorite_count: int = Field(default=1, ge=0, le=1)
     templates: List[str] = Field(default_factory=list)
 
     @field_validator("comment_mode")
@@ -725,7 +725,7 @@ class TaskUpdate(BaseModel):
     random_min_interval: Optional[int] = Field(default=None, ge=0)
     random_max_interval: Optional[int] = Field(default=None, ge=0)
     random_like_count: Optional[int] = Field(default=None, ge=0)
-    random_favorite_count: Optional[int] = Field(default=None, ge=0)
+    random_favorite_count: Optional[int] = Field(default=None, ge=0, le=1)
     templates: Optional[List[str]] = None
     status: Optional[str] = None
     total_episodes: Optional[int] = Field(default=None, ge=0)

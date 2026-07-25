@@ -1901,7 +1901,7 @@ class HongguoOperations:
                     "success": True,
                     "verified": True,
                     "already_active": True,
-                    "message": f"当前视频已经{label}",
+                    "message": "当前短剧已经收藏" if action == "favorite" else "当前视频已经点赞",
                 }
 
             self.d.click(*point)

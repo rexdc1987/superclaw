@@ -3907,7 +3907,7 @@ class TestHongguoEngineWaits:
             "current_episode": 1,
             "total_episodes": 77,
         }
-        with patch.object(engine, "_page_state", side_effect=[empty_state, valid_state]):
+        with patch.object(engine, "_page_state", side_effect=[empty_state, valid_state, valid_state]):
             with patch.object(engine, "_check_pause_stop"):
                 with patch.object(engine, "_log"):
                     with patch("rpa.hongguo.engine.time.sleep"):
@@ -3930,7 +3930,7 @@ class TestHongguoEngineWaits:
         current_one = {**current_two, "current_episode": 1}
         ops = MagicMock()
         ops.play_episode.return_value = True
-        with patch.object(engine, "_page_state", side_effect=[current_two, current_one]):
+        with patch.object(engine, "_page_state", side_effect=[current_two, current_one, current_one]):
             with patch.object(engine, "_check_pause_stop"):
                 with patch.object(engine, "_comment_already_verified", return_value=False):
                     with patch.object(engine, "_log"):
@@ -4116,7 +4116,9 @@ class TestHongguoEngineWaits:
                 53,
             ) is False
 
-        assert events == ["detect_live", "close_live", "open_search"]
+        assert events == ["detect_live", "close_live"]
+        ops._stop_app.assert_called_once()
+        ops.open_search_page.assert_not_called()
 
     def test_recover_to_verified_episode_skips_duplicate_retry_for_wrong_collection(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
@@ -4134,7 +4136,13 @@ class TestHongguoEngineWaits:
         ) is True
 
         ops.ensure_playback_page.assert_called_once_with(14)
-        engine._reopen_target_episode.assert_called_once_with(ops, {"drama_name": "万妖图录传8"}, 14, 109)
+        engine._reopen_target_episode.assert_called_once_with(
+            ops,
+            {"drama_name": "万妖图录传8"},
+            14,
+            109,
+            prefer_exact_title=True,
+        )
 
     def test_recover_to_verified_episode_reopens_when_regular_budget_is_exhausted(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
@@ -4157,7 +4165,39 @@ class TestHongguoEngineWaits:
 
         ops.ensure_playback_page.assert_called_once_with(14)
         engine._wait_for_episode_verified.assert_not_called()
-        engine._reopen_target_episode.assert_called_once_with(ops, {"drama_name": "万妖图录传8"}, 14, 109)
+        engine._reopen_target_episode.assert_called_once_with(
+            ops,
+            {"drama_name": "万妖图录传8"},
+            14,
+            109,
+            prefer_exact_title=True,
+        )
+
+    def test_recover_to_verified_episode_retries_reopen_with_alternate_result_selection(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._skip_ad_if_present = MagicMock(return_value=False)
+        engine._reopen_target_episode = MagicMock(side_effect=[False, False, True])
+        ops = MagicMock()
+        ops.ensure_playback_page.return_value = False
+        ops._open_main_activity.return_value = True
+
+        with patch("rpa.hongguo.engine.time.sleep"):
+            assert engine._recover_to_verified_episode(
+                ops,
+                {"drama_name": "胭脂念念不忘"},
+                1,
+                40,
+                "错误合集",
+            ) is True
+
+        assert engine._reopen_target_episode.call_args_list == [
+            call(ops, {"drama_name": "胭脂念念不忘"}, 1, 40, prefer_exact_title=True),
+            call(ops, {"drama_name": "胭脂念念不忘"}, 1, 40, prefer_exact_title=False),
+            call(ops, {"drama_name": "胭脂念念不忘"}, 1, 40, prefer_exact_title=True),
+        ]
+        ops._open_main_activity.assert_not_called()
 
     def test_reopen_target_episode_retries_search_after_forcing_main_page(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
@@ -4187,7 +4227,7 @@ class TestHongguoEngineWaits:
                 ) is True
 
         assert ops.open_search_page.call_count == 2
-        ops._open_main_activity.assert_called_once()
+        assert ops._open_main_activity.call_count == 2
 
     def test_engine_strict_title_matches_numeric_first_installment_with_subtitle(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
@@ -5242,7 +5282,7 @@ def test_favorite_current_episode_keeps_existing_favorite_active():
         "success": True,
         "verified": True,
         "already_active": True,
-        "message": "当前视频已经收藏",
+        "message": "当前短剧已经收藏",
     }
     ops.d.click.assert_not_called()
     ops._engagement_selected_visual.assert_not_called()
@@ -5302,6 +5342,11 @@ def test_engagement_episode_plan_respects_count_total_and_zero():
     with patch("rpa.hongguo.engine.random.sample", return_value=[2, 4, 6]):
         assert engine._engagement_episode_plan({"random_like_count": 3}, 10, "random_like_count", 5) == [2, 4, 6]
     assert engine._engagement_episode_plan({"random_favorite_count": 0}, 10, "random_favorite_count", 1) == []
+    with patch("rpa.hongguo.engine.random.sample", return_value=[4]) as sample:
+        assert engine._engagement_episode_plan(
+            {"random_favorite_count": 2}, 10, "random_favorite_count", 1
+        ) == [4]
+    sample.assert_called_once_with(range(1, 11), 1)
 
     capped = engine._engagement_episode_plan({"random_like_count": 99}, 4, "random_like_count", 5)
     assert capped == [1, 2, 3, 4]
@@ -5352,7 +5397,7 @@ def test_process_engagement_episode_does_not_count_unverified_click():
     assert engine._log.call_args.args[0] == "warn"
 
 
-def test_process_engagement_episode_reschedules_already_active_without_counting():
+def test_process_engagement_episode_reschedules_already_active_like_without_counting():
     engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
     engine._check_pause_stop = MagicMock()
     engine._log = MagicMock()
@@ -5360,27 +5405,127 @@ def test_process_engagement_episode_reschedules_already_active_without_counting(
     engine._increment_engagement_counter = MagicMock()
     task = {
         "execution_plan_json": json.dumps(
-            {"comment_episodes": [], "like_episodes": [], "favorite_episodes": [2, 5]}
+            {"comment_episodes": [], "like_episodes": [2, 5], "favorite_episodes": []}
         )
     }
-    favorites = {2, 5}
+    likes = {2, 5}
+    ops = MagicMock()
+    ops.like_current_episode.return_value = {
+        "success": True,
+        "verified": True,
+        "already_active": True,
+        "message": "当前视频已经点赞",
+    }
+
+    with patch("rpa.hongguo.engine.random.choice", return_value=3):
+        engine._process_engagement_episode(ops, 2, likes, set(), total=6, task=task)
+
+    assert likes == {3, 5}
+    assert engine._completed_engagement_episodes["like"] == set()
+    engine._increment_engagement_counter.assert_not_called()
+    updated_plan = json.loads(task["execution_plan_json"])
+    assert updated_plan["like_episodes"] == [3, 5]
+    assert "不消耗新增名额" in engine._log.call_args.args[1]
+
+
+def test_process_engagement_episode_counts_existing_drama_favorite_as_complete():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._check_pause_stop = MagicMock()
+    engine._log = MagicMock()
+    engine._increment_engagement_counter = MagicMock()
+    favorites = {7}
     ops = MagicMock()
     ops.favorite_current_episode.return_value = {
         "success": True,
         "verified": True,
         "already_active": True,
-        "message": "当前视频已经收藏",
+        "message": "当前短剧已经收藏",
     }
 
-    with patch("rpa.hongguo.engine.random.choice", return_value=3):
-        engine._process_engagement_episode(ops, 2, set(), favorites, total=6, task=task)
+    engine._process_engagement_episode(ops, 7, set(), favorites, total=40, task={})
 
-    assert favorites == {3, 5}
-    assert engine._completed_engagement_episodes["favorite"] == set()
-    engine._increment_engagement_counter.assert_not_called()
-    updated_plan = json.loads(task["execution_plan_json"])
-    assert updated_plan["favorite_episodes"] == [3, 5]
-    assert "不消耗新增名额" in engine._log.call_args.args[1]
+    assert engine._completed_engagement_episodes["favorite"] == {7}
+    engine._increment_engagement_counter.assert_called_once_with("favorite")
+    assert "收藏目标已达成" in engine._log.call_args.args[1]
+
+
+def test_final_engagement_retry_revisits_an_earlier_episode_when_last_like_is_already_active():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._increment_engagement_counter = MagicMock()
+    engine._update_task = MagicMock()
+    engine._completed_engagement_episodes = {"like": {18, 28}, "favorite": set()}
+    task = {
+        "execution_plan_json": json.dumps(
+            {"like_episodes": [18, 28, 40], "favorite_episodes": []}
+        )
+    }
+    likes = {18, 28, 40}
+    ops = MagicMock()
+    ops.like_current_episode.return_value = {
+        "success": True,
+        "verified": True,
+        "already_active": False,
+        "message": "点赞成功",
+    }
+
+    with patch("rpa.hongguo.engine.random.shuffle"):
+        engine._retry_missing_engagements_before_completion(
+            ops,
+            task,
+            40,
+            likes,
+            set(),
+        )
+
+    engine._recover_to_verified_episode.assert_called_once_with(
+        ops,
+        task,
+        1,
+        40,
+        "最终补偿点赞",
+    )
+    assert likes == {1, 18, 28}
+    assert engine._completed_engagement_episodes["like"] == {1, 18, 28}
+    engine._increment_engagement_counter.assert_called_once_with("like")
+    assert json.loads(task["execution_plan_json"])["like_episodes"] == [1, 18, 28]
+
+
+def test_main_loop_recovers_target_when_final_episode_switches_collection():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._assert_target_playback = MagicMock(
+        side_effect=[RuntimeError("检测到短剧总集数不匹配: 期望 40，实际 78"), None]
+    )
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    recovered_state = {"current_episode": 40, "total_episodes": 40}
+    engine._page_state = MagicMock(return_value=recovered_state)
+    ops = MagicMock()
+
+    result = engine._ensure_target_playback_context(
+        ops,
+        {"drama_name": "胭脂念念不忘"},
+        {"current_episode": 40, "total_episodes": 78},
+        40,
+        40,
+    )
+
+    assert result is recovered_state
+    engine._recover_to_verified_episode.assert_called_once()
+    assert "错误合集" in engine._log.call_args.args[1]
+
+
+def test_main_loop_does_not_hide_non_collection_playback_errors():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._assert_target_playback = MagicMock(side_effect=RuntimeError("未检测到播放控件"))
+    engine._recover_to_verified_episode = MagicMock()
+
+    with pytest.raises(RuntimeError, match="未检测到播放控件"):
+        engine._ensure_target_playback_context(MagicMock(), {}, {}, 4, 40)
+
+    engine._recover_to_verified_episode.assert_not_called()
 
 
 def test_pending_episode_check_includes_unfinished_engagements():
@@ -5403,6 +5548,9 @@ def test_hongguo_task_payload_defaults_enable_random_engagements():
 
     assert payload.random_like_count == 5
     assert payload.random_favorite_count == 1
+
+    with pytest.raises(ValueError):
+        TaskBase(drama_name="胭脂念念不忘", random_favorite_count=2)
 
 
 # TASK_COMPLETE: phase2_rpa_engine
