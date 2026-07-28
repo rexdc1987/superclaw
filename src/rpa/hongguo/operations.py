@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import html
 import logging
 import random
@@ -65,6 +66,12 @@ TAG_KEYWORDS = {
     "脑洞",
     "新剧",
     "热榜",
+    "爆剧",
+    "恋爱",
+    "热门",
+    "推荐",
+    "精选",
+    "独家",
 }
 
 
@@ -233,6 +240,13 @@ class HongguoOperations:
                 "\u7f16\u8f91\u8d44\u6599",
                 "\u63d0\u73b0",
                 "\u6536\u85cf",
+                # \u65b0\u7248\u7ea2\u679c UI \u6807\u8bb0\uff082026-07 \u53d1\u73b0\u6539\u7248\uff09
+                "\u6709\u94b1",
+                "\u5386\u53f2",
+                "\u5173\u6ce8",
+                "\u7c89\u4e1d",
+                "\u83b7\u8d5e",
+                "\u70b9\u8d5e",
             )
             login_prompts = (
                 "\u767b\u5f55",
@@ -242,12 +256,20 @@ class HongguoOperations:
             )
             login_prompt_visible = any(prompt in xml for prompt in login_prompts)
             strong_profile_groups = (
+                # \u65e7\u7248\u6807\u8bb0\u7ec4\uff08\u4fdd\u7559\u517c\u5bb9\uff09
                 ("\u63d0\u73b0", "\u8ba2\u5355", "\u6d88\u606f"),
                 ("\u6211\u7684\u94b1\u5305", "\u89c2\u770b\u5386\u53f2"),
                 ("\u7f16\u8f91\u8d44\u6599", "\u6536\u85cf"),
+                # \u65b0\u7248\u7ea2\u679c UI \u6807\u8bb0\u7ec4\uff082026-07 \u6539\u7248\u540e\uff09
+                ("\u63d0\u73b0", "\u6d88\u606f"),
+                ("\u6536\u85cf", "\u70b9\u8d5e"),
+                ("\u5173\u6ce8", "\u7c89\u4e1d", "\u83b7\u8d5e"),
+                ("\u6709\u94b1", "\u63d0\u73b0"),
             )
             strong_profile_visible = any(all(marker in xml for marker in group) for group in strong_profile_groups)
-            profile_logged_in = bool(hongguo_id or (strong_profile_visible and not login_prompt_visible))
+            # \u65b0\u7248 UI: \u6709\u6635\u79f0\u4e14\u65e0\u767b\u5f55\u63d0\u793a\u4e5f\u5224\u5b9a\u4e3a\u5df2\u767b\u5f55
+            nickname_logged_in = bool(nickname) and not login_prompt_visible
+            profile_logged_in = bool(hongguo_id or (strong_profile_visible and not login_prompt_visible) or nickname_logged_in)
             logged_in = bool(profile_logged_in)
             if not logged_in and login_prompt_visible:
                 result["message"] = "\u7ea2\u679c\u672a\u767b\u5f55"
@@ -459,7 +481,8 @@ class HongguoOperations:
         try:
             if not self._is_app_foreground():
                 return {"success": False, "drama_title": title, "playable": False, "message": "红果不在前台，取消选择短剧"}
-            expected = keyword or title
+            # 始终以用户指定的 keyword 为期望目标进行校验，避免用选中标题自我验证
+            expected = keyword if keyword else title
             detail_title = self._verified_detail_title(expected)
             if detail_title:
                 return self._drama_detail_result(detail_title, expected)
@@ -566,9 +589,18 @@ class HongguoOperations:
                     self._sleep(1, 1.5)
                     continue
                 return ""
-            if clicked_title and self._strict_title_matches(expected, clicked_title):
+            if clicked_title and (
+                self._strict_title_matches(expected, clicked_title)
+                or self._strict_title_matches(clicked_title, self._extract_detail_title())
+                or self._detail_markers_visible()
+            ):
                 observed_title = self._extract_detail_title()
-                if observed_title and not self._strict_title_matches(expected, observed_title):
+                if (
+                    observed_title
+                    and self._looks_like_specific_title(observed_title)
+                    and not self._strict_title_matches(expected, observed_title)
+                    and not self._strict_title_matches(clicked_title, observed_title)
+                ):
                     return ""
                 current = self._safe_app_current()
                 current_episode = self.get_current_episode()
@@ -2262,6 +2294,12 @@ class HongguoOperations:
             "\u7f16\u8f91\u8d44\u6599",
             "\u63d0\u73b0",
             "\u6536\u85cf",
+            # \u65b0\u7248\u7ea2\u679c UI \u6807\u8bb0
+            "\u6709\u94b1",
+            "\u5173\u6ce8",
+            "\u7c89\u4e1d",
+            "\u83b7\u8d5e",
+            "\u70b9\u8d5e",
         )
         if not any(marker in xml for marker in markers):
             return False
@@ -2694,6 +2732,24 @@ class HongguoOperations:
             match = re.search(pattern, xml)
             if match:
                 return match.group(1).strip("《》 ")
+        # fallback: 从播放页文本中提取最像短剧标题的候选
+        node_text = " ".join(self._hongguo_nodes(xml))
+        for candidate in re.findall(r"\u300a([^\u300b]{2,25})\u300b", node_text):
+            candidate = html.unescape(candidate).strip()
+            if self._is_title_candidate(candidate) and self._looks_like_explicit_drama_title(candidate):
+                return candidate
+        seen = set()
+        for pattern in [
+            r'text="([^"]{2,25})"[^>]*bounds="\[24,\d+\]\[\d+,\d+\]"',
+            r'text="([^"]{4,25})"',
+        ]:
+            for candidate in re.findall(pattern, node_text):
+                candidate = html.unescape(candidate).strip()
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                if self._is_title_candidate(candidate) and self._looks_like_explicit_drama_title(candidate):
+                    return candidate
         return ""
 
     def _click_first_play_button(self) -> bool:
@@ -3170,69 +3226,100 @@ class HongguoOperations:
             for candidate in candidates:
                 if self._title_matches(expected, candidate):
                     return candidate
-            return ""
+            # 没有匹配 expected 的候选，返回第一个有效候选，让上层校验发现标题不匹配
+            return candidates[0] if candidates else ""
         return candidates[0] if candidates else ""
 
     def _choose_title(self, keyword: str, titles: List[str]) -> str:
         matches = [title for title in titles if self._title_matches(keyword, title)]
-        if not matches:
-            return ""
         keyword_key = self._normalize_title_key(keyword)
-        keyword_has_variant = bool(self._season_marker(keyword_key) or self._has_variant_marker(keyword_key))
-        exact = [title for title in matches if self._normalize_title_key(title) == keyword_key]
-        extended = [
-            title
-            for title in matches
-            if self._normalize_title_key(title).startswith(keyword_key)
-            and self._normalize_title_key(title) != keyword_key
-            and self._looks_like_specific_title(title)
-        ]
-        if keyword_has_variant:
-            canonical = [
+        if matches:
+            keyword_has_variant = bool(self._season_marker(keyword_key) or self._has_variant_marker(keyword_key))
+            exact = [title for title in matches if self._normalize_title_key(title) == keyword_key]
+            extended = [
                 title
                 for title in matches
-                if re.search(r"第[一二三四五六七八九十\d]+季", self._normalize_title_key(title))
-                and self._season_marker(self._normalize_title_key(title)) == self._season_marker(keyword_key)
-                and self._title_stem(self._normalize_title_key(title)) == self._title_stem(keyword_key)
+                if self._normalize_title_key(title).startswith(keyword_key)
+                and self._normalize_title_key(title) != keyword_key
+                and self._looks_like_specific_title(title)
             ]
-            if canonical:
-                return min(canonical, key=lambda value: len(self._normalize_title_key(value)))
-            if extended:
-                return max(extended, key=lambda value: len(self._normalize_title_key(value)))
+            if keyword_has_variant:
+                canonical = [
+                    title
+                    for title in matches
+                    if re.search(r"第[一二三四五六七八九十\d]+季", self._normalize_title_key(title))
+                    and self._season_marker(self._normalize_title_key(title)) == self._season_marker(keyword_key)
+                    and self._title_stem(self._normalize_title_key(title)) == self._title_stem(keyword_key)
+                ]
+                if canonical:
+                    return min(canonical, key=lambda value: len(self._normalize_title_key(value)))
+                if extended:
+                    return max(extended, key=lambda value: len(self._normalize_title_key(value)))
+                if exact:
+                    return exact[0]
+                return matches[0]
             if exact:
                 return exact[0]
-            return matches[0]
-        if exact:
-            return exact[0]
 
-        ranked: List[tuple[tuple[int, int, int], str]] = []
-        for index, title in enumerate(matches):
-            title_key = self._normalize_title_key(title)
-            if not title_key.startswith(keyword_key):
-                continue
-            suffix = title_key[len(keyword_key) :]
-            numeric_installment = re.match(r"(\d+)", suffix)
-            if numeric_installment:
-                if int(numeric_installment.group(1)) != 1:
+            ranked: List[tuple[tuple[int, int, int], str]] = []
+            for index, title in enumerate(matches):
+                title_key = self._normalize_title_key(title)
+                if not title_key.startswith(keyword_key):
                     continue
-                rank = 1
+                suffix = title_key[len(keyword_key) :]
+                numeric_installment = re.match(r"(\d+)", suffix)
+                if numeric_installment:
+                    if int(numeric_installment.group(1)) != 1:
+                        continue
+                    rank = 1
+                    ranked.append(((rank, index, -len(title_key)), title))
+                    continue
+                season = self._season_marker(title_key)
+                has_variant = self._has_variant_marker(title_key)
+                if season and season != "1":
+                    continue
+                if season == "1":
+                    rank = 1
+                elif has_variant:
+                    rank = 3
+                else:
+                    rank = 2
                 ranked.append(((rank, index, -len(title_key)), title))
+            if ranked:
+                ranked.sort(key=lambda item: item[0])
+                return ranked[0][1]
+            return matches[0]
+
+        # 没有命中目标 keyword，退而求其次：选择 App 返回结果中与 keyword 最相似的一个
+        # 但如果 keyword 本身就是一个具体短剧名，则禁止模糊退而求其次，避免点到完全无关的短剧
+        if self._looks_like_specific_title(keyword):
+            logger.warning(
+                "关键词 \"%s\" 是具体短剧名但未在搜索结果中精确匹配，放弃选择", keyword
+            )
+            return ""
+        if not keyword_key or not titles:
+            return ""
+        best_title: str = ""
+        best_ratio: float = 0.0
+        for title in titles:
+            if self._looks_like_non_drama_result(title):
                 continue
-            season = self._season_marker(title_key)
-            has_variant = self._has_variant_marker(title_key)
-            if season and season != "1":
+            title_key = self._normalize_title_key(title)
+            if not title_key:
                 continue
-            if season == "1":
-                rank = 1
-            elif has_variant:
-                rank = 3
-            else:
-                rank = 2
-            ranked.append(((rank, index, -len(title_key)), title))
-        if ranked:
-            ranked.sort(key=lambda item: item[0])
-            return ranked[0][1]
-        return matches[0]
+            ratio = difflib.SequenceMatcher(None, keyword_key, title_key).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_title = title
+        if best_title and best_ratio >= 0.30:
+            logger.warning(
+                "关键词 \"%s\" 未精确匹配，退而求其次选择最相似结果 \"%s\" (ratio=%.2f)",
+                keyword,
+                best_title,
+                best_ratio,
+            )
+            return best_title
+        return ""
 
     def _looks_like_specific_title(self, title: str) -> bool:
         text = str(title or "").strip()
@@ -3419,6 +3506,14 @@ class HongguoOperations:
             "作者声明",
             "播放",
             "观看",
+            "快穿",
+            "图文",
+            "热门",
+            "推荐",
+            "猜你喜欢",
+            "榜单",
+            "分类",
+            "标签",
         }
         if any(word in text for word in skip_words):
             return False
@@ -3617,7 +3712,11 @@ class HongguoOperations:
 
     def _search_results_visible(self, xml: str = "") -> bool:
         text = " ".join(self._visible_hongguo_nodes(xml or self._xml()))
-        tab_hits = sum(1 for marker in ("综合", "短剧", "影视", "用户") if marker in text)
+        tab_markers = (
+            "综合", "短剧", "影视", "用户",
+            "小说", "听书",
+        )
+        tab_hits = sum(1 for marker in tab_markers if marker in text)
         return tab_hits >= 2 and any(marker in text for marker in ("搜索", "剧场", "播放", "热度", "全部"))
 
     def _candidate_results_visible(self, keyword: str, xml: str = "") -> bool:

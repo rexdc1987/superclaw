@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import random
 import re
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib import request
 from urllib.error import HTTPError, URLError
 
@@ -97,16 +97,22 @@ class CommentGenerator:
         self.last_source = "local"
         self.last_error = ""
         if self._ai_enabled():
-            try:
-                comment, usage = self._generate_remote_comment(title)
-                self.last_usage = usage
-                self.last_source = "ai"
-                return comment, usage
-            except Exception as exc:
-                self.last_error = str(exc)
-                if not self.ai_config.get("fallback_to_local", True):
-                    raise CommentGenerationError(str(exc)) from exc
-                self.last_usage = {}
+            last_exc: "Optional[Exception]" = None
+            max_retries = int(self.ai_config.get("max_retries", 2))
+            for attempt in range(max_retries + 1):
+                try:
+                    comment, usage = self._generate_remote_comment(title, attempt=attempt)
+                    self.last_usage = usage
+                    self.last_source = "ai"
+                    return comment, usage
+                except CommentGenerationError as exc:
+                    # 上游模型偶发把系统提示词原样吐回（prompt leak）/空回复，
+                    # 微调 temperature 后重试，大概率能拿到正常评论，避免无谓降级本地。
+                    last_exc = exc
+                    continue
+            self.last_error = str(last_exc) if last_exc else "AI 调用失败"
+            if not self.ai_config.get("fallback_to_local", True):
+                raise CommentGenerationError(self.last_error)
         else:
             self.last_error = "AI 未启用或未配置 API 密钥"
         return self._generate_local_comment(title), {}
@@ -150,7 +156,7 @@ class CommentGenerator:
             return scope
         return f"{self.DEFAULT_COMMENT_SCOPE}：{title or '红果短剧'}"
 
-    def _generate_remote_comment(self, title: str) -> Tuple[str, Dict[str, Any]]:
+    def _generate_remote_comment(self, title: str, attempt: int = 0) -> Tuple[str, Dict[str, Any]]:
         base_url = str(self.ai_config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
         model = str(self.ai_config.get("model") or "gpt-4o-mini")
         provider = str(self.ai_config.get("provider") or "openai_compatible")
@@ -178,7 +184,7 @@ class CommentGenerator:
                     ),
                 },
             ],
-            "temperature": float(self.ai_config.get("temperature") or 0.8),
+            "temperature": min(float(self.ai_config.get("temperature") or 0.8) + attempt * 0.12, 1.4),
             "max_tokens": int(self.ai_config.get("max_tokens") or 80),
         }
         req = request.Request(

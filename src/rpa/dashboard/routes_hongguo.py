@@ -3114,6 +3114,47 @@ def _detect_multi_devices_uncached() -> Dict[str, Any]:
         seen_addrs.add(addr)
         pending_checks.append((index, instance, addr))
 
+    # Retry ADB connection for instances whose process is started but ADB is
+    # not yet ready (MuMu VM boot race: player_state=start_finished but ADB
+    # returns errcode -202 "vm not ready").  Wait and re-discover.
+    adb_not_ready_indices = [
+        index
+        for index, slot in enumerate(device_slots)
+        if slot is not None and slot.get("status") == "adb_not_ready"
+    ]
+    if adb_not_ready_indices:
+        max_retries = 3
+        retry_indices = list(adb_not_ready_indices)
+        for attempt in range(1, max_retries + 1):
+            if not retry_indices:
+                break
+            logger.info(
+                "Hongguo ADB not-ready retry %d/%d for instances: %s",
+                attempt,
+                max_retries,
+                [mumu_instances[i].get("name") for i in retry_indices],
+            )
+            time.sleep(5)
+            retry_instances = discover_mumu_instances(connect_adb=True)
+            still_pending: List[int] = []
+            for index in retry_indices:
+                instance = retry_instances[index] if index < len(retry_instances) else None
+                if not instance:
+                    continue
+                addr = str(instance.get("addr") or "").strip()
+                if addr:
+                    seen_addrs.add(addr)
+                    pending_checks.append((index, instance, addr))
+                    logger.info(
+                        "Hongguo ADB retry: instance %s (%s) now reachable at %s",
+                        instance.get("index"),
+                        instance.get("name"),
+                        addr,
+                    )
+                else:
+                    still_pending.append(index)
+            retry_indices = still_pending
+
     # uiautomator2 sessions share the host ADB server. Concurrent profile-page
     # checks can block one another even when every device answers plain ADB.
     # Keep login inspection ordered; duplicate emulator-* aliases are filtered
@@ -3249,50 +3290,61 @@ def _apply_device_lease_visibility(result: Dict[str, Any]) -> Dict[str, Any]:
 def list_multi_devices():
     global _multi_device_detection_cache, _multi_device_detection_cache_at
 
-    if _execution_mode() == "api":
-        return _list_registered_worker_devices()
+    try:
+        if _execution_mode() == "api":
+            return _list_registered_worker_devices()
 
-    request_started = time.monotonic()
-    with _MULTI_DEVICE_DETECTION_LOCK:
-        cache_age = request_started - _multi_device_detection_cache_at
-        if (
-            _multi_device_detection_cache is not None
-            and 0 <= cache_age <= _MULTI_DEVICE_DETECTION_SUCCESS_TTL_SECONDS
-            and int(_multi_device_detection_cache.get("online_count") or 0) > 0
-            and int(_multi_device_detection_cache.get("logged_in_count") or 0)
-            == int(_multi_device_detection_cache.get("online_count") or 0)
-        ):
-            cached = _apply_device_lease_visibility(_multi_device_detection_cache)
-            cached["reused_recent_result"] = True
-            cached["reused_concurrent_result"] = False
-            return cached
+        request_started = time.monotonic()
+        with _MULTI_DEVICE_DETECTION_LOCK:
+            cache_age = request_started - _multi_device_detection_cache_at
+            if (
+                _multi_device_detection_cache is not None
+                and 0 <= cache_age <= _MULTI_DEVICE_DETECTION_SUCCESS_TTL_SECONDS
+                and int(_multi_device_detection_cache.get("online_count") or 0) > 0
+                and int(_multi_device_detection_cache.get("logged_in_count") or 0)
+                == int(_multi_device_detection_cache.get("online_count") or 0)
+            ):
+                cached = _apply_device_lease_visibility(_multi_device_detection_cache)
+                cached["reused_recent_result"] = True
+                cached["reused_concurrent_result"] = False
+                return cached
 
-        # A second browser request can arrive while the first request is still
-        # inspecting profile pages. Reuse the result completed after this
-        # request began; successful results also have the short TTL above.
-        if (
-            _multi_device_detection_cache is not None
-            and _multi_device_detection_cache_at >= request_started
-        ):
-            cached = _apply_device_lease_visibility(_multi_device_detection_cache)
-            cached["reused_recent_result"] = False
-            cached["reused_concurrent_result"] = True
-            return cached
+            # A second browser request can arrive while the first request is still
+            # inspecting profile pages. Reuse the result completed after this
+            # request began; successful results also have the short TTL above.
+            if (
+                _multi_device_detection_cache is not None
+                and _multi_device_detection_cache_at >= request_started
+            ):
+                cached = _apply_device_lease_visibility(_multi_device_detection_cache)
+                cached["reused_recent_result"] = False
+                cached["reused_concurrent_result"] = True
+                return cached
 
-        detection_started = time.monotonic()
-        result = _detect_multi_devices_uncached()
-        result["check_duration_sec"] = round(time.monotonic() - detection_started, 2)
-        result["reused_recent_result"] = False
-        result["reused_concurrent_result"] = False
-        _multi_device_detection_cache = result
-        _multi_device_detection_cache_at = time.monotonic()
-        logger.info(
-            "Hongguo multi-device login detection completed: online=%d logged_in=%d duration=%.2fs",
-            result["online_count"],
-            result["logged_in_count"],
-            result["check_duration_sec"],
-        )
-        return _apply_device_lease_visibility(result)
+            detection_started = time.monotonic()
+            result = _detect_multi_devices_uncached()
+            result["check_duration_sec"] = round(time.monotonic() - detection_started, 2)
+            result["reused_recent_result"] = False
+            result["reused_concurrent_result"] = False
+            _multi_device_detection_cache = result
+            _multi_device_detection_cache_at = time.monotonic()
+            logger.info(
+                "Hongguo multi-device login detection completed: online=%d logged_in=%d duration=%.2fs",
+                result["online_count"],
+                result["logged_in_count"],
+                result["check_duration_sec"],
+            )
+            return _apply_device_lease_visibility(result)
+    except Exception as exc:
+        logger.warning("list_multi_devices database error: %s", exc)
+        return {
+            "success": False,
+            "devices": [],
+            "ignored_devices": [],
+            "online_count": 0,
+            "logged_in_count": 0,
+            "database_error": f"MySQL 连接失败: {exc}",
+        }
 
 
 @router.post("/multi/tasks")
@@ -3323,22 +3375,26 @@ async def create_multi_tasks(payload: MultiTaskCreate):
 def list_multi_runs(limit: int = Query(default=20, ge=1, le=100)):
     owner_clause, owner_params = _owner_filter()
     owner_sql = f" AND {owner_clause}" if owner_clause else ""
-    with _connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT multi_run_id
-                FROM hongguo_comment_tasks
-                WHERE multi_run_id IS NOT NULL AND multi_run_id <> ''{owner_sql}
-                GROUP BY multi_run_id
-                ORDER BY MAX(created_at) DESC
-                LIMIT %s
-                """,
-                (*owner_params, limit),
-            )
-            run_ids = [row["multi_run_id"] for row in cur.fetchall() or []]
-        runs = [_serialize_multi_run(run_id, _fetch_multi_run_tasks(conn, run_id)) for run_id in run_ids]
-    return {"success": True, "runs": runs}
+    try:
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT multi_run_id
+                    FROM hongguo_comment_tasks
+                    WHERE multi_run_id IS NOT NULL AND multi_run_id <> ''{owner_sql}
+                    GROUP BY multi_run_id
+                    ORDER BY MAX(created_at) DESC
+                    LIMIT %s
+                    """,
+                    (*owner_params, limit),
+                )
+                run_ids = [row["multi_run_id"] for row in cur.fetchall() or []]
+            runs = [_serialize_multi_run(run_id, _fetch_multi_run_tasks(conn, run_id)) for run_id in run_ids]
+        return {"success": True, "runs": runs}
+    except Exception as exc:
+        logger.warning("list_multi_runs database error: %s", exc)
+        return {"success": False, "runs": [], "database_error": f"MySQL 连接失败: {exc}"}
 
 
 @router.get("/multi/runs/{run_id}")
