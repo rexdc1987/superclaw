@@ -23,8 +23,10 @@ api.interceptors.request.use(attachAuth)
 settingsApi.interceptors.request.use(attachAuth)
 
 function handleResponseError(error) {
-  const msg = error.response?.data?.detail || error.message || '请求失败'
-  ElMessage.error(msg)
+  if (!error.config?.silent) {
+    const msg = error.response?.data?.detail || error.message || '请求失败'
+    ElMessage.error(msg)
+  }
   return Promise.reject(error)
 }
 
@@ -47,8 +49,8 @@ export const checkLogin = () => api.post('/check-login', null, { timeout: 240000
 export const getDevices = () => api.get('/devices', { timeout: 90000 })
 export const getMultiDevices = () => api.get('/multi/devices', { timeout: 300000 })
 export const createMultiTasks = (data) => api.post('/multi/tasks', data)
-export const getMultiRuns = (params) => api.get('/multi/runs', { params })
-export const getMultiRun = (runId) => api.get('/multi/runs/' + runId)
+export const getMultiRuns = (params, config = {}) => api.get('/multi/runs', { ...config, params })
+export const getMultiRun = (runId, config = {}) => api.get('/multi/runs/' + runId, config)
 export const startMultiRun = (runId) => api.post('/multi/runs/' + runId + '/start', null, { timeout: 300000 })
 export const stopMultiRun = (runId) => api.post('/multi/runs/' + runId + '/stop', null, { timeout: 120000 })
 export const getAISettings = () => settingsApi.get('/ai')
@@ -60,7 +62,7 @@ export const getHongguoSettings = () => settingsApi.get('/hongguo')
 export const updateHongguoSettings = (data) => settingsApi.put('/hongguo', data)
 
 export const getRecords = (taskId, params) => api.get('/tasks/' + taskId + '/records', { params })
-export const getLogs = (taskId, params) => api.get('/tasks/' + taskId + '/logs', { params })
+export const getLogs = (taskId, params, config = {}) => api.get('/tasks/' + taskId + '/logs', { ...config, params })
 
 export const getTemplates = (params) => api.get('/templates', { params })
 export const createTemplate = (data) => api.post('/templates', data)

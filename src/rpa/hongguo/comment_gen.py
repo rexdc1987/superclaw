@@ -181,6 +181,10 @@ class CommentGenerator:
             "temperature": float(self.ai_config.get("temperature") or 0.8),
             "max_tokens": int(self.ai_config.get("max_tokens") or 80),
         }
+        if model.lower().startswith("mimo-"):
+            # MiMo may spend the entire completion budget on reasoning and
+            # return it in reasoning_content with an empty publishable answer.
+            payload["thinking"] = {"type": "disabled"}
         req = request.Request(
             f"{base_url}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -226,7 +230,6 @@ class CommentGenerator:
             candidates.extend(
                 [
                     message.get("content"),
-                    message.get("reasoning_content"),
                     message.get("text"),
                 ]
             )

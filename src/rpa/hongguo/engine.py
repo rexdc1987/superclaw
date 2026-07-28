@@ -200,16 +200,34 @@ class TaskEngine:
                 state = self._ensure_target_playback_context(ops, task, state, episode, total)
                 current = int(state.get("current_episode") or 0)
                 if current and current != episode:
-                    if current > episode and not self._pending_comment_episodes_between(task, episode, current):
+                    pending_episodes = (
+                        self._pending_comment_episodes_between(task, episode, current)
+                        if current > episode
+                        else []
+                    )
+                    if current > episode and not pending_episodes:
                         self._log(
                             "info",
                             f"全流程v3: 第{episode}集已自然播放越过到第{current}集，未命中评论或互动计划，顺延观察",
                         )
                         continue
-                    self._log("warn", f"全流程v3: 期望第{episode}集，当前识别第{current}集，尝试恢复目标集")
-                    if self._recover_to_verified_episode(ops, task, episode, total, f"主循环集数偏移，当前第{current}集"):
-                        state = self._page_state(ops, task)
-                        current = int(state.get("current_episode") or 0)
+                    recovery_episode = pending_episodes[0] if pending_episodes else episode
+                    self._log(
+                        "warn",
+                        f"全流程v3: 期望第{episode}集，当前识别第{current}集，"
+                        f"尝试恢复第{recovery_episode}集",
+                    )
+                    if self._recover_to_verified_episode(
+                        ops,
+                        task,
+                        recovery_episode,
+                        total,
+                        f"主循环集数偏移，当前第{current}集",
+                    ):
+                        # Recovery already performs stable episode verification. Process the
+                        # pending action immediately so fast playback cannot outrun it again.
+                        episode = recovery_episode
+                        current = recovery_episode
                     if current > episode and not self._pending_comment_episodes_between(task, episode, current):
                         self._log(
                             "info",
@@ -217,7 +235,9 @@ class TaskEngine:
                         )
                         continue
                     if current and current != episode:
-                        raise RuntimeError(f"全流程v3跳集异常: 期望第{episode}集，当前第{current}集")
+                        raise RuntimeError(
+                            f"全流程v3跳集异常: 期望第{recovery_episode}集，当前第{current}集"
+                        )
 
                 self._update_task(current_episode=episode, updated_at=datetime.now())
                 self._log("info", f"全流程v3: 正在观察第{episode}集")
@@ -584,10 +604,14 @@ class TaskEngine:
         if not selected_title:
             self._log("warn", "全流程v3: 未找到可读文字标题命中，尝试无文字海报兜底校验")
 
-        selected = ops.select_drama(selected_title, keyword=keyword)
+        task_total = int(task.get("total_episodes") or 0)
+        selected = ops.select_drama(
+            selected_title,
+            keyword=keyword,
+            expected_total=task_total,
+        )
         drama_title = selected.get("drama_title") or selected_title
         self._log("info", selected.get("message") or f"全流程v3: 已进入目标剧集 {drama_title}")
-        task_total = int(task.get("total_episodes") or 0)
         if not selected.get("success"):
             shot = ops.take_screenshot("select_drama_failed", self.screenshot_dir)
             self._log(
@@ -657,8 +681,15 @@ class TaskEngine:
 
         state = self._page_state_with_empty_retry(ops, task)
         total = int(state.get("total_episodes") or total_before or task_total or 0)
+        verified_total = int(total_before or task_total or total or 0)
         try:
-            self._assert_target_playback(ops, task, state, total)
+            self._assert_target_playback(
+                ops,
+                task,
+                state,
+                verified_total,
+                allow_unreadable_first_episode=True,
+            )
         except RuntimeError as exc:
             if "非目标合集" not in str(exc):
                 raise
@@ -671,7 +702,13 @@ class TaskEngine:
                 raise RuntimeError(f"{exc}，重搜目标短剧失败，已截图 {shot}") from exc
             state = self._page_state_with_empty_retry(ops, task)
             total = int(state.get("total_episodes") or total)
-            self._assert_target_playback(ops, task, state, total)
+            self._assert_target_playback(
+                ops,
+                task,
+                state,
+                int(task_total or total or 0),
+                allow_unreadable_first_episode=True,
+            )
         return {
             "drama_title": drama_title,
             "total_episodes": total,
@@ -1092,6 +1129,7 @@ class TaskEngine:
         reseek_attempts = 0
         max_reseek_attempts = 8
         stable_target_confirmations = 0
+        unreadable_state_recovery_attempted = False
         while time.time() < deadline:
             self._check_pause_stop()
             state = self._page_state(ops, task)
@@ -1103,6 +1141,25 @@ class TaskEngine:
                 and not state.get("launcher_visible")
                 and not state.get("playback_visible")
             ):
+                if not unreadable_state_recovery_attempted:
+                    unreadable_state_recovery_attempted = True
+                    restart_uiautomator = getattr(ops, "_restart_uiautomator_server", None)
+                    restarted = False
+                    if callable(restart_uiautomator):
+                        try:
+                            restarted = bool(restart_uiautomator())
+                        except Exception as exc:
+                            self._log(
+                                "warn",
+                                f"全流程v3: 切第{target}集时自动化服务恢复异常: {exc}",
+                            )
+                    self._log(
+                        "info" if restarted else "warn",
+                        f"全流程v3: 切第{target}集时页面状态完全不可读，重启自动化服务={restarted}",
+                    )
+                    if restarted:
+                        time.sleep(2)
+                        continue
                 now = time.time()
                 if now - last_log_at >= 10:
                     self._log("warn", f"全流程v3: 切第{target}集时页面状态暂不可读，继续重试")
@@ -1191,6 +1248,8 @@ class TaskEngine:
                     return True
                 raise RuntimeError(f"切集时短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
             if current == target:
+                if self._pause_pending_action_episode(ops, task, target, state):
+                    return True
                 stable_target_confirmations += 1
                 if stable_target_confirmations >= 2:
                     return True
@@ -1206,6 +1265,8 @@ class TaskEngine:
             if current > target and reseek_attempts < max_reseek_attempts:
                 reseek_attempts += 1
                 replayed = ops.play_episode(target)
+                if replayed and self._pause_pending_action_episode(ops, task, target):
+                    return True
                 deadline = max(deadline, time.time() + 45)
                 self._log(
                     "warn",
@@ -1298,6 +1359,7 @@ class TaskEngine:
                         and not restored_wrong_collection
                     )
                     if restored_playback and restored_current == target:
+                        self._pause_pending_action_episode(ops, task, target, restored_state)
                         self._log("info", f"全流程v3: 拉回红果前台后已进入第{target}集")
                         return True
                     if restored_playback and restored_current in (0, episode):
@@ -1307,6 +1369,7 @@ class TaskEngine:
                             f"全流程v3: 拉回红果前台后直接切换第{target}集={advanced}",
                         )
                         if advanced:
+                            self._pause_pending_action_episode(ops, task, target)
                             return True
                     if (
                         restored_playback
@@ -1378,6 +1441,7 @@ class TaskEngine:
                         restored_current = int(restored_state.get("current_episode") or 0)
                         if restored_activity == SHORT_SERIES_ACTIVITY and self._has_playback_context(restored_state):
                             if restored_current == target:
+                                self._pause_pending_action_episode(ops, task, target, restored_state)
                                 self._log("info", f"全流程v3: 关闭红果内部直播页后已进入第{target}集")
                                 return True
                             if restored_current in (0, episode):
@@ -1402,6 +1466,7 @@ class TaskEngine:
                                         f"全流程v3: 直播页关闭后第二次主动切换第{target}集={advanced}",
                                     )
                                 if advanced:
+                                    self._pause_pending_action_episode(ops, task, target)
                                     return True
                                 if self._recover_to_verified_episode(
                                     ops,
@@ -1520,6 +1585,7 @@ class TaskEngine:
                 raise RuntimeError(f"第{episode}集后跳到其他短剧: 期望总集数 {expected_total}，实际 {total}")
 
             if current == target:
+                self._pause_pending_action_episode(ops, task, target, state)
                 self._log("info", f"全流程v3: 已自动进入第{target}集")
                 return True
             if current == episode:
@@ -1762,6 +1828,25 @@ class TaskEngine:
             if start_episode <= episode < end_episode
         ]
 
+    def _pause_pending_action_episode(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        episode: int,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if not self._pending_comment_episodes_between(task, episode, episode + 1):
+            return False
+        if state and state.get("playback_paused"):
+            return True
+        pause = getattr(ops, "pause_playback_quickly", None)
+        paused = bool(pause()) if callable(pause) else False
+        self._log(
+            "info" if paused else "warn",
+            f"全流程v3: 第{episode}集命中待执行评论或互动，立即暂停={paused}",
+        )
+        return paused
+
     def _recover_to_verified_episode(
         self,
         ops: HongguoOperations,
@@ -1932,6 +2017,8 @@ class TaskEngine:
                 selected_title,
                 keyword=keyword,
                 prefer_exact_title=prefer_exact_title,
+                prefer_result_card=not prefer_exact_title,
+                expected_total=expected_total,
             )
             if not selected.get("success"):
                 self._log("warn", selected.get("message") or "重新进入目标短剧失败")
@@ -1987,7 +2074,12 @@ class TaskEngine:
         titles = ops._extract_drama_titles()
         selected_title = ops._choose_title(keyword, titles)
         self._log("info", f"全流程v3: 恢复重试搜索结果={titles[:5]}，命中={selected_title or '-'}")
-        selected = ops.select_drama(selected_title, keyword=keyword, prefer_exact_title=True)
+        selected = ops.select_drama(
+            selected_title,
+            keyword=keyword,
+            prefer_exact_title=True,
+            expected_total=expected_total,
+        )
         if not selected.get("success"):
             self._log("warn", selected.get("message") or "恢复重试进入目标短剧失败")
             return False
@@ -2184,6 +2276,8 @@ class TaskEngine:
         task: Dict[str, Any],
         state: Dict[str, Any],
         expected_total: int,
+        *,
+        allow_unreadable_first_episode: bool = False,
     ) -> None:
         app = state.get("app") or {}
         if not self._has_playback_context(state):
@@ -2200,18 +2294,14 @@ class TaskEngine:
             raise RuntimeError(f"检测到非目标合集: 期望 {keyword}，实际 {collection_title}")
         playing_title = str(state.get("playing_title") or "").strip()
         detail_title = str(state.get("detail_title") or "").strip()
+        if keyword and playing_title and not self._strict_title_matches(keyword, playing_title):
+            raise RuntimeError(f"检测到短剧标题不匹配: 期望 {keyword}，实际 {playing_title}")
         title_signals = [playing_title]
         if not state.get("playback_visible"):
             title_signals.append(detail_title)
         reliable_titles = [title for title in title_signals if self._reliable_title_signal(keyword, title)]
         if keyword and reliable_titles and not any(self._strict_title_matches(keyword, title) for title in reliable_titles):
-            if expected_total and total == expected_total and current == expected_total:
-                self._log(
-                    "warn",
-                    f"全流程v3: 最终第{current}集已确认，忽略页面相关推荐标题 {reliable_titles[0]}",
-                )
-            else:
-                raise RuntimeError(f"检测到短剧标题不匹配: 期望 {keyword}，实际 {reliable_titles[0]}")
+            raise RuntimeError(f"检测到短剧标题不匹配: 期望 {keyword}，实际 {reliable_titles[0]}")
         if (
             keyword
             and state.get("playback_visible")
@@ -2226,6 +2316,18 @@ class TaskEngine:
             except Exception:
                 shot = "截图失败"
             self._log("warn", f"全流程v3: 播放页可见但当前集数不可读，继续观察，{shot}")
+            return
+        if (
+            not current
+            and allow_unreadable_first_episode
+            and expected_total > 0
+            and total == expected_total
+            and app.get("package") == "com.phoenix.read"
+            and app.get("activity") == "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity"
+            and not state.get("launcher_visible")
+            and not state.get("ad_visible")
+        ):
+            self._log("info", "全流程v3: 首集已确认，播放控件暂时隐藏，按第1集继续")
             return
         if not current:
             raise RuntimeError("未识别到当前集数")

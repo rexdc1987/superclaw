@@ -455,6 +455,8 @@ class HongguoOperations:
         title: str,
         keyword: str = "",
         prefer_exact_title: bool = False,
+        prefer_result_card: bool = False,
+        expected_total: int = 0,
     ) -> Dict[str, Any]:
         try:
             if not self._is_app_foreground():
@@ -472,13 +474,18 @@ class HongguoOperations:
                     "message": "未进入搜索结果页 tabs，仍停留在搜索候选页，取消选择短剧",
                 }
             clicked_card = False
-            if prefer_exact_title:
-                clicked = self._click_matching_title(title, expected) if title else False
-            else:
+            if prefer_result_card:
                 clicked_card = self._click_matching_result_card(title, expected) if title else False
                 clicked = clicked_card
                 if not clicked:
                     clicked = self._click_matching_title(title, expected) if title else False
+            elif prefer_exact_title:
+                clicked = self._click_matching_title(title, expected) if title else False
+            else:
+                clicked = self._click_matching_title(title, expected) if title else False
+                if not clicked:
+                    clicked_card = self._click_matching_result_card(title, expected) if title else False
+                    clicked = clicked_card
             if not clicked:
                 poster_result = self._try_unlabeled_poster_results(expected)
                 if poster_result:
@@ -493,6 +500,7 @@ class HongguoOperations:
                     "playable": False,
                     "message": "点击短剧结果后设备连接刷新失败",
                 }
+            self._pause_selected_playback_quickly()
             if expected and self._still_on_search_selection_page():
                 return {
                     "success": False,
@@ -508,6 +516,7 @@ class HongguoOperations:
                 if retried:
                     self._sleep(2, 3)
                     self._dismiss_launcher_widget_dialog()
+                    self._pause_selected_playback_quickly()
                 if not retried or self._still_on_search_selection_page():
                     return {
                         "success": False,
@@ -529,7 +538,11 @@ class HongguoOperations:
             if self._ad_continue_visible():
                 self.skip_ad_if_present()
                 time.sleep(3)
-            drama_title = self._wait_selected_drama_title(expected, title)
+            drama_title = self._wait_selected_drama_title(
+                expected,
+                title,
+                expected_total=expected_total,
+            )
             if expected and not drama_title:
                 return {
                     "success": False,
@@ -540,6 +553,25 @@ class HongguoOperations:
             return self._drama_detail_result(drama_title, expected)
         except Exception as exc:
             return {"success": False, "drama_title": title, "playable": False, "message": str(exc)}
+
+    def pause_playback_quickly(self) -> bool:
+        """Pause playback with one direct tap, avoiding slow hierarchy reads."""
+        current = self._safe_app_current()
+        if current.get("package") != APP_PACKAGE or current.get("activity") != SHORT_SERIES_ACTIVITY:
+            return False
+        try:
+            call_with_timeout(
+                lambda: self.d.click(int(self.width * 0.5), int(self.height * 0.42)),
+                3,
+                "pause selected hongguo playback",
+            )
+            return True
+        except Exception:
+            return False
+
+    def _pause_selected_playback_quickly(self) -> bool:
+        """Keep a resumed final episode from ending while selection is verified."""
+        return self.pause_playback_quickly()
 
     def _dismiss_launcher_widget_dialog(self) -> bool:
         xml = self._xml()
@@ -553,53 +585,69 @@ class HongguoOperations:
         time.sleep(1.5)
         return True
 
-    def _wait_selected_drama_title(self, expected: str, clicked_title: str, attempts: int = 8) -> str:
+    def _wait_selected_drama_title(
+        self,
+        expected: str,
+        clicked_title: str,
+        attempts: int = 8,
+        expected_total: int = 0,
+    ) -> str:
         """Wait for the Surface player metadata to settle after opening a result."""
         fallback_confirmations = 0
         for attempt in range(max(1, attempts)):
-            drama_title = self._verified_detail_title(expected)
+            current = self._safe_app_current()
+            xml = self._xml()
+            drama_title = self._verified_detail_title(expected, xml=xml, current=current)
             if drama_title:
                 return drama_title
-            if self._mismatched_collection_title(expected):
+            if self._mismatched_collection_title(expected, xml):
                 fallback_confirmations = 0
                 if attempt + 1 < attempts:
                     self._sleep(1, 1.5)
                     continue
                 return ""
             if clicked_title and self._strict_title_matches(expected, clicked_title):
-                observed_title = self._extract_detail_title()
+                observed_title = self._extract_detail_title(xml=xml)
                 if observed_title and not self._strict_title_matches(expected, observed_title):
                     return ""
-                current = self._safe_app_current()
-                current_episode = self.get_current_episode()
-                total_episodes = self.get_total_episodes()
+                current_episode = self.get_current_episode(xml, assume_foreground=True)
+                total_episodes = self.get_total_episodes(xml, assume_foreground=True)
+                total_matches = not expected_total or total_episodes == expected_total
                 playback_context = (
                     current.get("package") == APP_PACKAGE
                     and current.get("activity") == SHORT_SERIES_ACTIVITY
+                    and total_matches
                     and (
                         (current_episode > 0 and total_episodes >= current_episode)
-                        or self._playback_visible()
+                        or self._playback_visible(xml, short_series_active=True)
                     )
                 )
                 fallback_confirmations = fallback_confirmations + 1 if playback_context else 0
-                if fallback_confirmations >= 2:
+                required_confirmations = 1 if expected_total and total_episodes == expected_total else 2
+                if fallback_confirmations >= required_confirmations:
                     return clicked_title
             if attempt + 1 < attempts:
                 self._sleep(1, 1.5)
         return ""
 
-    def _verified_detail_title(self, expected: str, allow_clicked_title: bool = False) -> str:
+    def _verified_detail_title(
+        self,
+        expected: str,
+        allow_clicked_title: bool = False,
+        xml: Optional[str] = None,
+        current: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Return the real title only when the target detail/playback page is visible."""
-        current = self._safe_app_current()
+        current = current if current is not None else self._safe_app_current()
         if current.get("package") != APP_PACKAGE or current.get("activity") != SHORT_SERIES_ACTIVITY:
             return ""
-        xml = self._xml()
+        xml = self._xml() if xml is None else xml
         if self._search_results_visible(xml) or self._search_candidate_page_visible(xml):
             return ""
-        drama_title = self._extract_detail_title(expected)
+        drama_title = self._extract_detail_title(expected, xml)
         if drama_title and self._strict_title_matches(expected, drama_title):
-            return drama_title if self._detail_markers_visible() else ""
-        observed_title = self._extract_detail_title()
+            return drama_title if self._detail_markers_visible(xml) else ""
+        observed_title = self._extract_detail_title(xml=xml)
         if observed_title and (
             not allow_clicked_title or self._looks_like_explicit_drama_title(observed_title)
         ):
@@ -607,9 +655,9 @@ class HongguoOperations:
         if (
             allow_clicked_title
             and expected
-            and self._detail_markers_visible()
-            and self._playback_visible(xml)
-            and self.get_total_episodes() > 0
+            and self._detail_markers_visible(xml)
+            and self._playback_visible(xml, short_series_active=True)
+            and self.get_total_episodes(xml, assume_foreground=True) > 0
         ):
             return expected
         return ""
@@ -624,6 +672,9 @@ class HongguoOperations:
 
     def _current_collection_title(self, xml: Optional[str] = None) -> str:
         xml = xml if xml is not None else self._xml()
+        playing_title = self._current_playing_title(xml)
+        if playing_title:
+            return playing_title
         texts: List[str] = []
         for node in self._visible_hongguo_nodes(xml):
             text_match = re.search(r'text="([^"]+)"', node)
@@ -735,8 +786,8 @@ class HongguoOperations:
             "message": "已进入短剧详情" if (playable or detail_visible) else "短剧不可播放",
         }
 
-    def _detail_markers_visible(self) -> bool:
-        xml = " ".join(self._hongguo_nodes(self._xml()))
+    def _detail_markers_visible(self, xml: Optional[str] = None) -> bool:
+        xml = " ".join(self._hongguo_nodes(self._xml() if xml is None else xml))
         return bool(re.search(r"全\d+集|第\d+集", xml) or any(marker in xml for marker in ("剧情简介", "剧评", "选集")))
 
     def play_episode(self, episode_number: int) -> bool:
@@ -2198,17 +2249,17 @@ class HongguoOperations:
     def _open_profile_tab(self) -> bool:
         try:
             self._close_popups_quick()
-            started_on_playback = self._short_series_activity_active()
-            if started_on_playback:
-                if not self._open_main_activity():
-                    return False
-                time.sleep(1)
             xml = self._xml()
             if self._hierarchy_empty(xml):
                 if self._restart_uiautomator_server():
                     xml = self._xml()
             if self._profile_visible(xml):
                 return True
+            started_on_playback = self._short_series_activity_active()
+            if started_on_playback:
+                if not self._open_main_activity():
+                    return False
+                time.sleep(1)
             if not started_on_playback and not self._open_main_tabs():
                 return False
             for _ in range(3):
@@ -2263,6 +2314,9 @@ class HongguoOperations:
             "\u63d0\u73b0",
             "\u6536\u85cf",
         )
+        hongguo_xml = " ".join(self._visible_hongguo_nodes(xml))
+        if any(marker in hongguo_xml for marker in markers):
+            return True
         if not any(marker in xml for marker in markers):
             return False
         current = self._safe_app_current()
@@ -3151,7 +3205,11 @@ class HongguoOperations:
             return current_title
         candidates: List[str] = []
         seen = set()
-        node_text = " ".join(self._hongguo_nodes(xml))
+        node_text = " ".join(
+            node
+            for node in self._hongguo_nodes(xml)
+            if "同系列剧" not in html.unescape(node)
+        )
         for candidate in re.findall(r"\u300a([^\u300b]{2,25})\u300b", node_text):
             candidate = html.unescape(candidate).strip()
             if self._is_title_candidate(candidate) and candidate not in seen:

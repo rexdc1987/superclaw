@@ -18,7 +18,7 @@ export default defineConfig(({ mode }) => {
       allowedHosts: ['test.openclaw.com', 'localhost', '127.0.0.1'],
       proxy: {
         '/api': {
-          target: env.VITE_API_TARGET || 'http://127.0.0.1:8980',
+          target: env.VITE_API_TARGET || 'http://127.0.0.1:8987',
           changeOrigin: true,
         },
       },

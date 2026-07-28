@@ -2439,9 +2439,12 @@ async def test_ai_settings(payload: Optional[AISettingsUpdate] = None, _=Depends
     if payload is None:
         ai = _ai_config()
     else:
-        ai = payload.model_dump()
-        api_key_env = ai.get("api_key_env") or "OPENAI_API_KEY"
-        ai["api_key"] = ai.get("api_key") or os.environ.get(api_key_env, "")
+        ai = _ai_config()
+        submitted = payload.model_dump()
+        submitted_key = submitted.pop("api_key", None)
+        ai.update(submitted)
+        if submitted_key:
+            ai["api_key"] = submitted_key
     ai["fallback_to_local"] = False
     try:
         content, source, usage = CommentGenerator(ai).generate_with_usage("红果短剧", "ai")
@@ -3125,7 +3128,7 @@ def _detect_multi_devices_uncached() -> Dict[str, Any]:
     )
     for index, instance, addr in pending_checks:
         check_started = time.monotonic()
-        result = _safe_check_login_for_device(addr, mumu=instance, timeout=60)
+        result = _safe_check_login_for_device(addr, mumu=instance, timeout=75)
         result["check_duration_sec"] = round(time.monotonic() - check_started, 2)
         device_slots[index] = result
         logger.info(

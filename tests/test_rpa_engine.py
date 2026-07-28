@@ -15,7 +15,7 @@ import sys
 import time
 import pytest
 from pathlib import Path
-from unittest.mock import ANY, MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, create_autospec, patch
 
 # 添加 src 到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -123,8 +123,8 @@ def test_multi_device_login_detection_allows_slow_mumu_profile_checks():
                 result = routes_hongguo._detect_multi_devices_uncached()
 
     assert checked == [
-        ("127.0.0.1:16416", "1", 60),
-        ("127.0.0.1:16448", "2", 60),
+        ("127.0.0.1:16416", "1", 75),
+        ("127.0.0.1:16448", "2", 75),
     ]
     assert result["online_count"] == 2
     assert result["logged_in_count"] == 2
@@ -1865,7 +1865,7 @@ class TestHongguoPlaybackHeuristics:
         assert result["success"] is True
         assert result["drama_title"] == selected_title
 
-    def test_select_drama_prefers_matching_result_card_click(self):
+    def test_select_drama_prefers_exact_title_click(self):
         ops = HongguoOperations(object())
         selected_title = "yunmiao2 target"
         with patch.object(ops, "_is_app_foreground", return_value=True):
@@ -1883,8 +1883,8 @@ class TestHongguoPlaybackHeuristics:
                                         ):
                                             result = ops.select_drama(selected_title, keyword="yunmiao2")
         assert result["success"] is True
-        card_click.assert_called_once_with(selected_title, "yunmiao2")
-        title_click.assert_not_called()
+        title_click.assert_called_once_with(selected_title, "yunmiao2")
+        card_click.assert_not_called()
 
     def test_select_drama_retries_exact_title_after_card_opens_wrong_collection(self):
         ops = HongguoOperations(object())
@@ -1895,7 +1895,7 @@ class TestHongguoPlaybackHeuristics:
                 with patch.object(ops, "_xml", return_value="results"):
                     with patch.object(ops, "_search_candidate_page_visible", return_value=False):
                         with patch.object(ops, "_click_matching_result_card", return_value=True):
-                            with patch.object(ops, "_click_matching_title", return_value=True) as title_click:
+                            with patch.object(ops, "_click_matching_title", side_effect=[False, True]) as title_click:
                                 with patch.object(ops, "_sleep"):
                                     with patch.object(ops, "_dismiss_launcher_widget_dialog"):
                                         with patch.object(ops, "_still_on_search_selection_page", return_value=False):
@@ -1926,7 +1926,7 @@ class TestHongguoPlaybackHeuristics:
 
         assert result["success"] is True
         ops.d.press.assert_called_once_with("back")
-        title_click.assert_called_once_with(selected_title, "万妖图录传3")
+        assert title_click.call_count == 2
 
     def test_collection_title_extracts_wrong_video_collection_label(self):
         ops = HongguoOperations(object())
@@ -1937,6 +1937,16 @@ class TestHongguoPlaybackHeuristics:
 
         assert ops._current_collection_title(xml) == "神奇宇宙"
         assert ops._mismatched_collection_title("万妖图录传3", xml) == "神奇宇宙"
+
+    def test_collection_title_uses_playing_collection_label(self):
+        ops = HongguoOperations(object())
+        xml = (
+            '<node package="com.phoenix.read" visible-to-user="true" '
+            'text="合集 · 《周星驰系列电影》 · 全37集" />'
+        )
+
+        assert ops._current_collection_title(xml) == "周星驰系列电影"
+        assert ops._mismatched_collection_title("胭脂念念不忘", xml) == "周星驰系列电影"
 
     def test_wait_selected_drama_title_retries_transient_surface_metadata(self):
         ops = HongguoOperations(object())
@@ -2020,6 +2030,133 @@ class TestHongguoPlaybackHeuristics:
                                             attempts=3,
                                         )
         assert result == ""
+
+    def test_wait_selected_drama_title_rejects_wrong_total_without_title_metadata(self):
+        ops = HongguoOperations(object())
+        selected_title = "胭脂念念不忘"
+        with patch.object(ops, "_verified_detail_title", return_value=""):
+            with patch.object(ops, "_mismatched_collection_title", return_value=""):
+                with patch.object(ops, "_extract_detail_title", return_value=""):
+                    with patch.object(
+                        ops,
+                        "_safe_app_current",
+                        return_value={
+                            "package": "com.phoenix.read",
+                            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                        },
+                    ):
+                        with patch.object(ops, "get_current_episode", return_value=1):
+                            with patch.object(ops, "get_total_episodes", return_value=154):
+                                with patch.object(ops, "_playback_visible", return_value=True):
+                                    with patch.object(ops, "_sleep"):
+                                        result = ops._wait_selected_drama_title(
+                                            "胭脂念念不忘",
+                                            selected_title,
+                                            attempts=2,
+                                            expected_total=40,
+                                        )
+        assert result == ""
+
+    def test_wait_selected_drama_title_accepts_exact_total_from_one_ui_snapshot(self):
+        ops = HongguoOperations(object())
+        xml = '<node package="com.phoenix.read" text="全40集" />'
+        current = {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        }
+        with patch.object(ops, "_safe_app_current", return_value=current):
+            with patch.object(ops, "_xml", return_value=xml) as read_xml:
+                with patch.object(ops, "_verified_detail_title", return_value="") as verified:
+                    with patch.object(ops, "_mismatched_collection_title", return_value="") as mismatch:
+                        with patch.object(ops, "_extract_detail_title", return_value="") as detail:
+                            with patch.object(ops, "get_current_episode", return_value=40) as episode:
+                                with patch.object(ops, "get_total_episodes", return_value=40) as total:
+                                    with patch.object(ops, "_playback_visible", return_value=True):
+                                        with patch.object(ops, "_sleep") as sleep:
+                                            result = ops._wait_selected_drama_title(
+                                                "胭脂念念不忘",
+                                                "胭脂念念不忘",
+                                                expected_total=40,
+                                            )
+
+        assert result == "胭脂念念不忘"
+        read_xml.assert_called_once_with()
+        verified.assert_called_once_with("胭脂念念不忘", xml=xml, current=current)
+        mismatch.assert_called_once_with("胭脂念念不忘", xml)
+        detail.assert_called_once_with(xml=xml)
+        episode.assert_called_once_with(xml, assume_foreground=True)
+        total.assert_called_once_with(xml, assume_foreground=True)
+        sleep.assert_not_called()
+
+    def test_select_drama_pauses_last_episode_before_verifying_result(self):
+        ops = HongguoOperations(object())
+        ops.d = MagicMock()
+        ops.width, ops.height = 720, 1280
+        selected_title = "胭脂念念不忘"
+        events = []
+        current = {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        }
+        ops.d.click.side_effect = lambda x, y: events.append(("pause", (x, y)))
+        with patch.object(ops, "_is_app_foreground", return_value=True):
+            with patch.object(ops, "_verified_detail_title", return_value=""):
+                with patch.object(ops, "_xml", return_value="results"):
+                    with patch.object(ops, "_search_candidate_page_visible", return_value=False):
+                        with patch.object(ops, "_click_matching_title", return_value=True):
+                            with patch.object(ops, "_sleep"):
+                                with patch.object(ops, "_dismiss_launcher_widget_dialog"):
+                                    with patch.object(ops, "_safe_app_current", return_value=current):
+                                        with patch.object(ops, "_still_on_search_selection_page", return_value=False):
+                                            with patch.object(ops, "_mismatched_collection_title", return_value=""):
+                                                with patch.object(
+                                                    ops,
+                                                    "_wait_selected_drama_title",
+                                                    side_effect=lambda *_args, **_kwargs: events.append(("verify", "")) or selected_title,
+                                                ):
+                                                    with patch.object(
+                                                        ops,
+                                                        "_drama_detail_result",
+                                                        return_value={"success": True, "drama_title": selected_title},
+                                                    ):
+                                                        with patch(
+                                                            "rpa.hongguo.operations.call_with_timeout",
+                                                            side_effect=lambda func, *_args: func(),
+                                                        ):
+                                                            result = ops.select_drama(
+                                                                selected_title,
+                                                                keyword=selected_title,
+                                                                expected_total=40,
+                                                            )
+
+        assert result["success"] is True
+        assert events == [("pause", (360, 537)), ("verify", "")]
+
+    def test_select_drama_can_prefer_matching_result_card_for_recovery(self):
+        ops = HongguoOperations(object())
+        selected_title = "胭脂念念不忘"
+        with patch.object(ops, "_is_app_foreground", return_value=True):
+            with patch.object(ops, "_verified_detail_title", side_effect=["", selected_title]):
+                with patch.object(ops, "_xml", return_value="results"):
+                    with patch.object(ops, "_search_candidate_page_visible", return_value=False):
+                        with patch.object(ops, "_click_matching_result_card", return_value=True) as card_click:
+                            with patch.object(ops, "_click_matching_title", return_value=True) as title_click:
+                                with patch.object(ops, "_sleep"):
+                                    with patch.object(ops, "_still_on_search_selection_page", return_value=False):
+                                        with patch.object(
+                                            ops,
+                                            "_drama_detail_result",
+                                            return_value={"success": True, "drama_title": selected_title},
+                                        ):
+                                            result = ops.select_drama(
+                                                selected_title,
+                                                keyword=selected_title,
+                                                prefer_result_card=True,
+                                                expected_total=40,
+                                            )
+        assert result["success"] is True
+        card_click.assert_called_once_with(selected_title, selected_title)
+        title_click.assert_not_called()
 
     def test_select_drama_keeps_healthy_device_session_after_click(self):
         ops = HongguoOperations(object())
@@ -2725,6 +2862,28 @@ class TestHongguoPlaybackHeuristics:
 
 
 class TestHongguoLoginDetails:
+    def test_profile_visible_accepts_hongguo_owned_profile_markers_without_app_query(self):
+        ops = HongguoOperations(object())
+        xml = (
+            '<node package="com.phoenix.read" visible-to-user="true" '
+            'text="\u6211\u7684\u94b1\u5305" bounds="[0,0][720,1280]" />'
+        )
+
+        with patch.object(ops, "_safe_app_current") as app_current:
+            assert ops._profile_visible(xml) is True
+
+        app_current.assert_not_called()
+
+    def test_open_profile_tab_skips_slow_activity_query_when_profile_is_already_visible(self):
+        ops = HongguoOperations(object())
+        with patch.object(ops, "_close_popups_quick"):
+            with patch.object(ops, "_xml", return_value="profile"):
+                with patch.object(ops, "_profile_visible", return_value=True):
+                    with patch.object(ops, "_short_series_activity_active") as playback_active:
+                        assert ops._open_profile_tab() is True
+
+        playback_active.assert_not_called()
+
     def test_check_login_accepts_foreground_app_without_login_prompt(self):
         ops = HongguoOperations(object())
         with patch.object(ops, "_close_popups_quick"):
@@ -3726,6 +3885,89 @@ def test_verified_wait_throttles_persistent_ad_after_single_swipe():
     ops.skip_ad_if_present.assert_called_once_with()
 
 
+def test_verified_next_episode_pauses_pending_comment_before_returning():
+    engine = TaskEngine(task_id=169, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = create_autospec(engine._log)
+    engine._comment_already_verified = MagicMock(return_value=False)
+    engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+    engine._page_state = MagicMock(
+        return_value={
+            "current_episode": 8,
+            "total_episodes": 53,
+            "playback_visible": True,
+            "playback_paused": False,
+            "ad_visible": False,
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+        }
+    )
+    task = {"execution_plan_json": json.dumps({"comment_episodes": [8]})}
+    ops = MagicMock()
+    ops.pause_playback_quickly.return_value = True
+
+    assert engine._wait_for_next_episode_verified(ops, task, 7, 8, 53) is True
+
+    ops.pause_playback_quickly.assert_called_once_with()
+    assert any("立即暂停=True" in item.args[1] for item in engine._log.call_args_list)
+
+
+def test_verified_next_episode_pauses_pending_like_before_returning():
+    engine = TaskEngine(task_id=172, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = create_autospec(engine._log)
+    engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+    engine._page_state = MagicMock(
+        return_value={
+            "current_episode": 3,
+            "total_episodes": 58,
+            "playback_visible": True,
+            "playback_paused": False,
+            "ad_visible": False,
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+        }
+    )
+    task = {"execution_plan_json": json.dumps({"like_episodes": [3]})}
+    ops = MagicMock()
+    ops.pause_playback_quickly.return_value = True
+
+    assert engine._wait_for_next_episode_verified(ops, task, 2, 3, 58) is True
+
+    ops.pause_playback_quickly.assert_called_once_with()
+
+
+def test_verified_seek_pauses_pending_comment_after_reseek_success():
+    engine = TaskEngine(task_id=169, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = create_autospec(engine._log)
+    engine._comment_already_verified = MagicMock(return_value=False)
+    engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+    engine._page_state = MagicMock(
+        return_value={
+            "current_episode": 9,
+            "total_episodes": 53,
+            "playback_visible": True,
+            "playback_paused": False,
+            "ad_visible": False,
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+        }
+    )
+    task = {"execution_plan_json": json.dumps({"comment_episodes": [8]})}
+    ops = MagicMock()
+    ops.play_episode.return_value = True
+    ops.pause_playback_quickly.return_value = True
+
+    assert engine._wait_for_episode_verified(ops, task, 8, 53, timeout=30) is True
+
+    ops.play_episode.assert_called_once_with(8)
+    ops.pause_playback_quickly.assert_called_once_with()
+
+
 def test_open_search_page_returns_to_main_when_playback_is_visually_detected():
     ops = HongguoOperations(object())
     ops.d = MagicMock()
@@ -3904,6 +4146,68 @@ class TestHongguoEngineWaits:
         with patch.object(engine, "_log"):
             engine._assert_target_playback(DummyOps(), {"drama_name": "云渺"}, state, 77)
 
+    def test_assert_target_playback_allows_unreadable_first_episode_after_surface_confirmation(self):
+        engine = TaskEngine(task_id=176, db_config={}, screenshot_dir="C:/tmp")
+        ops = MagicMock()
+        ops._playback_visible.return_value = False
+        state = {
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+            "app_foreground": True,
+            "launcher_visible": False,
+            "playback_visible": False,
+            "ad_visible": False,
+            "current_episode": 0,
+            "total_episodes": 58,
+            "collection_title": "万妖图录传第三季",
+        }
+
+        with patch.object(engine, "_log"):
+            engine._assert_target_playback(
+                ops,
+                {"drama_name": "万妖图录传3"},
+                state,
+                58,
+                allow_unreadable_first_episode=True,
+            )
+
+    @pytest.mark.parametrize(
+        ("state_override", "error"),
+        [
+            ({"total_episodes": 59}, "总集数不匹配"),
+            ({"collection_title": "神奇宇宙"}, "非目标合集"),
+        ],
+    )
+    def test_unreadable_first_episode_fallback_keeps_drama_validation(self, state_override, error):
+        engine = TaskEngine(task_id=176, db_config={}, screenshot_dir="C:/tmp")
+        ops = MagicMock()
+        ops._playback_visible.return_value = False
+        state = {
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+            "app_foreground": True,
+            "launcher_visible": False,
+            "playback_visible": False,
+            "ad_visible": False,
+            "current_episode": 0,
+            "total_episodes": 58,
+            "collection_title": "万妖图录传第三季",
+            **state_override,
+        }
+
+        with pytest.raises(RuntimeError, match=error):
+            engine._assert_target_playback(
+                ops,
+                {"drama_name": "万妖图录传3"},
+                state,
+                58,
+                allow_unreadable_first_episode=True,
+            )
+
     def test_wait_for_episode_verified_accepts_repeated_surface_first_episode_context(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
         state = {
@@ -3950,7 +4254,40 @@ class TestHongguoEngineWaits:
             with patch.object(engine, "_check_pause_stop"):
                 with patch.object(engine, "_log"):
                     with patch("rpa.hongguo.engine.time.sleep"):
-                        assert engine._wait_for_episode_verified(object(), {}, 1, 77, timeout=20) is True
+                            assert engine._wait_for_episode_verified(object(), {}, 1, 77, timeout=20) is True
+
+    def test_wait_for_episode_verified_restarts_uiautomator_after_fully_empty_state(self):
+        engine = TaskEngine(task_id=179, db_config={}, screenshot_dir="C:/tmp")
+        empty_state = {
+            "app": {},
+            "first_visible_package": "",
+            "launcher_visible": False,
+            "playback_visible": False,
+            "current_episode": 0,
+        }
+        valid_state = {
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+            "app_foreground": True,
+            "launcher_visible": False,
+            "playback_visible": True,
+            "ad_visible": False,
+            "current_episode": 43,
+            "total_episodes": 58,
+        }
+        ops = MagicMock()
+        ops._restart_uiautomator_server.return_value = True
+
+        with patch.object(engine, "_page_state", side_effect=[empty_state, valid_state, valid_state]):
+            with patch.object(engine, "_check_pause_stop"):
+                with patch.object(engine, "_log") as log:
+                    with patch("rpa.hongguo.engine.time.sleep"):
+                        assert engine._wait_for_episode_verified(ops, {}, 43, 58, timeout=20) is True
+
+        ops._restart_uiautomator_server.assert_called_once_with()
+        assert any("重启自动化服务=True" in item.args[1] for item in log.call_args_list)
 
     def test_wait_for_episode_verified_reseeks_when_autoplay_passes_target(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
@@ -5120,7 +5457,21 @@ def test_extract_detail_title_reads_quoted_playing_title():
         assert ops._extract_detail_title(xml=xml) == "伪装者"
 
 
-def test_assert_target_playback_ignores_related_season_title_on_verified_final_episode():
+def test_extract_detail_title_ignores_related_series_recommendation():
+    ops = HongguoOperations(object())
+    xml = "".join(
+        [
+            '<node package="com.phoenix.read" text="万妖图录传第一季" bounds="[32,871][288,919]" />',
+            '<node package="com.phoenix.read" text="同系列剧《万妖图录传第二季》" bounds="[80,1104][472,1146]" />',
+        ]
+    )
+
+    with patch.object(ops, "_current_playing_title", return_value=""):
+        assert ops._extract_detail_title(xml=xml) == "万妖图录传第一季"
+        assert ops._extract_detail_title("万妖图录传", xml) == "万妖图录传第一季"
+
+
+def test_assert_target_playback_rejects_wrong_playing_title_on_final_episode():
     engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
     engine._log = MagicMock()
     ops = MagicMock()
@@ -5138,9 +5489,8 @@ def test_assert_target_playback_ignores_related_season_title_on_verified_final_e
         "detail_title": "",
     }
 
-    engine._assert_target_playback(ops, {"drama_name": "万妖图录传"}, state, 81)
-
-    assert "相关推荐标题" in engine._log.call_args.args[1]
+    with pytest.raises(RuntimeError, match="标题不匹配"):
+        engine._assert_target_playback(ops, {"drama_name": "万妖图录传"}, state, 81)
 
 
 def test_assert_target_playback_still_rejects_wrong_season_before_final_episode():
@@ -5615,6 +5965,89 @@ def test_pending_episode_check_includes_unfinished_engagements():
     assert engine._pending_comment_episodes_between(task, 2, 5) == [3, 4]
     engine._completed_engagement_episodes["like"].add(3)
     assert engine._pending_comment_episodes_between(task, 2, 5) == [4]
+
+
+def test_main_loop_processes_pending_favorite_immediately_after_skip_recovery(tmp_path):
+    from rpa.hongguo import engine as engine_module
+
+    engine = TaskEngine(task_id=163, db_config={}, screenshot_dir=str(tmp_path))
+    task = {"drama_name": "胭脂念念不忘"}
+    ops = MagicMock()
+    ops.take_screenshot.return_value = str(tmp_path / "completed.png")
+    states = [
+        {
+            "current_episode": episode,
+            "total_episodes": 13,
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+        }
+        for episode in range(1, 11)
+    ]
+    states.extend(
+        [
+            {
+                "current_episode": 13,
+                "total_episodes": 13,
+                "app": {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                },
+            }
+            for _ in range(3)
+        ]
+    )
+
+    engine._update_task = MagicMock()
+    engine._log = MagicMock()
+    engine._load_task = MagicMock(return_value=task)
+    engine._prepare_verified_playback = MagicMock(
+        return_value={"total_episodes": 13, "drama_title": task["drama_name"]}
+    )
+    engine._comment_episode_plan = MagicMock(return_value=[])
+    engine._engagement_episode_plan = MagicMock(
+        side_effect=lambda _task, _total, field, _default: [11]
+        if field == "random_favorite_count"
+        else []
+    )
+    engine._completed_comment_episodes = MagicMock(return_value=set())
+    engine._task_rule_snapshot = MagicMock(return_value={})
+    engine._resume_if_paused = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._page_state = MagicMock(side_effect=states)
+    engine._ensure_target_playback_context = MagicMock(
+        side_effect=lambda _ops, _task, state, _episode, _total: state
+    )
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._comment_already_verified = MagicMock(return_value=False)
+
+    def complete_favorite(_ops, episode, _likes, _favorites, **_kwargs):
+        if episode == 11:
+            engine._completed_engagement_episodes["favorite"].add(11)
+
+    engine._process_engagement_episode = MagicMock(side_effect=complete_favorite)
+    engine._process_comment_episode = MagicMock(return_value=False)
+    engine._wait_for_next_episode_verified = MagicMock(return_value=True)
+    engine._missing_verified_comment_episodes = MagicMock(return_value=[])
+    engine._retry_missing_engagements_before_completion = MagicMock()
+    engine._duration_seconds = MagicMock(return_value=1)
+
+    with patch.object(engine_module, "check_connection", return_value=True):
+        with patch.object(engine_module, "connect", return_value=object()):
+            with patch.object(engine_module, "HongguoOperations", return_value=ops):
+                engine._run_verified_flow()
+
+    engine._recover_to_verified_episode.assert_called_once_with(
+        ops,
+        task,
+        11,
+        13,
+        "主循环集数偏移，当前第13集",
+    )
+    assert any(call.args[1] == 11 for call in engine._process_engagement_episode.call_args_list)
+    assert not any(call.kwargs.get("status") == "failed" for call in engine._update_task.call_args_list)
+    assert any(call.kwargs.get("status") == "completed" for call in engine._update_task.call_args_list)
 
 
 def test_hongguo_task_payload_defaults_enable_random_engagements():

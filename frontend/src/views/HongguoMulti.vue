@@ -95,14 +95,6 @@
               <el-radio value="random">随机集数</el-radio>
             </el-radio-group>
           </el-form-item>
-          <el-form-item label="随机点赞">
-            <el-input-number v-model="form.random_like_count" :min="0" />
-            <span class="field-hint">次</span>
-          </el-form-item>
-          <el-form-item label="短剧收藏">
-            <el-input-number v-model="form.random_favorite_count" :min="0" :max="1" />
-            <span class="field-hint">0/1</span>
-          </el-form-item>
           <template v-if="form.comment_mode === 'specified'">
             <el-form-item label="起始集数">
               <el-input-number v-model="form.start_episode" :min="1" />
@@ -128,6 +120,14 @@
               <span class="field-hint">秒</span>
             </el-form-item>
           </template>
+          <el-form-item label="随机点赞">
+            <el-input-number v-model="form.random_like_count" :min="0" />
+            <span class="field-hint">次</span>
+          </el-form-item>
+          <el-form-item label="短剧收藏">
+            <el-input-number v-model="form.random_favorite_count" :min="0" :max="1" />
+            <span class="field-hint">0/1</span>
+          </el-form-item>
           <el-form-item label="内容来源">
             <el-radio-group v-model="form.content_source">
               <el-radio value="ai">AI 生成</el-radio>
@@ -285,6 +285,7 @@ const templateText = ref('')
 const selectedLogTaskId = ref(null)
 const taskLogs = ref({})
 let pollTimer = null
+let pollInFlight = false
 
 const form = reactive({
   drama_name: '',
@@ -298,7 +299,7 @@ const form = reactive({
   random_like_count: 5,
   random_favorite_count: 1,
   content_source: 'ai',
-  playback_speed: '2.0x',
+  playback_speed: '1.0x',
   templates: [],
 })
 
@@ -355,6 +356,8 @@ function accountText(row) {
 }
 
 async function detectDevices() {
+  const resumePolling = Boolean(pollTimer)
+  stopPolling()
   loadingDevices.value = true
   try {
     const result = await getMultiDevices()
@@ -383,6 +386,7 @@ async function detectDevices() {
     }
   } finally {
     loadingDevices.value = false
+    if (resumePolling) startPolling()
   }
 }
 
@@ -486,16 +490,17 @@ async function loadRuns() {
   }
 }
 
-async function loadRunDetail(runId = activeRunId.value) {
+async function loadRunDetail(runId = activeRunId.value, options = {}) {
   if (!runId) {
     activeRun.value = null
     return
   }
   loadingRunDetail.value = true
   try {
-    activeRun.value = await getMultiRun(runId)
+    const requestConfig = options.silent ? { silent: true, timeout: 120000 } : {}
+    activeRun.value = await getMultiRun(runId, requestConfig)
     activeRunId.value = runId
-    await refreshVisibleLogs()
+    await refreshVisibleLogs(options)
   } finally {
     loadingRunDetail.value = false
   }
@@ -514,7 +519,7 @@ function ruleFromTask(task) {
     random_like_count: task?.random_like_count ?? 5,
     random_favorite_count: Math.min(task?.random_favorite_count ?? 1, 1),
     content_source: task?.content_source || 'ai',
-    playback_speed: task?.playback_speed || '2.0x',
+    playback_speed: task?.playback_speed || '1.0x',
     templates: task?.templates || [],
   }
 }
@@ -576,12 +581,13 @@ async function loadTaskLogs(taskId) {
   }
 }
 
-async function refreshVisibleLogs() {
+async function refreshVisibleLogs(options = {}) {
   const tasks = activeRun.value?.tasks || []
   const targets = tasks.slice(0, 6)
   await Promise.all(targets.map(async (task) => {
     try {
-      const result = await getLogs(task.id, { limit: 8, current_run_only: true })
+      const requestConfig = options.silent ? { silent: true, timeout: 120000 } : {}
+      const result = await getLogs(task.id, { limit: 8, current_run_only: true }, requestConfig)
       taskLogs.value = { ...taskLogs.value, [task.id]: Array.isArray(result) ? result : (result.value || []) }
     } catch (error) {
       // Ignore per-task log refresh failures; the main run state is still useful.
@@ -592,10 +598,17 @@ async function refreshVisibleLogs() {
 function startPolling() {
   stopPolling()
   pollTimer = window.setInterval(async () => {
-    if (!activeRunId.value) return
-    await loadRunDetail(activeRunId.value)
-    const running = (activeRun.value?.tasks || []).some((item) => item.status === 'running')
-    if (!running) stopPolling()
+    if (!activeRunId.value || pollInFlight) return
+    pollInFlight = true
+    try {
+      await loadRunDetail(activeRunId.value, { silent: true })
+      const running = (activeRun.value?.tasks || []).some((item) => item.status === 'running')
+      if (!running) stopPolling()
+    } catch (error) {
+      // The next interval retries without interrupting the user's workflow.
+    } finally {
+      pollInFlight = false
+    }
   }, 5000)
 }
 

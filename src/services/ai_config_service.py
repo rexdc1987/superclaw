@@ -91,7 +91,10 @@ def ai_config(include_secret: bool = True) -> Dict[str, Any]:
     ai = dict(app_config().get("ai", {}))
     api_key_env = ai.get("api_key_env") or "OPENAI_API_KEY"
     if include_secret:
-        ai["api_key"] = os.environ.get(api_key_env) or ai.get("api_key", "")
+        # A key explicitly saved from the settings page must win over a stale
+        # machine-level environment variable. The environment remains a
+        # fallback for deployments that do not persist secrets locally.
+        ai["api_key"] = ai.get("api_key") or os.environ.get(api_key_env, "")
     return ai
 
 
@@ -102,7 +105,7 @@ def public_ai_settings(ai: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "provider": current.get("provider", "openai_compatible"),
         "enabled": bool(current.get("enabled", False)),
         "api_key_env": api_key_env,
-        "api_key_configured": bool(os.environ.get(api_key_env) or current.get("api_key")),
+        "api_key_configured": bool(current.get("api_key") or os.environ.get(api_key_env)),
         "base_url": current.get("base_url", ""),
         "model": current.get("model", ""),
         "timeout": int(current.get("timeout", 30)),

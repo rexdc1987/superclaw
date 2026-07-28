@@ -110,9 +110,12 @@ async def test_ai_settings(payload: Optional[AISettingsUpdate] = None):
     if payload is None:
         current = ai_config()
     else:
-        current = payload.model_dump()
-        api_key_env = current.get("api_key_env") or "OPENAI_API_KEY"
-        current["api_key"] = current.get("api_key") or os.environ.get(api_key_env, "")
+        current = ai_config()
+        submitted = payload.model_dump()
+        submitted_key = submitted.pop("api_key", None)
+        current.update(submitted)
+        if submitted_key:
+            current["api_key"] = submitted_key
     current["fallback_to_local"] = False
     try:
         content, source, usage = CommentGenerator(current).generate_with_usage("红果短剧", "ai")
