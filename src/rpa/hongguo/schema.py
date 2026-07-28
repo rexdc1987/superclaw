@@ -75,6 +75,7 @@ BASE_DDL = (
         message TEXT NOT NULL,
         episode_number INT DEFAULT NULL,
         screenshot_path VARCHAR(500) DEFAULT NULL,
+        duration_seconds INT DEFAULT NULL,
         created_at DATETIME DEFAULT NULL,
         INDEX idx_hongguo_log_task (task_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
