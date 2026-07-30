@@ -23,7 +23,7 @@ import pymysql
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymysql.cursors import DictCursor
 
 from api.security import current_principal, require_admin
@@ -60,6 +60,8 @@ _MULTI_DEVICE_DETECTION_LOCK = threading.Lock()
 _MULTI_DEVICE_DETECTION_SUCCESS_TTL_SECONDS = 30
 _multi_device_detection_cache: Optional[Dict[str, Any]] = None
 _multi_device_detection_cache_at = 0.0
+_SCHEMA_LOCK = threading.Lock()
+_schema_ready = False
 
 TASK_STATUSES = {
     "pending",
@@ -446,6 +448,44 @@ def _ensure_task_schema(conn) -> None:
 
         cur.execute(
             """
+            UPDATE hongguo_comment_templates
+            SET category='通用'
+            WHERE category IS NULL OR TRIM(category)=''
+            """
+        )
+        cur.execute(
+            """
+            UPDATE hongguo_comment_templates
+            SET is_default=0
+            WHERE is_default IS NULL
+            """
+        )
+        cur.execute(
+            """
+            UPDATE hongguo_comment_templates
+            SET use_count=0
+            WHERE use_count IS NULL
+            """
+        )
+        cur.execute(
+            """
+            UPDATE hongguo_comment_templates
+            SET created_at=NOW()
+            WHERE created_at IS NULL
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE hongguo_comment_templates
+            MODIFY category VARCHAR(50) NOT NULL DEFAULT '通用',
+            MODIFY is_default TINYINT(1) NOT NULL DEFAULT 0,
+            MODIFY use_count INT NOT NULL DEFAULT 0,
+            MODIFY created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            """
+        )
+
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS hongguo_device_leases (
                 lease_key VARCHAR(220) NOT NULL PRIMARY KEY,
                 device_addr VARCHAR(80) NOT NULL,
@@ -519,9 +559,15 @@ def _ensure_task_schema(conn) -> None:
 
 @contextmanager
 def _connection():
+    global _schema_ready
     conn = pymysql.connect(**_db_config())
     try:
-        _ensure_task_schema(conn)
+        if not _schema_ready:
+            with _SCHEMA_LOCK:
+                if not _schema_ready:
+                    _ensure_task_schema(conn)
+                    conn.commit()
+                    _schema_ready = True
         yield conn
         conn.commit()
     except Exception:
@@ -625,6 +671,7 @@ class TaskBase(BaseModel):
     random_like_count: int = Field(default=5, ge=0)
     random_favorite_count: int = Field(default=1, ge=0, le=1)
     templates: List[str] = Field(default_factory=list)
+    template_ids: List[int] = Field(default_factory=list)
 
     @field_validator("comment_mode")
     @classmethod
@@ -652,6 +699,29 @@ class TaskBase(BaseModel):
         if not value:
             raise ValueError("drama_name is required")
         return value
+
+    @field_validator("templates")
+    @classmethod
+    def validate_templates(cls, value: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        for item in value:
+            content = str(item).strip()
+            if content and content not in seen:
+                cleaned.append(content)
+                seen.add(content)
+        return cleaned
+
+    @field_validator("template_ids")
+    @classmethod
+    def validate_template_ids(cls, value: List[int]) -> List[int]:
+        return list(dict.fromkeys(item for item in value if item > 0))
+
+    @model_validator(mode="after")
+    def validate_template_source(self):
+        if self.content_source == "template" and not self.templates:
+            raise ValueError("template content source requires at least one template")
+        return self
 
 
 class TaskCreate(TaskBase):
@@ -772,9 +842,18 @@ class StageRunRequest(BaseModel):
 
 
 class TemplateCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
     content: str
-    category: str = "通用"
+    category: Optional[str] = Field(default="通用", max_length=50)
     is_default: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("name is required")
+        return value
 
     @field_validator("content")
     @classmethod
@@ -784,11 +863,27 @@ class TemplateCreate(BaseModel):
             raise ValueError("content is required")
         return value
 
+    @field_validator("category")
+    @classmethod
+    def validate_category(cls, value: Optional[str]) -> str:
+        return str(value or "").strip() or "通用"
+
 
 class TemplateUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=100)
     content: Optional[str] = None
-    category: Optional[str] = None
+    category: Optional[str] = Field(default=None, max_length=50)
     is_default: Optional[bool] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("name cannot be empty")
+        return value
 
     @field_validator("content")
     @classmethod
@@ -799,6 +894,13 @@ class TemplateUpdate(BaseModel):
         if not value:
             raise ValueError("content cannot be empty")
         return value
+
+    @field_validator("category")
+    @classmethod
+    def validate_category(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        return value.strip() or "通用"
 
 
 def _task_insert_values(payload: TaskBase) -> tuple[Any, ...]:
@@ -817,6 +919,32 @@ def _task_insert_values(payload: TaskBase) -> tuple[Any, ...]:
         _json_dumps(payload.templates),
         payload.playback_speed,
     )
+
+
+def _increment_template_usage(
+    conn,
+    templates: List[str],
+    template_ids: Optional[List[int]] = None,
+) -> None:
+    if not templates and not template_ids:
+        return
+    principal = current_principal()
+    owner_sql = ""
+    params: List[Any] = list(template_ids or templates)
+    if not principal.is_admin:
+        owner_sql = " AND (owner_user_id=%s OR (owner_user_id=0 AND is_default=1))"
+        params.append(int(principal.user_id))
+    placeholders = ", ".join(["%s"] * len(template_ids or templates))
+    lookup_column = "id" if template_ids else "content"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE hongguo_comment_templates
+            SET use_count=COALESCE(use_count, 0)+1
+            WHERE {lookup_column} IN ({placeholders}){owner_sql}
+            """,
+            params,
+        )
 
 
 def _insert_task_record(
@@ -855,7 +983,9 @@ def _insert_task_record(
                 now,
             ),
         )
-        return int(cur.lastrowid)
+        task_id = int(cur.lastrowid)
+    _increment_template_usage(conn, payload.templates, payload.template_ids)
+    return task_id
 
 
 @router.post("/tasks")
@@ -3498,11 +3628,24 @@ async def create_template(payload: TemplateCreate):
     with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
+                "SELECT id FROM hongguo_comment_templates WHERE content=%s LIMIT 1",
+                (payload.content,),
+            )
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="相同内容的模板已存在")
+            cur.execute(
                 """
-                INSERT INTO hongguo_comment_templates (content, category, is_default, owner_user_id)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO hongguo_comment_templates (
+                    name, content, category, is_default, owner_user_id
+                ) VALUES (%s, %s, %s, %s, %s)
                 """,
-                (payload.content, payload.category, int(payload.is_default), _owner_user_id()),
+                (
+                    payload.name,
+                    payload.content,
+                    payload.category,
+                    int(payload.is_default),
+                    _owner_user_id(),
+                ),
             )
             template_id = cur.lastrowid
             cur.execute("SELECT * FROM hongguo_comment_templates WHERE id=%s", (template_id,))
@@ -3545,6 +3688,13 @@ async def update_template(template_id: int, payload: TemplateUpdate):
             )
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="Template not found")
+            if "content" in data:
+                cur.execute(
+                    "SELECT id FROM hongguo_comment_templates WHERE content=%s AND id<>%s LIMIT 1",
+                    (data["content"], template_id),
+                )
+                if cur.fetchone():
+                    raise HTTPException(status_code=409, detail="相同内容的模板已存在")
             cur.execute(
                 f"""
                 UPDATE hongguo_comment_templates

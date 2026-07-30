@@ -19,6 +19,7 @@ logger = logging.getLogger("uvicorn.error")
 APP_PACKAGE = "com.phoenix.read"
 SHORT_SERIES_ACTIVITY = "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity"
 LIVE_LITE_ACTIVITY = "com.dragon.read.component.biz.impl.live.ui.LiveLiteActivity"
+POLARIS_MULTI_TAB_ACTIVITY = "com.dragon.read.polaris.tab.PolarisMultiTabActivity"
 COMMENT_BUTTON_ID = "com.phoenix.read:id/cdi"
 COMMENT_BUTTON_IDS = (COMMENT_BUTTON_ID, "com.phoenix.read:id/cdw")
 PLAYBACK_SPEED_OPTIONS = ("0.75x", "1.0x", "1.25x", "1.5x", "2.0x", "3.0x")
@@ -49,6 +50,12 @@ AD_PAGE_MARKERS = (
     "高效管理",
 )
 AD_SWIPE_CONTEXT_MARKERS = ("上滑", "滑动", "继续观看", "继续看", "短剧")
+REWARD_RAIN_MARKERS = (
+    "红包雨",
+    "开启红包雨",
+    "金币全归你",
+    "一大波金币红包来了",
+)
 TAG_KEYWORDS = {
     "玄幻",
     "传统",
@@ -829,6 +836,10 @@ class HongguoOperations:
                 return self._episode_is_confirmed(1)
             self.exit_fullscreen()
             selector = self._episode_panel_selector()
+            if selector is None and self._short_series_activity_active():
+                self._reveal_playback_controls()
+                time.sleep(0.8)
+                selector = self._episode_panel_selector()
             if selector is not None and self._exists(selector, 3):
                 selector.click()
                 self._sleep(1.5, 2.5)
@@ -1770,8 +1781,57 @@ class HongguoOperations:
         except Exception:
             return False
 
+    def _reward_rain_page_active(self, xml: Optional[str] = None) -> bool:
+        xml = self._xml() if xml is None else xml
+        if any(marker in (xml or "") for marker in REWARD_RAIN_MARKERS):
+            return True
+        current = self._safe_app_current()
+        return (
+            current.get("package") == APP_PACKAGE
+            and current.get("activity") == POLARIS_MULTI_TAB_ACTIVITY
+        )
+
+    def _dismiss_reward_rain_page(self) -> bool:
+        if not self._reward_rain_page_active():
+            return False
+
+        for selector in (
+            {"description": "关闭"},
+            {"descriptionContains": "关闭"},
+            {"text": "关闭"},
+        ):
+            try:
+                close_button = self.d(**selector)
+                if not self._exists(close_button, 0.4):
+                    continue
+                close_button.click()
+                time.sleep(0.8)
+                if not self._reward_rain_page_active():
+                    return True
+            except Exception:
+                pass
+
+        # The reward-rain close icon is surface-rendered and absent from the
+        # hierarchy on some app versions. Its observed position is stable.
+        try:
+            self.d.click(int(self.width * 0.5), int(self.height * 0.936))
+            time.sleep(0.8)
+            if not self._reward_rain_page_active():
+                return True
+        except Exception:
+            pass
+
+        try:
+            self.d.press("back")
+            time.sleep(1)
+            return not self._reward_rain_page_active()
+        except Exception:
+            return False
+
     def _open_comment_panel(self, timeout: float = 2, prefer_coordinate: bool = False) -> bool:
         self._recover_anr_dialog()
+        if self._reward_rain_page_active():
+            self._dismiss_reward_rain_page()
         self._close_xiaoguo_ai_panel()
         if self._comment_panel_open():
             return True

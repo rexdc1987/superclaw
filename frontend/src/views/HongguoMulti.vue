@@ -140,7 +140,26 @@
               <el-option v-for="item in playbackSpeedOptions" :key="item.value" :label="item.label" :value="item.value" />
             </el-select>
           </el-form-item>
-          <el-form-item label="评论模板">
+          <el-form-item v-if="form.content_source !== 'ai'" label="模板库">
+            <el-select
+              v-model="selectedTemplateIds"
+              multiple
+              filterable
+              collapse-tags
+              :loading="loadingTemplates"
+              placeholder="选择已保存的评论模板"
+              style="width: 100%"
+            >
+              <el-option
+                v-for="item in savedTemplates"
+                :key="item.id"
+                :label="templateOptionLabel(item)"
+                :value="item.id"
+              />
+            </el-select>
+            <el-button link type="primary" @click="router.push('/hongguo/templates')">管理模板</el-button>
+          </el-form-item>
+          <el-form-item v-if="form.content_source !== 'ai'" label="临时模板">
             <el-input v-model="templateText" type="textarea" :rows="4" placeholder="每行一条评论模板" />
           </el-form-item>
           <el-form-item>
@@ -262,9 +281,16 @@ import {
   getMultiRun,
   getMultiRuns,
   getLogs,
+  getTemplates,
   startMultiRun,
   stopMultiRun,
 } from '../api/hongguo'
+import {
+  normalizeTemplateList,
+  partitionTemplateContents,
+  resolveTemplateContents,
+  templateOptionLabel,
+} from '../utils/hongguoTemplates'
 
 const router = useRouter()
 const deviceTableRef = ref(null)
@@ -282,6 +308,9 @@ const stopping = ref(false)
 const rebuilding = ref(false)
 const loadingLogs = ref(false)
 const templateText = ref('')
+const savedTemplates = ref([])
+const selectedTemplateIds = ref([])
+const loadingTemplates = ref(false)
 const selectedLogTaskId = ref(null)
 const taskLogs = ref({})
 let pollTimer = null
@@ -316,6 +345,15 @@ const deviceSummary = computed(() => ({
   online: devices.value.filter((item) => item.online).length,
   loggedIn: devices.value.filter((item) => item.logged_in).length,
 }))
+
+async function loadTemplateLibrary() {
+  loadingTemplates.value = true
+  try {
+    savedTemplates.value = normalizeTemplateList(await getTemplates())
+  } finally {
+    loadingTemplates.value = false
+  }
+}
 
 function isDeviceSelectable(row) {
   return Boolean(row.online && row.logged_in && !row.leased_by_other)
@@ -403,12 +441,22 @@ async function createRun() {
     ElMessage.warning('最大间隔必须大于等于最小间隔')
     return
   }
+  const templates = resolveTemplateContents(
+    savedTemplates.value,
+    selectedTemplateIds.value,
+    templateText.value,
+  )
+  if (form.content_source === 'template' && !templates.length) {
+    ElMessage.warning('请选择或输入至少一条评论模板')
+    return
+  }
   creating.value = true
   try {
     const payload = {
       ...form,
       drama_name: form.drama_name.trim(),
-      templates: templateText.value.split('\n').map((item) => item.trim()).filter(Boolean),
+      templates,
+      template_ids: selectedTemplateIds.value,
       devices: selectedDevices.value.map((item) => ({
         addr: item.addr,
         label: item.label || item.addr,
@@ -531,7 +579,9 @@ function reuseRuleFromActiveRun() {
     return
   }
   Object.assign(form, ruleFromTask(task))
-  templateText.value = (task.templates || []).join('\n')
+  const partitioned = partitionTemplateContents(task.templates || [], savedTemplates.value)
+  selectedTemplateIds.value = partitioned.selectedIds
+  templateText.value = partitioned.manualText
   ElMessage.success('已复用当前批次规则')
 }
 
@@ -546,6 +596,7 @@ async function rebuildRunFromActiveRun() {
     const rule = ruleFromTask(tasks[0])
     const payload = {
       ...rule,
+      template_ids: partitionTemplateContents(rule.templates, savedTemplates.value).selectedIds,
       devices: tasks
         .filter((item) => item.device_addr)
         .map((item) => ({
@@ -677,6 +728,7 @@ function formatTime(value) {
 
 onMounted(() => {
   loadRuns()
+  loadTemplateLibrary()
 })
 
 onBeforeUnmount(stopPolling)

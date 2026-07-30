@@ -500,6 +500,34 @@ class TaskEngine:
             self._assert_target_playback(ops, task, state, expected_total)
             return state
         except RuntimeError as exc:
+            if "未识别到当前集数" in str(exc):
+                confirmed = self._confirm_current_episode(ops, episode)
+                if confirmed == episode:
+                    confirmed_state = dict(state)
+                    confirmed_state["current_episode"] = confirmed
+                    self._log(
+                        "info",
+                        f"全流程v3: 第{episode}集观察前控件隐藏，强确认仍为第{confirmed}集，继续执行",
+                    )
+                    return confirmed_state
+                self._log(
+                    "warn",
+                    f"全流程v3: 第{episode}集观察前当前集不可读，强确认={confirmed or 0}，恢复目标集",
+                )
+                if self._recover_to_verified_episode(
+                    ops,
+                    task,
+                    episode,
+                    expected_total,
+                    f"主循环观察前当前集不可读，强确认={confirmed or 0}",
+                ):
+                    recovered_state = self._page_state(ops, task)
+                    recovered_current = self._confirm_current_episode(ops, episode)
+                    if recovered_current == episode:
+                        recovered_state = dict(recovered_state)
+                        recovered_state["current_episode"] = recovered_current
+                        return recovered_state
+                raise
             mismatch_markers = ("总集数不匹配", "非目标合集", "标题不匹配")
             if not any(marker in str(exc) for marker in mismatch_markers):
                 raise
@@ -720,6 +748,15 @@ class TaskEngine:
         value = str(message or "").lower()
         return "401" in value or "invalid api key" in value or "invalid_key" in value
 
+    @classmethod
+    def _is_ai_non_retryable_error(cls, message: str) -> bool:
+        value = str(message or "").lower()
+        quota_exhausted = "429" in value and any(
+            marker in value
+            for marker in ("quota exhausted", "insufficient_quota", "limitation")
+        )
+        return cls._is_ai_auth_error(value) or quota_exhausted
+
     def _generate_comment_content(
         self,
         task: Dict[str, Any],
@@ -733,7 +770,7 @@ class TaskEngine:
             content = generator.generate_local_comment_excluding(drama_title, avoid_contents or set())
             self._log(
                 "info",
-                f"全流程v3: 第{episode}集AI鉴权已熔断，本任务直接使用本地评论",
+                f"全流程v3: 第{episode}集AI服务已熔断，本任务直接使用本地评论",
             )
             return content, "local", {}
 
@@ -755,10 +792,10 @@ class TaskEngine:
             self._log("info", f"全流程v3: 第{episode}集AI评论重复，已改用本地去重内容")
         if source == "local" and requested_source in {"ai", "mixed"} and generator.last_error:
             fallback_error = re.sub(r"\s+", " ", generator.last_error).strip()[:300]
-            auth_error = self._is_ai_auth_error(fallback_error)
-            if auth_error:
+            non_retryable_error = self._is_ai_non_retryable_error(fallback_error)
+            if non_retryable_error:
                 self._ai_comment_disabled_reason = fallback_error
-            suffix = "，本任务后续评论直接使用本地生成" if auth_error else ""
+            suffix = "，本任务后续评论直接使用本地生成" if non_retryable_error else ""
             self._log(
                 "warn",
                 f"全流程v3: 第{episode}集AI评论生成失败，已回退本地评论，原因={fallback_error}{suffix}",
@@ -776,19 +813,19 @@ class TaskEngine:
         avoid_contents: Optional[set[str]] = None,
     ) -> None:
         current = self._confirm_current_episode(ops, episode)
-        if current and current != episode:
+        if current != episode:
             self._log(
                 "warn",
-                f"全流程v3: 第{episode}集评论前强确认实际已到第{current}集，重新恢复评论目标集",
+                f"全流程v3: 第{episode}集评论前强确认当前集={current or 0}，重新恢复评论目标集",
             )
             if not self._recover_to_verified_episode(
                 ops,
                 task,
                 episode,
                 expected_total,
-                f"评论前实际集数已变为第{current}集",
+                f"评论前当前集未确认或已漂移，实际={current or 0}",
             ):
-                raise RuntimeError(f"第{episode}集评论前无法从第{current}集恢复目标集")
+                raise RuntimeError(f"第{episode}集评论前无法从当前集{current or 0}恢复目标集")
 
         paused = ops.pause_playback_if_playing()
         panel_ready = ops.prepare_comment_window(episode)
@@ -813,20 +850,20 @@ class TaskEngine:
             )
             if not panel_ready:
                 current = self._confirm_current_episode(ops, episode)
-                if current and current != episode:
+                if current != episode:
                     self._log(
                         "warn",
-                        f"全流程v3: 第{episode}集评论面板重试时实际已到第{current}集，再次恢复目标集",
+                        f"全流程v3: 第{episode}集评论面板重试时当前集={current or 0}，再次恢复目标集",
                     )
                     recovered = self._recover_to_verified_episode(
                         ops,
                         task,
                         episode,
                         expected_total,
-                        f"评论面板重试时实际集数已变为第{current}集",
+                        f"评论面板重试时当前集未确认或已漂移，实际={current or 0}",
                     )
                     confirmed = self._confirm_current_episode(ops, episode) if recovered else 0
-                    if recovered and (confirmed == 0 or confirmed == episode):
+                    if recovered and confirmed == episode:
                         paused = ops.pause_playback_if_playing()
                         panel_ready = ops.prepare_comment_window(episode)
                         self._log(
@@ -861,10 +898,10 @@ class TaskEngine:
                         f"全流程v3: 第{episode}集冷启动恢复后准备评论，当前集={current or 0}，"
                         f"暂停播放={paused}，评论面板={panel_ready}",
                     )
-                    if not panel_ready and current and current != episode:
+                    if not panel_ready and current != episode:
                         self._log(
                             "warn",
-                            f"全流程v3: 第{episode}集冷启动评论重试时实际已到第{current}集，"
+                            f"全流程v3: 第{episode}集冷启动评论重试时当前集={current or 0}，"
                             "最后一次恢复目标集",
                         )
                         recovered = self._recover_to_verified_episode(
@@ -872,11 +909,11 @@ class TaskEngine:
                             task,
                             episode,
                             expected_total,
-                            f"冷启动评论重试时实际集数已变为第{current}集",
+                            f"冷启动评论重试时当前集未确认或已漂移，实际={current or 0}",
                             allow_reopen=True,
                         )
                         confirmed = self._confirm_current_episode(ops, episode) if recovered else 0
-                        if recovered and (confirmed == 0 or confirmed == episode):
+                        if recovered and confirmed == episode:
                             paused = ops.pause_playback_if_playing()
                             panel_ready = ops.prepare_comment_window(episode)
                             current = self._confirm_current_episode(ops, episode)
@@ -1174,7 +1211,9 @@ class TaskEngine:
                 raise RuntimeError(
                     f"切第{target}集失败: {self._playback_state_summary(state)}，截图={shot or '失败'}"
                 )
-            if state.get("ad_visible"):
+            # LiveLite is an app activity, not a skippable in-player ad. Handle
+            # it immediately even when visual ad detection is also positive.
+            if state.get("ad_visible") and app.get("activity") != LIVE_LITE_ACTIVITY:
                 if getattr(ops, "_ad_swipe_pending", False) is True:
                     now = time.time()
                     if now - last_log_at >= 30:
@@ -1400,7 +1439,7 @@ class TaskEngine:
                 ):
                     return True
                 raise RuntimeError(f"第{episode}集后红果不在前台，当前 package={app.get('package') or '-'}")
-            if state.get("ad_visible"):
+            if state.get("ad_visible") and app.get("activity") != LIVE_LITE_ACTIVITY:
                 if getattr(ops, "_ad_swipe_pending", False) is True:
                     now = time.time()
                     if now - last_log_at >= 30:
@@ -1880,8 +1919,14 @@ class TaskEngine:
                         timeout=min(45, int(remaining)),
                         allow_reopen=False,
                     ):
-                        self._log("info", f"全流程v3: 已恢复到第{target}集")
-                        return True
+                        confirmed = self._confirm_current_episode(ops, target)
+                        if confirmed == target:
+                            self._log("info", f"全流程v3: 已恢复到第{target}集")
+                            return True
+                        self._log(
+                            "warn",
+                            f"全流程v3: 第{target}集恢复校验曾成功，但强确认当前集={confirmed or 0}，继续恢复",
+                        )
             except RuntimeError as exc:
                 self._log("warn", f"全流程v3: 常规恢复第{target}集失败: {exc}")
                 if any(marker in str(exc) for marker in ("总集数不匹配", "非目标合集")):
@@ -1910,11 +1955,17 @@ class TaskEngine:
                 prefer_exact_title=prefer_exact_title,
             )
             if reopened:
+                confirmed = self._confirm_current_episode(ops, target)
+                if confirmed == target:
+                    self._log(
+                        "info",
+                        f"全流程v3: 第{reopen_attempt + 1}轮重新进入短剧后已恢复到第{target}集",
+                    )
+                    return True
                 self._log(
-                    "info",
-                    f"全流程v3: 第{reopen_attempt + 1}轮重新进入短剧后已恢复到第{target}集",
+                    "warn",
+                    f"全流程v3: 第{reopen_attempt + 1}轮重新进入短剧后强确认当前集={confirmed or 0}，拒绝误判成功",
                 )
-                return True
             if reopen_attempt >= 2:
                 break
             self._log(

@@ -70,7 +70,27 @@
           <span class="field-hint">默认 1.0x，可在任务执行时切换</span>
         </el-form-item>
 
-        <el-form-item label="评论模板">
+        <el-form-item v-if="form.content_source !== 'ai'" label="模板库">
+          <el-select
+            v-model="selectedTemplateIds"
+            multiple
+            filterable
+            collapse-tags
+            :loading="loadingTemplates"
+            placeholder="选择已保存的评论模板"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="item in savedTemplates"
+              :key="item.id"
+              :label="templateOptionLabel(item)"
+              :value="item.id"
+            />
+          </el-select>
+          <el-button link type="primary" @click="router.push('/hongguo/templates')">管理模板</el-button>
+        </el-form-item>
+
+        <el-form-item v-if="form.content_source !== 'ai'" label="临时模板">
           <el-input
             v-model="templateText"
             type="textarea"
@@ -92,12 +112,21 @@
 import { computed, reactive, ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { createTask, getTask, updateTask } from '../api/hongguo'
+import { createTask, getTask, getTemplates, updateTask } from '../api/hongguo'
+import {
+  normalizeTemplateList,
+  partitionTemplateContents,
+  resolveTemplateContents,
+  templateOptionLabel,
+} from '../utils/hongguoTemplates'
 
 const route = useRoute()
 const router = useRouter()
 const submitting = ref(false)
 const templateText = ref('')
+const savedTemplates = ref([])
+const selectedTemplateIds = ref([])
+const loadingTemplates = ref(false)
 const editingId = computed(() => route.query.id ? Number(route.query.id) : null)
 const form = reactive({
   drama_name: '',
@@ -124,6 +153,15 @@ const playbackSpeedOptions = [
   { label: '3.0x', value: '3.0x' },
 ]
 
+async function loadTemplateLibrary() {
+  loadingTemplates.value = true
+  try {
+    savedTemplates.value = normalizeTemplateList(await getTemplates())
+  } finally {
+    loadingTemplates.value = false
+  }
+}
+
 async function loadTaskForEdit() {
   if (!editingId.value) return
   const task = await getTask(editingId.value)
@@ -142,7 +180,9 @@ async function loadTaskForEdit() {
     playback_speed: task.playback_speed || '1.0x',
     templates: task.templates || [],
   })
-  templateText.value = (task.templates || []).join('\n')
+  const partitioned = partitionTemplateContents(task.templates || [], savedTemplates.value)
+  selectedTemplateIds.value = partitioned.selectedIds
+  templateText.value = partitioned.manualText
 }
 
 async function handleSubmit() {
@@ -155,13 +195,24 @@ async function handleSubmit() {
     return
   }
 
+  const templates = resolveTemplateContents(
+    savedTemplates.value,
+    selectedTemplateIds.value,
+    templateText.value,
+  )
+  if (form.content_source === 'template' && !templates.length) {
+    ElMessage.warning('请选择或输入至少一条评论模板')
+    return
+  }
+
   submitting.value = true
   try {
     const payload = {
       ...form,
       drama_name: form.drama_name.trim(),
-      templates: templateText.value.split('\n').map(item => item.trim()).filter(Boolean)
+      templates,
     }
+    if (!editingId.value) payload.template_ids = selectedTemplateIds.value
     if (editingId.value) {
       await updateTask(editingId.value, payload)
       ElMessage.success('任务已更新')
@@ -175,7 +226,15 @@ async function handleSubmit() {
   }
 }
 
-onMounted(loadTaskForEdit)
+async function initializePage() {
+  try {
+    await loadTemplateLibrary()
+  } finally {
+    await loadTaskForEdit()
+  }
+}
+
+onMounted(initializePage)
 </script>
 
 <style scoped>

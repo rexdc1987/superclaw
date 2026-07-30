@@ -2686,6 +2686,25 @@ class TestHongguoPlaybackHeuristics:
                     with patch.object(ops, "get_current_episode", return_value=1):
                         assert ops.play_episode(1) is True
 
+    def test_play_episode_reveals_hidden_controls_before_opening_episode_panel(self):
+        ops = HongguoOperations(object())
+        selector = MagicMock()
+        with patch.object(ops, "_xml", return_value=""):
+            with patch.object(ops, "_launcher_visible", return_value=False):
+                with patch.object(ops, "get_current_episode", side_effect=[17, 18]):
+                    with patch.object(ops, "exit_fullscreen"):
+                        with patch.object(ops, "_short_series_activity_active", return_value=True):
+                            with patch.object(ops, "_reveal_playback_controls") as reveal:
+                                with patch.object(ops, "_episode_panel_selector", side_effect=[None, selector]):
+                                    with patch.object(ops, "_exists", return_value=True):
+                                        with patch.object(ops, "_click_episode_number", return_value=True):
+                                            with patch.object(ops, "_close_episode_list_panel", return_value=True):
+                                                with patch("rpa.hongguo.operations.time.sleep"):
+                                                    assert ops.play_episode(18) is True
+
+        reveal.assert_called_once_with()
+        selector.click.assert_called_once_with()
+
     def test_play_episode_one_does_not_exit_fullscreen_when_episode_is_not_yet_read(self):
         class DummyDevice:
             def window_size(self):
@@ -3382,6 +3401,24 @@ def test_close_live_lite_page_uses_visible_back_arrow_first():
     ops.d.press.assert_not_called()
 
 
+def test_open_comment_panel_dismisses_polaris_reward_rain_before_clicking_comment():
+    ops = HongguoOperations(object())
+    ops.width, ops.height = 720, 1280
+    ops.d = MagicMock()
+
+    with patch.object(ops, "_reward_rain_page_active", side_effect=[True, True, False]):
+        with patch.object(ops, "_exists", return_value=False):
+            with patch.object(ops, "_comment_panel_open", side_effect=[False, True]):
+                with patch.object(ops, "_close_xiaoguo_ai_panel"):
+                    with patch.object(ops, "_recover_anr_dialog"):
+                        with patch.object(ops, "_open_comment_panel_by_coordinate", return_value=True):
+                            with patch("rpa.hongguo.operations.time.sleep"):
+                                assert ops._open_comment_panel(0, prefer_coordinate=True) is True
+
+    assert call(360, 1198) in ops.d.click.call_args_list
+    ops.d.press.assert_not_called()
+
+
 def test_comment_button_obstruction_detects_reward_compose_layer():
     ops = HongguoOperations(object())
     ops.width, ops.height = 720, 1280
@@ -3556,6 +3593,34 @@ def test_comment_generation_circuits_ai_after_auth_failure_for_remaining_task():
     assert any("后续评论直接使用本地" in item.args[1] for item in engine._log.call_args_list)
 
 
+def test_comment_generation_circuits_ai_after_quota_exhaustion_for_remaining_task():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._current_ai_config = MagicMock(return_value={"enabled": True, "api_key": "limited-key"})
+    first_generator = MagicMock()
+    first_generator.generate_with_usage.return_value = ("本地兜底一", "local", {})
+    first_generator.last_error = 'AI API HTTP 429: {"error":{"message":"quota exhausted","type":"limitation"}}'
+    second_generator = MagicMock()
+    second_generator.generate_local_comment_excluding.return_value = "本地兜底二"
+
+    with patch(
+        "rpa.hongguo.engine.CommentGenerator",
+        side_effect=[first_generator, second_generator],
+    ):
+        engine._generate_comment_content({"content_source": "ai"}, "万妖图录传第三季", 6, set())
+        second = engine._generate_comment_content(
+            {"content_source": "ai"},
+            "万妖图录传第三季",
+            9,
+            {"本地兜底一"},
+        )
+
+    assert second == ("本地兜底二", "local", {})
+    first_generator.generate_with_usage.assert_called_once_with("万妖图录传第三季", "ai", [])
+    second_generator.generate_with_usage.assert_not_called()
+    assert "429" in engine._ai_comment_disabled_reason
+
+
 def test_save_comment_record_persists_send_and_verify_metadata():
     engine = TaskEngine(task_id=7, db_config={}, screenshot_dir="C:/tmp")
     cursor = MagicMock()
@@ -3723,7 +3788,7 @@ def test_comment_panel_cold_restart_recovers_episode_drift_once_more():
     assert engine._recover_to_verified_episode.call_count == 3
     assert ops.prepare_comment_window.call_count == 4
     assert any(
-        "冷启动评论重试时实际集数已变为第5集" in call.args[4]
+        "冷启动评论重试时当前集未确认或已漂移，实际=5" in call.args[4]
         for call in engine._recover_to_verified_episode.call_args_list
     )
     ops.post_comment.assert_called_once_with("好看", 4)
@@ -4502,6 +4567,7 @@ class TestHongguoEngineWaits:
         ops = MagicMock()
         ops.ensure_playback_page.side_effect = RuntimeError("切集时短剧总集数不匹配: 期望 109，实际 85")
         engine._reopen_target_episode = MagicMock(return_value=True)
+        engine._confirm_current_episode = MagicMock(return_value=14)
 
         assert engine._recover_to_verified_episode(
             ops,
@@ -4527,6 +4593,7 @@ class TestHongguoEngineWaits:
         engine._skip_ad_if_present = MagicMock(return_value=False)
         engine._wait_for_episode_verified = MagicMock(return_value=True)
         engine._reopen_target_episode = MagicMock(return_value=True)
+        engine._confirm_current_episode = MagicMock(return_value=14)
         ops = MagicMock()
         ops.ensure_playback_page.return_value = True
 
@@ -4555,6 +4622,7 @@ class TestHongguoEngineWaits:
         engine._check_pause_stop = MagicMock()
         engine._skip_ad_if_present = MagicMock(return_value=False)
         engine._reopen_target_episode = MagicMock(side_effect=[False, False, True])
+        engine._confirm_current_episode = MagicMock(return_value=1)
         ops = MagicMock()
         ops.ensure_playback_page.return_value = False
         ops._open_main_activity.return_value = True
@@ -4574,6 +4642,28 @@ class TestHongguoEngineWaits:
             call(ops, {"drama_name": "胭脂念念不忘"}, 1, 40, prefer_exact_title=True),
         ]
         ops._open_main_activity.assert_not_called()
+
+    def test_recover_to_verified_episode_rejects_reopen_when_episode_remains_unknown(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._skip_ad_if_present = MagicMock(return_value=False)
+        engine._reopen_target_episode = MagicMock(return_value=True)
+        engine._confirm_current_episode = MagicMock(return_value=0)
+        ops = MagicMock()
+        ops.ensure_playback_page.return_value = False
+
+        with patch("rpa.hongguo.engine.time.sleep"):
+            assert engine._recover_to_verified_episode(
+                ops,
+                {"drama_name": "万妖图录传2"},
+                53,
+                53,
+                "评论恢复测试",
+            ) is False
+
+        assert engine._reopen_target_episode.call_count == 3
+        assert any("拒绝误判成功" in logged.args[1] for logged in engine._log.call_args_list)
 
     def test_reopen_target_episode_retries_search_after_forcing_main_page(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
@@ -4772,7 +4862,7 @@ class TestHongguoEngineWaits:
                 {
                     "current_episode": 0,
                     "total_episodes": 0,
-                    "ad_visible": False,
+                    "ad_visible": True,
                     "app": {
                         "package": "com.phoenix.read",
                         "activity": "com.dragon.read.component.biz.impl.live.ui.LiveLiteActivity",
@@ -5951,6 +6041,39 @@ def test_main_loop_does_not_hide_non_collection_playback_errors():
     with pytest.raises(RuntimeError, match="未检测到播放控件"):
         engine._ensure_target_playback_context(MagicMock(), {}, {}, 4, 40)
 
+    engine._recover_to_verified_episode.assert_not_called()
+
+
+def test_main_loop_strongly_confirms_hidden_episode_marker_before_actions():
+    engine = TaskEngine(task_id=191, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._confirm_current_episode = MagicMock(return_value=1)
+    engine._recover_to_verified_episode = MagicMock()
+    ops = MagicMock()
+    ops._playback_visible.return_value = False
+    state = {
+        "current_episode": 0,
+        "total_episodes": 68,
+        "playback_visible": False,
+        "ad_visible": False,
+        "launcher_visible": False,
+        "app": {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        },
+    }
+
+    result = engine._ensure_target_playback_context(
+        ops,
+        {"drama_name": "万妖图录传4"},
+        state,
+        1,
+        68,
+    )
+
+    assert result["current_episode"] == 1
+    assert state["current_episode"] == 0
+    engine._confirm_current_episode.assert_called_once_with(ops, 1)
     engine._recover_to_verified_episode.assert_not_called()
 
 
