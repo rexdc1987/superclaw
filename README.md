@@ -1,5 +1,24 @@
 # SuperClaw - Social Media Comment Lead Operations System
 
+## Current Hongguo Windows Build
+
+The maintained Windows installation and Agent test workflow is documented in:
+
+- [Agent install and test manual](docs/AGENT_INSTALL_AND_TEST.md)
+- [Coding agent rules](AGENTS.md)
+
+Quick bootstrap on Windows after cloning `codex/hongguo-server-ready`:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\bootstrap_windows.ps1 -DatabaseMode Auto -Start
+.\.venv\Scripts\python.exe scripts\hongguo_dev_smoke.py
+```
+
+Open `http://127.0.0.1:3000/hongguo/multi`. The Hongguo workflow uses MySQL,
+not SQLite. The older generic deployment notes below describe legacy modules and
+are not the source of truth for the current MuMu/Hongguo setup.
+
 Automated comment collection, intelligent filtering, lead scoring, and batch outreach.
 
 ## Features
