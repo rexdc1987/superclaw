@@ -254,7 +254,10 @@ class HongguoOperations:
                 ("\u7f16\u8f91\u8d44\u6599", "\u6536\u85cf"),
             )
             strong_profile_visible = any(all(marker in xml for marker in group) for group in strong_profile_groups)
-            profile_logged_in = bool(hongguo_id or (strong_profile_visible and not login_prompt_visible))
+            profile_logged_in = bool(
+                not login_prompt_visible
+                and (hongguo_id or strong_profile_visible or nickname)
+            )
             logged_in = bool(profile_logged_in)
             if not logged_in and login_prompt_visible:
                 result["message"] = "\u7ea2\u679c\u672a\u767b\u5f55"
@@ -1986,11 +1989,49 @@ class HongguoOperations:
     def favorite_current_episode(self) -> Dict[str, Any]:
         return self._set_current_episode_engagement("favorite")
 
+    def inspect_current_episode_engagement(self, action: str) -> Dict[str, Any]:
+        labels = {"like": "点赞", "favorite": "收藏"}
+        label = labels.get(action)
+        if not label:
+            return {"success": False, "selected": None, "message": "不支持的互动动作"}
+        try:
+            xml = self._xml()
+            if (
+                not self._short_series_activity_active()
+                or not self._playback_visible(xml)
+                or self._ad_continue_visible(xml)
+            ):
+                return {
+                    "success": False,
+                    "selected": None,
+                    "message": f"当前不在可复核{label}的播放页",
+                }
+            point = self._engagement_control_point(action, xml)
+            selected = self._engagement_selected_from_xml(action, xml)
+            source = "控件"
+            if selected is None:
+                selected = self._engagement_selected_visual(action, point)
+                source = "截图"
+            if selected is None:
+                detail = str(getattr(self, "_last_engagement_visual_error", "") or "")
+                message = f"{label}状态不可读"
+                if detail:
+                    message = f"{message}: {detail}"
+                return {"success": False, "selected": None, "message": message}
+            return {
+                "success": True,
+                "selected": selected,
+                "message": f"已通过{source}确认{label}{'已生效' if selected else '未生效'}",
+            }
+        except Exception as exc:
+            return {"success": False, "selected": None, "message": f"复核{label}失败: {exc}"}
+
     def _set_current_episode_engagement(self, action: str) -> Dict[str, Any]:
         labels = {"like": "点赞", "favorite": "收藏"}
         label = labels.get(action)
         if not label:
             return {"success": False, "verified": False, "message": "不支持的互动动作"}
+        click_sent = False
         try:
             if self._comment_panel_open():
                 self._close_comment_panel()
@@ -2016,6 +2057,7 @@ class HongguoOperations:
                 }
 
             self.d.click(*point)
+            click_sent = True
             after_xml = ""
             after_selected: Optional[bool] = None
             for _ in range(3):
@@ -2029,6 +2071,7 @@ class HongguoOperations:
                         "success": True,
                         "verified": True,
                         "already_active": False,
+                        "click_sent": True,
                         "message": f"{label}成功",
                     }
 
@@ -2039,15 +2082,28 @@ class HongguoOperations:
                 and self._playback_visible(after_xml)
             )
             if after_selected is None and still_playing:
+                detail = str(getattr(self, "_last_engagement_visual_error", "") or "")
+                suffix = f": {detail}" if detail else ""
                 return {
                     "success": True,
                     "verified": False,
                     "already_active": False,
-                    "message": f"{label}点击已发送，控件状态不可读",
+                    "click_sent": True,
+                    "message": f"{label}点击已发送，控件状态不可读{suffix}",
                 }
-            return {"success": False, "verified": False, "message": f"{label}后未检测到生效状态"}
+            return {
+                "success": False,
+                "verified": False,
+                "click_sent": True,
+                "message": f"{label}后未检测到生效状态",
+            }
         except Exception as exc:
-            return {"success": False, "verified": False, "message": f"{label}失败: {exc}"}
+            return {
+                "success": False,
+                "verified": False,
+                "click_sent": click_sent,
+                "message": f"{label}失败: {exc}",
+            }
 
     def _engagement_control_point(self, action: str, xml: str) -> tuple[int, int]:
         markers = ("点赞", "赞") if action == "like" else ("收藏",)
@@ -2096,24 +2152,56 @@ class HongguoOperations:
         return None
 
     def _engagement_selected_visual(self, action: str, point: tuple[int, int]) -> Optional[bool]:
+        image = None
+        errors: List[str] = []
+        self._last_engagement_visual_error = ""
+        serial = getattr(self.d, "serial", None) or getattr(self.d, "_serial", None)
+        if serial:
+            try:
+                import adbutils
+
+                image = call_with_timeout(
+                    lambda: adbutils.adb.device(serial).screenshot(),
+                    8,
+                    f"{action} adb state screenshot {serial}",
+                )
+            except Exception as exc:
+                errors.append(f"ADB截图失败={exc}")
+                image = None
         try:
-            image = call_with_timeout(lambda: self.d.screenshot(), 8, f"{action} state screenshot").convert("RGB")
-        except Exception:
+            if image is None:
+                image = call_with_timeout(
+                    lambda: self.d.screenshot(),
+                    8,
+                    f"{action} uiautomator state screenshot",
+                )
+            image = image.convert("RGB")
+        except Exception as exc:
+            errors.append(f"uiautomator截图失败={exc}")
+            self._last_engagement_visual_error = "；".join(errors)
             return None
-        center_x, center_y = point
-        radius_x = max(24, int(self.width * 0.055))
-        radius_y = max(24, int(self.height * 0.035))
+        image_width, image_height = image.size
+        center_x = int(point[0] * image_width / max(1, self.width))
+        center_y = int(point[1] * image_height / max(1, self.height))
+        radius_x = max(24, int(image_width * 0.055))
+        radius_y = max(24, int(image_height * 0.035))
         crop = image.crop(
             (
                 max(0, center_x - radius_x),
                 max(0, center_y - radius_y),
-                min(self.width, center_x + radius_x),
-                min(self.height, center_y + radius_y),
+                min(image_width, center_x + radius_x),
+                min(image_height, center_y + radius_y),
             )
         )
         pixels = list(crop.getdata())
         if not pixels:
             return None
+        bright_neutral = sum(
+            1
+            for red, green, blue in pixels
+            if min(red, green, blue) >= 180
+            and max(red, green, blue) - min(red, green, blue) <= 35
+        )
         if action == "like":
             colored = sum(
                 1 for red, green, blue in pixels
@@ -2124,7 +2212,10 @@ class HongguoOperations:
                 1 for red, green, blue in pixels
                 if red >= 175 and green >= 105 and blue <= 125 and red - blue >= 65
             )
-        return colored >= 18
+        # The video behind a white icon can itself be red or orange. A selected
+        # control replaces the bright-white icon with color, so color must
+        # dominate the neutral icon pixels instead of merely being present.
+        return colored >= 18 and colored > bright_neutral
 
     def exit_fullscreen(self) -> bool:
         if not self._short_series_activity_active():
@@ -3662,12 +3753,12 @@ class HongguoOperations:
         actions = []
         for action_name, action in (
             ("click_search_button", self._click_visible_search_button),
-            ("tap_search_button", lambda: self.d.click(int(self.width * 0.93), int(self.height * 0.083))),
+            ("tap_search_button", lambda: self.d.click(int(self.width * 0.93), int(self.height * 0.042))),
             ("press_enter", lambda: self.d.press("enter")),
             ("keyevent_enter", lambda: self.d.shell("input keyevent 66")),
             ("press_search", lambda: self.d.press("search")),
             ("keyevent_search", lambda: self.d.shell("input keyevent 84")),
-            ("tap_search_icon", lambda: self.d.click(int(self.width * 0.9), int(self.height * 0.055))),
+            ("tap_search_icon", lambda: self.d.click(int(self.width * 0.9), int(self.height * 0.042))),
         ):
             try:
                 action()
@@ -3714,12 +3805,25 @@ class HongguoOperations:
             "message": "已展示搜索候选结果，但未进入搜索结果页 tabs" if candidate_visible else "已填写关键词，但未进入搜索结果页",
         }
 
-    def _wait_search_results_page(self, keyword: str, timeout: float = 6) -> Dict[str, Any]:
+    def _wait_search_results_page(self, keyword: str, timeout: float = 8) -> Dict[str, Any]:
         deadline = time.time() + timeout
         last_xml = ""
+        foreground_misses = 0
         while time.time() < deadline:
             if not self._is_app_foreground():
-                return {"success": False, "app_foreground": False, "message": "提交搜索后离开红果 App"}
+                foreground_misses += 1
+                if foreground_misses >= 4:
+                    current = self._safe_app_current()
+                    package = str(current.get("package") or "unknown")
+                    return {
+                        "success": False,
+                        "app_foreground": False,
+                        "current_package": package,
+                        "message": f"提交搜索后离开红果 App，当前包={package}",
+                    }
+                time.sleep(0.5)
+                continue
+            foreground_misses = 0
             last_xml = self._xml()
             if self._search_results_visible(last_xml):
                 return {"success": True, "app_foreground": True, "tabs_visible": True, "message": "已进入搜索结果页"}

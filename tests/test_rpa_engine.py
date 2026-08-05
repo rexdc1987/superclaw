@@ -1483,6 +1483,45 @@ class TestHongguoPlaybackHeuristics:
         assert result["message"] == "已展示搜索候选结果，但未进入搜索结果页 tabs"
         assert result["actions"]
 
+    def test_submit_search_uses_header_button_coordinate_when_hierarchy_button_is_missing(self):
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 720, 1280
+        ops.d = MagicMock()
+        with patch.object(ops, "_click_visible_search_button", side_effect=RuntimeError("missing")):
+            with patch.object(
+                ops,
+                "_wait_search_results_page",
+                return_value={"success": True, "app_foreground": True, "tabs_visible": True},
+            ):
+                result = ops._submit_search("丧尸狂潮")
+
+        assert result["success"] is True
+        assert result["action"] == "tap_search_button"
+        ops.d.click.assert_called_once_with(669, 53)
+
+    def test_wait_search_results_tolerates_transient_foreground_misses(self):
+        ops = HongguoOperations(object())
+        with patch.object(ops, "_is_app_foreground", side_effect=[False, False, True]):
+            with patch.object(ops, "_xml", return_value="results"):
+                with patch.object(ops, "_search_results_visible", return_value=True):
+                    with patch("rpa.hongguo.operations.time.sleep"):
+                        result = ops._wait_search_results_page("丧尸狂潮", timeout=2)
+
+        assert result["success"] is True
+        assert result["app_foreground"] is True
+
+    def test_wait_search_results_reports_sustained_foreground_loss(self):
+        ops = HongguoOperations(object())
+        with patch.object(ops, "_is_app_foreground", return_value=False):
+            with patch.object(ops, "_safe_app_current", return_value={"package": "app.lawnchair"}):
+                with patch("rpa.hongguo.operations.time.sleep"):
+                    result = ops._wait_search_results_page("丧尸狂潮", timeout=2)
+
+        assert result["success"] is False
+        assert result["app_foreground"] is False
+        assert result["current_package"] == "app.lawnchair"
+        assert "当前包=app.lawnchair" in result["message"]
+
     def test_search_results_visible_requires_tabs(self):
         ops = HongguoOperations(object())
         assert ops._search_results_visible(
@@ -3040,6 +3079,84 @@ class TestHongguoLoginDetails:
         assert account["logged_in"] is True
         assert account["nickname"] == "用户名86662668"
         assert account["hongguo_id"] == ""
+
+    def test_get_account_info_accepts_profile_with_only_nickname(self):
+        class DummyDevice:
+            def window_size(self):
+                return (720, 1280)
+
+            def dump_hierarchy(self):
+                return 'text="凹凸曼" text="首页" text="我的"'
+
+        ops = HongguoOperations(DummyDevice())
+        with patch.object(ops, "_open_profile_tab", return_value=True):
+            with patch.object(ops, "_profile_visible", return_value=True):
+                account = ops.get_account_info()
+
+        assert account["logged_in"] is True
+        assert account["nickname"] == "凹凸曼"
+        assert account["hongguo_id"] == ""
+
+    def test_get_account_info_rejects_nickname_when_login_prompt_is_visible(self):
+        class DummyDevice:
+            def window_size(self):
+                return (720, 1280)
+
+            def dump_hierarchy(self):
+                return 'text="凹凸曼" text="手机号登录" text="我的"'
+
+        ops = HongguoOperations(DummyDevice())
+        with patch.object(ops, "_open_profile_tab", return_value=True):
+            with patch.object(ops, "_profile_visible", return_value=True):
+                account = ops.get_account_info()
+
+        assert account["logged_in"] is False
+        assert account["message"] == "红果未登录"
+
+    def test_prepare_playback_captures_login_failure(self):
+        engine = TaskEngine(task_id=213, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._check_login = MagicMock(
+            return_value={"logged_in": False, "message": "未识别红果账号信息"}
+        )
+        ops = MagicMock()
+        ops.launch_app.return_value = True
+        ops.take_screenshot.return_value = "C:/tmp/login_check_failed.png"
+
+        with pytest.raises(RuntimeError, match="login_check_failed.png"):
+            engine._prepare_verified_playback(ops, {"drama_name": "测试短剧"})
+
+        ops.take_screenshot.assert_called_once_with("login_check_failed", "C:/tmp")
+        engine._log.assert_any_call(
+            "error",
+            "全流程v3: 登录检测失败，已截图 C:/tmp/login_check_failed.png",
+        )
+
+    def test_prepare_playback_captures_search_submit_failure(self):
+        engine = TaskEngine(task_id=225, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._check_login = MagicMock(return_value={"logged_in": True})
+        engine._reset_search_context = MagicMock(return_value=True)
+        ops = MagicMock()
+        ops.launch_app.return_value = True
+        ops.open_search_page.return_value = {"success": True}
+        ops.input_search_keyword.return_value = {"success": True}
+        ops.submit_search.return_value = {
+            "success": False,
+            "message": "提交搜索后离开红果 App，当前包=app.lawnchair",
+        }
+        ops.take_screenshot.return_value = "C:/tmp/search_submit_failed.png"
+
+        with pytest.raises(RuntimeError, match="search_submit_failed.png"):
+            engine._prepare_verified_playback(ops, {"drama_name": "丧尸狂潮"})
+
+        ops.take_screenshot.assert_called_once_with("search_submit_failed", "C:/tmp")
+        engine._log.assert_any_call(
+            "error",
+            "全流程v3: 搜索提交失败，已截图 C:/tmp/search_submit_failed.png",
+        )
 
     def test_hongguo_id_does_not_parse_resource_id_attribute(self):
         ops = HongguoOperations(object())
@@ -5151,6 +5268,38 @@ class TestHongguoEngineWaits:
         engine._update_task.assert_called_with(current_episode=51, updated_at=ANY)
         assert any("已纠正执行进度" in item.args[1] for item in engine._log.call_args_list)
 
+    def test_verified_next_episode_recovers_earliest_skipped_pending_action(self):
+        engine = TaskEngine(task_id=231, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._has_playback_context = MagicMock(return_value=True)
+        engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+        engine._pending_comment_episodes_between = MagicMock(return_value=[38])
+        engine._recover_to_verified_episode = MagicMock(return_value=True)
+        engine._page_state = MagicMock(
+            return_value={
+                "current_episode": 39,
+                "total_episodes": 134,
+                "playback_visible": True,
+                "playback_paused": False,
+                "ad_visible": False,
+                "app": {
+                    "package": "com.phoenix.read",
+                    "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                },
+            }
+        )
+
+        assert engine._wait_for_next_episode_verified(MagicMock(), {}, 36, 37, 134) is True
+
+        engine._recover_to_verified_episode.assert_called_once_with(
+            ANY,
+            {},
+            38,
+            134,
+            "自动跳过待执行集，当前第39集",
+        )
+
     def test_verified_next_episode_does_not_force_skip_while_normally_playing(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
         engine._log = MagicMock()
@@ -5852,6 +6001,46 @@ def test_favorite_current_episode_waits_for_delayed_visual_confirmation():
     assert ops._engagement_selected_visual.call_count == 3
 
 
+def test_engagement_visual_state_prefers_independent_adb_screenshot():
+    from PIL import Image, ImageDraw
+
+    ops = HongguoOperations.__new__(HongguoOperations)
+    ops.width, ops.height = 720, 1280
+    ops.d = MagicMock(serial="192.168.1.134:5555")
+    ops.d.screenshot.side_effect = RuntimeError("uiautomator screenshot unavailable")
+    image = Image.new("RGB", (720, 1280), "black")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((640, 575, 690, 635), fill=(255, 185, 20))
+    fake_adbutils = MagicMock()
+    fake_adbutils.adb.device.return_value.screenshot.return_value = image
+
+    with patch.dict(sys.modules, {"adbutils": fake_adbutils}):
+        with patch("rpa.hongguo.operations.call_with_timeout", side_effect=lambda func, *_args: func()):
+            selected = ops._engagement_selected_visual("favorite", (666, 614))
+
+    assert selected is True
+    fake_adbutils.adb.device.assert_called_once_with("192.168.1.134:5555")
+    ops.d.screenshot.assert_not_called()
+
+
+def test_engagement_visual_state_rejects_red_video_behind_white_like_icon():
+    from PIL import Image, ImageDraw
+
+    ops = HongguoOperations.__new__(HongguoOperations)
+    ops.width, ops.height = 720, 1280
+    ops.d = MagicMock()
+    image = Image.new("RGB", (720, 1280), "black")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((627, 852, 634, 940), fill=(230, 55, 45))
+    draw.rectangle((646, 866, 686, 926), fill="white")
+    ops.d.screenshot.return_value = image
+
+    with patch("rpa.hongguo.operations.call_with_timeout", side_effect=lambda func, *_args: func()):
+        selected = ops._engagement_selected_visual("like", (666, 896))
+
+    assert selected is False
+
+
 def test_engagement_episode_plan_respects_count_total_and_zero():
     engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
 
@@ -5903,17 +6092,44 @@ def test_process_engagement_episode_does_not_count_unverified_click():
     ops.favorite_current_episode.return_value = {
         "success": True,
         "verified": False,
+        "click_sent": True,
         "message": "收藏点击已发送，控件状态不可读",
     }
 
     engine._process_engagement_episode(ops, 7, set(), {7})
 
     assert engine._completed_engagement_episodes["favorite"] == set()
+    assert engine._uncertain_engagement_episodes["favorite"] == {7}
     engine._increment_engagement_counter.assert_not_called()
     assert engine._log.call_args.args[0] == "warn"
 
 
-def test_process_engagement_episode_reschedules_already_active_like_without_counting():
+def test_final_engagement_retry_does_not_repeat_unverified_clicks():
+    engine = TaskEngine(task_id=222, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._increment_engagement_counter = MagicMock()
+    engine._uncertain_engagement_episodes = {"like": {26, 27}, "favorite": {23}}
+    ops = MagicMock()
+
+    engine._retry_missing_engagements_before_completion(
+        ops,
+        {"execution_plan_json": "{}"},
+        30,
+        {26, 27},
+        {23},
+    )
+
+    engine._recover_to_verified_episode.assert_not_called()
+    ops.like_current_episode.assert_not_called()
+    ops.favorite_current_episode.assert_not_called()
+    messages = [item.args[1] for item in engine._log.call_args_list]
+    assert any("避免重复点赞" in message for message in messages)
+    assert any("避免重复收藏" in message for message in messages)
+
+
+def test_process_engagement_episode_counts_already_active_like_as_satisfied():
     engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
     engine._check_pause_stop = MagicMock()
     engine._log = MagicMock()
@@ -5933,15 +6149,14 @@ def test_process_engagement_episode_reschedules_already_active_like_without_coun
         "message": "当前视频已经点赞",
     }
 
-    with patch("rpa.hongguo.engine.random.choice", return_value=3):
-        engine._process_engagement_episode(ops, 2, likes, set(), total=6, task=task)
+    engine._process_engagement_episode(ops, 2, likes, set(), total=6, task=task)
 
-    assert likes == {3, 5}
-    assert engine._completed_engagement_episodes["like"] == set()
-    engine._increment_engagement_counter.assert_not_called()
+    assert likes == {2, 5}
+    assert engine._completed_engagement_episodes["like"] == {2}
+    engine._increment_engagement_counter.assert_called_once_with("like")
     updated_plan = json.loads(task["execution_plan_json"])
-    assert updated_plan["like_episodes"] == [3, 5]
-    assert "不消耗新增名额" in engine._log.call_args.args[1]
+    assert updated_plan["like_episodes"] == [2, 5]
+    assert "互动目标已达成" in engine._log.call_args.args[1]
 
 
 def test_process_engagement_episode_counts_existing_drama_favorite_as_complete():
@@ -5962,7 +6177,106 @@ def test_process_engagement_episode_counts_existing_drama_favorite_as_complete()
 
     assert engine._completed_engagement_episodes["favorite"] == {7}
     engine._increment_engagement_counter.assert_called_once_with("favorite")
-    assert "收藏目标已达成" in engine._log.call_args.args[1]
+    assert "互动目标已达成" in engine._log.call_args.args[1]
+
+
+def test_recheck_uncertain_like_counts_verified_state_without_clicking():
+    engine = TaskEngine(task_id=230, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._increment_engagement_counter = MagicMock()
+    engine._uncertain_engagement_episodes = {"like": {16}, "favorite": set()}
+    ops = MagicMock()
+    ops.inspect_current_episode_engagement.return_value = {
+        "success": True,
+        "selected": True,
+        "message": "已通过截图确认点赞已生效",
+    }
+    ops.take_screenshot.return_value = "C:/tmp/ep16_like_recheck_verified.png"
+
+    engine._recheck_uncertain_engagements_before_completion(ops, {}, 40)
+
+    engine._recover_to_verified_episode.assert_called_once_with(
+        ops, {}, 16, 40, "复核待确认点赞"
+    )
+    ops.inspect_current_episode_engagement.assert_called_once_with("like")
+    ops.like_current_episode.assert_not_called()
+    assert engine._completed_engagement_episodes["like"] == {16}
+    assert engine._uncertain_engagement_episodes["like"] == set()
+    engine._increment_engagement_counter.assert_called_once_with("like")
+
+
+def test_capture_final_episode_evidence_requires_stable_target_episode():
+    engine = TaskEngine(task_id=231, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._assert_target_playback = MagicMock()
+    engine._recover_to_verified_episode = MagicMock()
+    state = {"current_episode": 134, "total_episodes": 134}
+    engine._page_state_with_empty_retry = MagicMock(return_value=state)
+    ops = MagicMock()
+    ops.pause_playback_if_playing.return_value = True
+    ops.take_screenshot.return_value = "C:/tmp/task_completed_summary.png"
+
+    result = engine._capture_final_episode_evidence(ops, {"drama_name": "目标短剧"}, 134)
+
+    assert result == "C:/tmp/task_completed_summary.png"
+    assert engine._page_state_with_empty_retry.call_count == 3
+    assert engine._assert_target_playback.call_count == 3
+    engine._recover_to_verified_episode.assert_not_called()
+    ops.pause_playback_if_playing.assert_called_once_with()
+    ops.take_screenshot.assert_called_once_with("task_completed_summary", "C:/tmp")
+
+
+def test_capture_final_episode_evidence_recovers_after_collection_switch():
+    engine = TaskEngine(task_id=232, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    wrong = {"current_episode": 1, "total_episodes": 94}
+    expected = {"current_episode": 134, "total_episodes": 134}
+    engine._page_state_with_empty_retry = MagicMock(
+        side_effect=[wrong, expected, expected, expected]
+    )
+    engine._assert_target_playback = MagicMock(
+        side_effect=[RuntimeError("检测到短剧总集数不匹配"), None, None, None]
+    )
+    ops = MagicMock()
+    ops.pause_playback_if_playing.return_value = True
+    ops.take_screenshot.return_value = "C:/tmp/task_completed_summary.png"
+
+    result = engine._capture_final_episode_evidence(ops, {"drama_name": "目标短剧"}, 134)
+
+    assert result == "C:/tmp/task_completed_summary.png"
+    engine._recover_to_verified_episode.assert_called_once_with(
+        ops,
+        {"drama_name": "目标短剧"},
+        134,
+        134,
+        "完成截图前目标合集或最后一集已切换",
+    )
+    ops.take_screenshot.assert_called_once_with("task_completed_summary", "C:/tmp")
+
+
+def test_inspect_current_episode_engagement_is_read_only():
+    ops = HongguoOperations.__new__(HongguoOperations)
+    ops.width, ops.height = 720, 1280
+    ops.d = MagicMock()
+    xml = (
+        '<node package="com.phoenix.read" visible-to-user="true" '
+        'content-desc="已点赞" bounds="[630,840][700,930]" />'
+    )
+    ops._xml = MagicMock(return_value=xml)
+    ops._short_series_activity_active = MagicMock(return_value=True)
+    ops._playback_visible = MagicMock(return_value=True)
+    ops._ad_continue_visible = MagicMock(return_value=False)
+
+    result = ops.inspect_current_episode_engagement("like")
+
+    assert result["success"] is True
+    assert result["selected"] is True
+    ops.d.click.assert_not_called()
 
 
 def test_final_engagement_retry_revisits_an_earlier_episode_when_last_like_is_already_active():
@@ -6154,6 +6468,9 @@ def test_main_loop_processes_pending_favorite_immediately_after_skip_recovery(tm
     engine._wait_for_next_episode_verified = MagicMock(return_value=True)
     engine._missing_verified_comment_episodes = MagicMock(return_value=[])
     engine._retry_missing_engagements_before_completion = MagicMock()
+    engine._capture_final_episode_evidence = MagicMock(
+        return_value=str(tmp_path / "completed.png")
+    )
     engine._duration_seconds = MagicMock(return_value=1)
 
     with patch.object(engine_module, "check_connection", return_value=True):
@@ -6169,6 +6486,7 @@ def test_main_loop_processes_pending_favorite_immediately_after_skip_recovery(tm
         "主循环集数偏移，当前第13集",
     )
     assert any(call.args[1] == 11 for call in engine._process_engagement_episode.call_args_list)
+    engine._capture_final_episode_evidence.assert_called_once_with(ops, task, 13)
     assert not any(call.kwargs.get("status") == "failed" for call in engine._update_task.call_args_list)
     assert any(call.kwargs.get("status") == "completed" for call in engine._update_task.call_args_list)
 

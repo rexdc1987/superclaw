@@ -56,6 +56,10 @@ class TaskEngine:
             "like": set(),
             "favorite": set(),
         }
+        self._uncertain_engagement_episodes: Dict[str, set[int]] = {
+            "like": set(),
+            "favorite": set(),
+        }
         self._device_info_cache: Dict[str, Any] = {}
         self._ai_comment_disabled_reason = ""
         self._thread: Optional[threading.Thread] = None
@@ -152,6 +156,8 @@ class TaskEngine:
                 self._engagement_episode_plan(task, total, "random_favorite_count", 1)
             )
             self._completed_engagement_episodes = {"like": set(), "favorite": set()}
+            self._uncertain_engagement_episodes = {"like": set(), "favorite": set()}
+            completion_screenshot = ""
             completed_episodes = self._completed_comment_episodes()
             if completed_episodes:
                 comment_episodes -= completed_episodes
@@ -260,6 +266,11 @@ class TaskEngine:
                     self._resume_if_paused(ops, episode)
 
                 if episode >= total:
+                    completion_screenshot = self._capture_final_episode_evidence(
+                        ops,
+                        task,
+                        total,
+                    )
                     break
                 target = episode + 1
                 if not self._wait_for_next_episode_verified(ops, task, episode, target, total):
@@ -281,6 +292,11 @@ class TaskEngine:
                     missing_comments,
                 )
                 completed_at = datetime.now()
+            self._recheck_uncertain_engagements_before_completion(
+                ops,
+                task,
+                total,
+            )
             self._retry_missing_engagements_before_completion(
                 ops,
                 task,
@@ -289,9 +305,16 @@ class TaskEngine:
                 favorite_episodes,
             )
             completed_at = datetime.now()
-            completion_screenshot = ops.take_screenshot("task_completed_summary", self.screenshot_dir)
+            if not completion_screenshot:
+                completion_screenshot = self._capture_final_episode_evidence(
+                    ops,
+                    task,
+                    total,
+                )
             likes_completed = len(self._completed_engagement_episodes["like"])
             favorites_completed = len(self._completed_engagement_episodes["favorite"])
+            likes_uncertain = len(self._uncertain_engagement_episodes["like"])
+            favorites_uncertain = len(self._uncertain_engagement_episodes["favorite"])
             self._update_task(completion_screenshot_path=completion_screenshot, updated_at=completed_at)
             engagement_level = (
                 "info"
@@ -302,7 +325,9 @@ class TaskEngine:
             self._log(
                 engagement_level,
                 f"全流程v3: 互动统计 点赞={likes_completed}/{len(like_episodes)}，"
-                f"收藏={favorites_completed}/{len(favorite_episodes)}，完成截图 {completion_screenshot}",
+                f"收藏={favorites_completed}/{len(favorite_episodes)}，"
+                f"待确认点击=点赞{likes_uncertain}/收藏{favorites_uncertain}，"
+                f"完成截图 {completion_screenshot}",
             )
             if missing_comments or not engagement_complete:
                 failures = []
@@ -313,7 +338,8 @@ class TaskEngine:
                 if not engagement_complete:
                     failures.append(
                         f"互动未达标: 点赞={likes_completed}/{len(like_episodes)}，"
-                        f"收藏={favorites_completed}/{len(favorite_episodes)}"
+                        f"收藏={favorites_completed}/{len(favorite_episodes)}，"
+                        f"待确认点击=点赞{likes_uncertain}/收藏{favorites_uncertain}"
                     )
                 message = "；".join(failures)
                 self._update_task(
@@ -352,6 +378,62 @@ class TaskEngine:
                 updated_at=completed_at,
             )
             self._log("error", f"任务失败: {exc}")
+
+    def _capture_final_episode_evidence(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        total: int,
+    ) -> str:
+        last_error = ""
+        for attempt in range(2):
+            self._check_pause_stop()
+            try:
+                state = self._page_state_with_empty_retry(ops, task)
+                self._assert_target_playback(ops, task, state, total)
+                current = int(state.get("current_episode") or 0)
+                if current != total:
+                    raise RuntimeError(f"完成证据当前集不匹配: 期望 {total}，实际 {current}")
+
+                paused = ops.pause_playback_if_playing()
+                stable_state = self._page_state_with_empty_retry(ops, task)
+                self._assert_target_playback(ops, task, stable_state, total)
+                stable_current = int(stable_state.get("current_episode") or 0)
+                if stable_current != total:
+                    raise RuntimeError(
+                        f"完成截图前当前集不匹配: 期望 {total}，实际 {stable_current}"
+                    )
+
+                screenshot = ops.take_screenshot("task_completed_summary", self.screenshot_dir)
+                verified_state = self._page_state_with_empty_retry(ops, task)
+                self._assert_target_playback(ops, task, verified_state, total)
+                verified_current = int(verified_state.get("current_episode") or 0)
+                if verified_current != total:
+                    raise RuntimeError(
+                        f"完成截图后当前集不匹配: 期望 {total}，实际 {verified_current}"
+                    )
+                self._log(
+                    "info",
+                    f"全流程v3: 已确认目标短剧最后一集={total}，暂停播放={paused}，"
+                    f"完成证据 {screenshot}",
+                )
+                return str(screenshot)
+            except Exception as exc:
+                last_error = str(exc)
+                self._log(
+                    "warn",
+                    f"全流程v3: 第{attempt + 1}次完成证据校验失败 - {last_error}",
+                )
+            if attempt == 0 and self._recover_to_verified_episode(
+                ops,
+                task,
+                total,
+                total,
+                "完成截图前目标合集或最后一集已切换",
+            ):
+                continue
+            break
+        raise RuntimeError(f"无法取得目标短剧最后一集完成证据: {last_error or '状态不可读'}")
 
     def _process_comment_episode(
         self,
@@ -397,6 +479,7 @@ class TaskEngine:
             result = operation()
             success = bool(result.get("success"))
             verified = bool(result.get("verified"))
+            click_sent = bool(result.get("click_sent"))
             self._log(
                 "info" if success and verified else "warn",
                 f"全流程v3: 第{episode}集随机{label}={'成功' if success else '失败'}，"
@@ -404,32 +487,67 @@ class TaskEngine:
             )
             if success and verified:
                 if result.get("already_active"):
-                    if action == "favorite":
-                        self._completed_engagement_episodes[action].add(episode)
-                        self._increment_engagement_counter(action)
-                        self._log("info", "全流程v3: 当前短剧原本已收藏，收藏目标已达成")
-                        continue
-                    replacement = self._reschedule_engagement_episode(
-                        action,
-                        label,
-                        episode,
-                        planned,
-                        total,
-                        task,
-                    )
-                    if replacement:
-                        self._log(
-                            "info",
-                            f"全流程v3: 第{episode}集原本已{label}，不消耗新增名额，顺延到第{replacement}集",
-                        )
-                    else:
-                        self._log(
-                            "warn",
-                            f"全流程v3: 第{episode}集原本已{label}，后续没有可顺延集数，不计入新增{label}",
-                        )
-                    continue
+                    target = "当前短剧" if action == "favorite" else f"第{episode}集"
+                    self._log("info", f"全流程v3: {target}原本已{label}，互动目标已达成")
                 self._completed_engagement_episodes[action].add(episode)
                 self._increment_engagement_counter(action)
+            elif click_sent:
+                self._uncertain_engagement_episodes[action].add(episode)
+                try:
+                    shot = ops.take_screenshot(
+                        f"ep{episode}_{action}_click_unverified",
+                        self.screenshot_dir,
+                    )
+                except Exception as exc:
+                    self._log("warn", f"全流程v3: 第{episode}集{label}待确认截图失败 - {exc}")
+                else:
+                    self._log("warn", f"全流程v3: 第{episode}集{label}点击待确认，已截图 {shot}")
+
+    def _recheck_uncertain_engagements_before_completion(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        total: int,
+    ) -> None:
+        actions = (("like", "点赞"), ("favorite", "收藏"))
+        for action, label in actions:
+            uncertain = self._uncertain_engagement_episodes[action]
+            for episode in sorted(uncertain):
+                self._check_pause_stop()
+                if action == "like" and not self._recover_to_verified_episode(
+                    ops,
+                    task,
+                    episode,
+                    total,
+                    f"复核待确认{label}",
+                ):
+                    self._log("warn", f"全流程v3: 第{episode}集待确认{label}无法恢复，保留待确认状态")
+                    continue
+                result = ops.inspect_current_episode_engagement(action)
+                selected = result.get("selected")
+                self._log(
+                    "info" if selected is True else "warn",
+                    f"全流程v3: 第{episode}集待确认{label}复核="
+                    f"{'已生效' if selected is True else '未生效' if selected is False else '状态不可读'}，"
+                    f"{result.get('message') or '-'}",
+                )
+                if selected is True:
+                    self._completed_engagement_episodes[action].add(episode)
+                    uncertain.discard(episode)
+                    self._increment_engagement_counter(action)
+                    try:
+                        shot = ops.take_screenshot(
+                            f"ep{episode}_{action}_recheck_verified",
+                            self.screenshot_dir,
+                        )
+                    except Exception as exc:
+                        self._log("warn", f"全流程v3: 第{episode}集{label}复核成功截图失败 - {exc}")
+                    else:
+                        self._log("info", f"全流程v3: 第{episode}集{label}复核成功，已截图 {shot}")
+                elif selected is False:
+                    # An explicit inactive state means the original click did not stick.
+                    # Clear uncertainty so the bounded compensation pass may safely retry.
+                    uncertain.discard(episode)
 
     def _retry_missing_engagements_before_completion(
         self,
@@ -447,9 +565,19 @@ class TaskEngine:
             missing = len(planned) - len(self._completed_engagement_episodes[action])
             if missing <= 0:
                 continue
-            attempted = set(planned) | set(self._completed_engagement_episodes[action])
+            uncertain = self._uncertain_engagement_episodes[action]
+            safe_missing = missing - len(uncertain)
+            if safe_missing <= 0:
+                self._log(
+                    "warn",
+                    f"全流程v3: {label}已有{len(uncertain)}次点击结果待确认，"
+                    f"为避免重复{label}或超出配置次数，不再执行补偿点击",
+                )
+                continue
+            attempted = set(planned) | set(self._completed_engagement_episodes[action]) | set(uncertain)
             candidates = [episode for episode in range(1, total + 1) if episode not in attempted]
             random.shuffle(candidates)
+            candidates = candidates[: min(len(candidates), max(2, safe_missing * 2))]
             self._log(
                 "warn",
                 f"全流程v3: 刷完后仍缺少{missing}次{label}，开始回访未尝试集数补偿",
@@ -471,14 +599,25 @@ class TaskEngine:
                 success = bool(result.get("success"))
                 verified = bool(result.get("verified"))
                 already_active = bool(result.get("already_active"))
+                click_sent = bool(result.get("click_sent"))
                 self._log(
                     "info" if success and verified else "warn",
                     f"全流程v3: 第{episode}集最终补偿{label}={'成功' if success else '失败'}，"
                     f"已验证={verified}，{result.get('message') or '-'}",
                 )
                 if not success or not verified:
-                    continue
-                if action == "like" and already_active:
+                    if click_sent:
+                        uncertain.add(episode)
+                        if (
+                            len(self._completed_engagement_episodes[action]) + len(uncertain)
+                            >= len(planned)
+                        ):
+                            self._log(
+                                "warn",
+                                f"全流程v3: {label}点击结果待确认数量已覆盖剩余名额，"
+                                f"停止补偿以避免重复点击",
+                            )
+                            break
                     continue
                 unresolved = sorted(planned - self._completed_engagement_episodes[action])
                 if unresolved:
@@ -600,7 +739,15 @@ class TaskEngine:
         login = self._check_login(ops)
         self._log("info", f"全流程v3: 登录检测 - {login.get('message') or login.get('status')}")
         if not login.get("logged_in"):
-            raise RuntimeError(login.get("message") or "登录检测失败")
+            message = login.get("message") or "登录检测失败"
+            try:
+                shot = ops.take_screenshot("login_check_failed", self.screenshot_dir)
+            except Exception as exc:
+                self._log("warn", f"全流程v3: 登录检测失败，诊断截图失败 - {exc}")
+            else:
+                self._log("error", f"全流程v3: 登录检测失败，已截图 {shot}")
+                message = f"{message}，已截图 {shot}"
+            raise RuntimeError(message)
 
         if not self._reset_search_context(ops, "首次选剧"):
             raise RuntimeError("首次选剧前无法重置到红果主页面")
@@ -624,7 +771,15 @@ class TaskEngine:
             f"结果页={bool(submit.get('tabs_visible') or search.get('tabs_visible'))}，候选={bool(submit.get('candidate_visible') or search.get('candidate_visible'))}",
         )
         if not search.get("success"):
-            raise RuntimeError(search.get("message") or "提交搜索失败")
+            message = search.get("message") or "提交搜索失败"
+            try:
+                shot = ops.take_screenshot("search_submit_failed", self.screenshot_dir)
+            except Exception as exc:
+                self._log("warn", f"全流程v3: 搜索提交失败，诊断截图失败 - {exc}")
+            else:
+                self._log("error", f"全流程v3: 搜索提交失败，已截图 {shot}")
+                message = f"{message}，已截图 {shot}"
+            raise RuntimeError(message)
 
         titles = ops._extract_drama_titles()
         selected_title = ops._choose_title(keyword, titles)
@@ -1742,8 +1897,8 @@ class TaskEngine:
                 freeze_recovery_attempted = False
                 post_comment_play_nudged = False
             if current > target:
-                pending_comments = self._pending_comment_episodes_between(task, target, current)
-                if not pending_comments:
+                pending_episodes = self._pending_comment_episodes_between(task, target, current)
+                if not pending_episodes:
                     self._log(
                         "info",
                         f"全流程v3: 已自动跨到第{current}集，第{target}-{current - 1}集无待评论任务，顺延观察",
@@ -1752,11 +1907,20 @@ class TaskEngine:
                 self._log(
                     "warn",
                     f"全流程v3: 已跳过目标第{target}集，当前第{current}集，"
-                    f"区间内待评论集数={pending_comments}，尝试切回目标集",
+                    f"区间内待执行集数={pending_episodes}，尝试恢复最早待执行集",
                 )
-                if self._recover_to_verified_episode(ops, task, target, expected_total, f"自动跳过目标集，当前第{current}集"):
+                recovery_target = pending_episodes[0]
+                if self._recover_to_verified_episode(
+                    ops,
+                    task,
+                    recovery_target,
+                    expected_total,
+                    f"自动跳过待执行集，当前第{current}集",
+                ):
                     return True
-                raise RuntimeError(f"跳过目标集: 目标第{target}集，当前第{current}集")
+                raise RuntimeError(
+                    f"跳过待执行集: 目标第{recovery_target}集，当前第{current}集"
+                )
             if current and current < episode:
                 raise RuntimeError(f"回退异常: 上一集第{episode}集，当前第{current}集")
             time.sleep(2)
@@ -1788,8 +1952,8 @@ class TaskEngine:
             self._log("info", f"全流程v3: 超时后二次确认已进入第{target}集")
             return True
         if final_current > target:
-            pending_comments = self._pending_comment_episodes_between(task, target, final_current)
-            if not pending_comments:
+            pending_episodes = self._pending_comment_episodes_between(task, target, final_current)
+            if not pending_episodes:
                 self._log(
                     "info",
                     f"全流程v3: 超时前强确认已播放到第{final_current}集，"
@@ -1799,12 +1963,12 @@ class TaskEngine:
             self._log(
                 "warn",
                 f"全流程v3: 超时前强确认已播放到第{final_current}集，"
-                f"区间待评论集数={pending_comments}，恢复第{target}集",
+                f"区间待执行集数={pending_episodes}，恢复第{pending_episodes[0]}集",
             )
             return self._recover_to_verified_episode(
                 ops,
                 task,
-                target,
+                pending_episodes[0],
                 expected_total,
                 f"超时前发现实际已到第{final_current}集",
             )
