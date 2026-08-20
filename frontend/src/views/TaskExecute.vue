@@ -24,6 +24,7 @@
           <el-descriptions-item label="创建时间">{{ formatTime(displayCreatedAt) }}</el-descriptions-item>
           <el-descriptions-item label="启动时间">{{ formatTime(displayStartedAt) }}</el-descriptions-item>
           <el-descriptions-item label="完成时间">{{ formatTime(displayCompletedAt) }}</el-descriptions-item>
+          <el-descriptions-item label="执行时长">{{ displayDuration }}</el-descriptions-item>
           <el-descriptions-item label="刷新状态">
             <el-tag :type="autoRefreshing ? 'success' : 'info'">{{ autoRefreshing ? '自动刷新中' : '手动刷新' }}</el-tag>
           </el-descriptions-item>
@@ -220,6 +221,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { getTask, startTask, pauseTask, resumeTask, stopTask, getRecords, getLogs, runPrepareTask, runStageTask } from '../api/hongguo'
+import { formatTaskDuration } from '../utils/taskDuration'
 
 const route = useRoute()
 const router = useRouter()
@@ -264,6 +266,7 @@ const liveSummary = computed(() => {
 const displayCreatedAt = computed(() => task.value?.created_at || '')
 const displayStartedAt = computed(() => task.value?.started_at || '')
 const displayCompletedAt = computed(() => task.value?.completed_at || '')
+const displayDuration = computed(() => formatTaskDuration(task.value))
 const executionPlan = computed(() => {
   const value = task.value?.execution_plan
   if (value && typeof value === 'object' && !Array.isArray(value)) return value

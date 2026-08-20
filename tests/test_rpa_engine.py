@@ -99,6 +99,31 @@ def test_hongguo_task_device_addr_prefers_bound_instance():
         assert routes_hongguo._task_device_addr({}) == "192.168.3.134:5555"
 
 
+def test_stop_multi_run_preserves_terminal_task_statuses():
+    from rpa.dashboard import routes_hongguo
+
+    tasks = [
+        {"id": 240, "status": "failed", "error_message": "未确认进入目标短剧详情"},
+        {"id": 241, "status": "running", "error_message": None},
+        {"id": 242, "status": "stopped", "error_message": None},
+    ]
+    connection_context = MagicMock()
+    connection_context.__enter__.return_value = MagicMock()
+
+    with patch.object(routes_hongguo, "_connection", return_value=connection_context):
+        with patch.object(routes_hongguo, "_fetch_multi_run_tasks", side_effect=[tasks, tasks]):
+            with patch.object(routes_hongguo, "_execution_mode", return_value="local"):
+                with patch.object(routes_hongguo, "_engine_manager") as engine_manager:
+                    with patch.object(routes_hongguo, "_set_task_status", return_value={"id": 241, "status": "stopped"}) as set_status:
+                        result = routes_hongguo.stop_multi_run("batch-240")
+
+    engine_manager.return_value.stop_task.assert_called_once_with(241)
+    set_status.assert_called_once_with(241, "stopped", "多开批次任务已停止")
+    assert [task["id"] for task in result["skipped"]] == [240, 242]
+    assert result["skipped"][0]["status"] == "failed"
+    assert result["skipped"][0]["error_message"] == "未确认进入目标短剧详情"
+
+
 def test_multi_device_login_detection_allows_slow_mumu_profile_checks():
     from rpa.dashboard import routes_hongguo
 
@@ -4269,6 +4294,19 @@ class TestHongguoEngineWaits:
         assert engine._strict_title_matches("三界反骨仔", "三界反骨仔，天庭刀枪炮第一季") is True
         assert engine._strict_title_matches("三界反骨仔", "三界反骨仔，天庭刀枪炮第二季") is False
 
+    def test_choose_title_rejects_later_seasons_for_base_keyword(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        titles = ["野路子·第二季", "民国榜 No.1", "野路子·第三季", "59.3万人预约", "民国"]
+
+        assert engine._choose_title("野路子", titles) == ""
+        assert engine._choose_title("野路子2", titles) == "野路子·第二季"
+        assert engine._choose_title("野路子第二季", titles) == "野路子·第二季"
+
+        ops = HongguoOperations(object())
+        assert ops._choose_title("野路子", titles) == ""
+        assert ops._choose_title("野路子2", titles) == "野路子·第二季"
+        assert ops._choose_title("野路子第二季", titles) == "野路子·第二季"
+
     def test_watch_episode_plan_starts_from_target_episode(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
         assert engine._watch_episode_plan(6, 3) == [3, 4, 5, 6]
@@ -5133,7 +5171,18 @@ class TestHongguoEngineWaits:
         engine._log = MagicMock()
         engine._check_pause_stop = MagicMock()
         engine._has_playback_context = MagicMock(return_value=True)
+        engine._total_mismatch_is_fatal = MagicMock(return_value=False)
         engine._recover_to_verified_episode = MagicMock(return_value=True)
+        restored_state = {
+            "current_episode": 5,
+            "total_episodes": 68,
+            "playback_visible": True,
+            "ad_visible": False,
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+        }
         engine._page_state = MagicMock(
             side_effect=[
                 {
@@ -5145,16 +5194,8 @@ class TestHongguoEngineWaits:
                         "activity": "com.dragon.read.component.biz.impl.live.ui.LiveLiteActivity",
                     },
                 },
-                {
-                    "current_episode": 5,
-                    "total_episodes": 68,
-                    "playback_visible": True,
-                    "ad_visible": False,
-                    "app": {
-                        "package": "com.phoenix.read",
-                        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
-                    },
-                },
+                restored_state,
+                *([restored_state] * 9),
             ]
         )
         ops = MagicMock()
@@ -5164,8 +5205,8 @@ class TestHongguoEngineWaits:
         with patch("rpa.hongguo.engine.time.sleep"):
             assert engine._wait_for_next_episode_verified(ops, {}, 5, 6, 68) is True
 
-        assert ops.play_episode.call_args_list == [call(6), call(6)]
-        ops.resume_playback_safely.assert_called_once_with()
+        assert ops.play_episode.call_args_list == [call(6), call(6), call(6)]
+        assert ops.resume_playback_safely.call_count == 3
         assert "直播页反复拦截自动连播" in engine._recover_to_verified_episode.call_args.args[4]
 
     def test_verified_next_episode_retries_direct_advance_after_resuming_previous_episode(self):
@@ -5173,7 +5214,18 @@ class TestHongguoEngineWaits:
         engine._log = MagicMock()
         engine._check_pause_stop = MagicMock()
         engine._has_playback_context = MagicMock(return_value=True)
+        engine._total_mismatch_is_fatal = MagicMock(return_value=False)
         engine._recover_to_verified_episode = MagicMock(return_value=True)
+        restored_state = {
+            "current_episode": 5,
+            "total_episodes": 68,
+            "playback_visible": True,
+            "ad_visible": False,
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+        }
         engine._page_state = MagicMock(
             side_effect=[
                 {
@@ -5185,16 +5237,8 @@ class TestHongguoEngineWaits:
                         "activity": "com.dragon.read.component.biz.impl.live.ui.LiveLiteActivity",
                     },
                 },
-                {
-                    "current_episode": 5,
-                    "total_episodes": 68,
-                    "playback_visible": True,
-                    "ad_visible": False,
-                    "app": {
-                        "package": "com.phoenix.read",
-                        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
-                    },
-                },
+                restored_state,
+                *([restored_state] * 3),
             ]
         )
         ops = MagicMock()
@@ -5208,6 +5252,45 @@ class TestHongguoEngineWaits:
         assert ops.play_episode.call_args_list == [call(6), call(6)]
         ops.resume_playback_safely.assert_called_once_with()
         engine._recover_to_verified_episode.assert_not_called()
+
+    def test_live_lite_local_recovery_accepts_delayed_auto_advance(self):
+        engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._has_playback_context = MagicMock(return_value=True)
+        engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+        engine._page_state = MagicMock(
+            side_effect=[
+                {
+                    "current_episode": 5,
+                    "total_episodes": 68,
+                    "playback_visible": True,
+                    "app": {
+                        "package": "com.phoenix.read",
+                        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                    },
+                },
+                {
+                    "current_episode": 6,
+                    "total_episodes": 68,
+                    "playback_visible": True,
+                    "app": {
+                        "package": "com.phoenix.read",
+                        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+                    },
+                },
+            ]
+        )
+        ops = MagicMock()
+        ops.play_episode.return_value = False
+        ops.resume_playback_safely.return_value = True
+
+        with patch("rpa.hongguo.engine.time.sleep"):
+            assert engine._recover_live_lite_next_episode_locally(ops, {}, 6, 68) is True
+
+        ops.play_episode.assert_called_once_with(6)
+        ops.resume_playback_safely.assert_called_once_with()
+        assert engine._page_state.call_count == 2
 
     def test_verified_next_episode_falls_back_when_live_lite_cannot_close(self):
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")

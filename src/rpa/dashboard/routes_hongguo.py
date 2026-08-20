@@ -72,6 +72,8 @@ TASK_STATUSES = {
     "failed",
     "stopped",
 }
+
+STOPPABLE_TASK_STATUSES = {"pending", "waiting_login", "running", "paused"}
 COMMENT_MODES = {"random", "specified"}
 CONTENT_SOURCES = {"ai", "template", "mixed"}
 RECORD_STATUSES = {"success", "failed", "skipped"}
@@ -3571,10 +3573,15 @@ def stop_multi_run(run_id: str):
     if not tasks:
         raise HTTPException(status_code=404, detail="Multi run not found")
     stopped = []
+    skipped = []
     for task in tasks:
         task_id = int(task["id"])
+        task_status = _normalize_status(task.get("status"))
+        if task_status not in STOPPABLE_TASK_STATUSES:
+            skipped.append(_serialize_task(task))
+            continue
         try:
-            if _execution_mode() == "api" and task.get("status") in {"running", "paused"}:
+            if _execution_mode() == "api" and task_status in {"running", "paused"}:
                 with _connection() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -3584,13 +3591,14 @@ def stop_multi_run(run_id: str):
                     _insert_log(conn, task_id, "多开批次已向执行节点发送停止命令")
                     stopped.append(_serialize_task(_fetch_one_or_404(conn, task_id)))
             else:
-                _engine_manager().stop_task(task_id)
+                if _execution_mode() != "api":
+                    _engine_manager().stop_task(task_id)
                 stopped.append(_set_task_status(task_id, "stopped", "多开批次任务已停止"))
         except Exception as exc:
             stopped.append({"id": task_id, "error_message": str(exc)})
     with _connection() as conn:
         latest = _fetch_multi_run_tasks(conn, run_id)
-    return {"success": True, "stopped": stopped, **_serialize_multi_run(run_id, latest)}
+    return {"success": True, "stopped": stopped, "skipped": skipped, **_serialize_multi_run(run_id, latest)}
 
 
 @router.get("/templates")

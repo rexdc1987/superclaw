@@ -1639,28 +1639,12 @@ class TaskEngine:
                                 self._log("info", f"全流程v3: 关闭红果内部直播页后已进入第{target}集")
                                 return True
                             if restored_current in (0, episode):
-                                advanced = bool(ops.play_episode(target))
-                                self._log(
-                                    "info" if advanced else "warn",
-                                    f"全流程v3: 关闭红果内部直播页后回到第{restored_current or episode}集，"
-                                    f"主动切换第{target}集={advanced}",
-                                )
-                                if not advanced:
-                                    resume = getattr(ops, "resume_playback_safely", None)
-                                    resumed = bool(resume()) if callable(resume) else False
-                                    self._log(
-                                        "info" if resumed else "warn",
-                                        f"全流程v3: 直播页关闭后目标集直切未确认，先恢复上一集播放={resumed}，"
-                                        f"再次尝试第{target}集",
-                                    )
-                                    time.sleep(1)
-                                    advanced = bool(ops.play_episode(target))
-                                    self._log(
-                                        "info" if advanced else "warn",
-                                        f"全流程v3: 直播页关闭后第二次主动切换第{target}集={advanced}",
-                                    )
-                                if advanced:
-                                    self._pause_pending_action_episode(ops, task, target)
+                                if self._recover_live_lite_next_episode_locally(
+                                    ops,
+                                    task,
+                                    target,
+                                    expected_total,
+                                ):
                                     return True
                                 if self._recover_to_verified_episode(
                                     ops,
@@ -2049,6 +2033,75 @@ class TaskEngine:
             f"全流程v3: 第{episode}集命中待执行评论或互动，立即暂停={paused}",
         )
         return paused
+
+    def _recover_live_lite_next_episode_locally(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        target: int,
+        expected_total: int,
+    ) -> bool:
+        """Try a bounded in-player recovery before reopening the whole drama."""
+        for attempt in range(3):
+            self._check_pause_stop()
+            advanced = bool(ops.play_episode(target))
+            self._log(
+                "info" if advanced else "warn",
+                f"全流程v3: 直播页关闭后本地切换第{target}集="
+                f"{advanced}，尝试{attempt + 1}/3",
+            )
+            if advanced:
+                self._pause_pending_action_episode(ops, task, target)
+                return True
+
+            resume = getattr(ops, "resume_playback_safely", None)
+            resumed = bool(resume()) if callable(resume) else False
+            self._log(
+                "info" if resumed else "warn",
+                f"全流程v3: 直播页关闭后本地切集未确认，恢复上一集播放={resumed}",
+            )
+
+            # Closing LiveLite at an episode boundary can resume automatic
+            # playback after the selector attempt has already timed out.
+            for _ in range(3):
+                time.sleep(2)
+                state = self._page_state(ops, task)
+                app = state.get("app") or {}
+                activity = str(app.get("activity") or "")
+                current = int(state.get("current_episode") or 0)
+                total = int(state.get("total_episodes") or 0)
+                if activity != SHORT_SERIES_ACTIVITY or not self._has_playback_context(state):
+                    self._log(
+                        "warn",
+                        f"全流程v3: LiveLite本地恢复离开短剧播放页，activity={activity or '-'}",
+                    )
+                    return False
+                if self._total_mismatch_is_fatal(
+                    ops,
+                    task,
+                    state,
+                    expected_total,
+                    total,
+                    current=current,
+                    target=target,
+                ):
+                    self._log(
+                        "warn",
+                        f"全流程v3: LiveLite本地恢复检测到错误合集，期望{expected_total}集，实际{total}集",
+                    )
+                    return False
+                if current == target:
+                    self._pause_pending_action_episode(ops, task, target, state)
+                    self._log("info", f"全流程v3: LiveLite本地恢复已确认进入第{target}集")
+                    return True
+                if current > target and not self._pending_comment_episodes_between(task, target, current):
+                    self._log(
+                        "info",
+                        f"全流程v3: LiveLite本地恢复时已播放到第{current}集，"
+                        f"第{target}-{current - 1}集无待执行任务，顺延观察",
+                    )
+                    return True
+        return False
 
     def _recover_to_verified_episode(
         self,
@@ -3282,7 +3335,7 @@ class TaskEngine:
         if ranked:
             ranked.sort(key=lambda item: item[0])
             return ranked[0][1]
-        return matches[0]
+        return ""
 
     @staticmethod
     def _looks_like_preview_title(title: str) -> bool:

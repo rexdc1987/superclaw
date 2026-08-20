@@ -3441,7 +3441,7 @@ class HongguoOperations:
         if ranked:
             ranked.sort(key=lambda item: item[0])
             return ranked[0][1]
-        return matches[0]
+        return ""
 
     def _looks_like_specific_title(self, title: str) -> bool:
         text = str(title or "").strip()

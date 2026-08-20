@@ -85,43 +85,46 @@
 
     <el-card>
       <el-table :data="tasks" v-loading="loading" style="width: 100%">
-        <el-table-column prop="id" label="ID" width="70" />
-        <el-table-column prop="drama_name" label="短剧名称" min-width="180" show-overflow-tooltip />
-        <el-table-column label="实例ID" min-width="150" show-overflow-tooltip>
+        <el-table-column prop="id" label="ID" width="60" />
+        <el-table-column prop="drama_name" label="短剧名称" min-width="170" show-overflow-tooltip />
+        <el-table-column label="实例ID" min-width="135" show-overflow-tooltip>
           <template #default="{ row }">
             {{ formatInstanceId(row) }}
           </template>
         </el-table-column>
-        <el-table-column label="实例名称" min-width="210" show-overflow-tooltip>
+        <el-table-column label="实例名称" min-width="200" show-overflow-tooltip>
           <template #default="{ row }">
             {{ formatInstanceName(row) }}
           </template>
         </el-table-column>
-        <el-table-column prop="comment_mode" label="模式" width="110">
+        <el-table-column prop="comment_mode" label="模式" width="80">
           <template #default="{ row }">
             <el-tag :type="row.comment_mode === 'random' ? 'warning' : 'success'">
               {{ modeText(row.comment_mode) }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="playback_speed" label="倍速" width="90">
+        <el-table-column prop="playback_speed" label="倍速" width="70">
           <template #default="{ row }">
             {{ row.playback_speed || '1.0x' }}
           </template>
         </el-table-column>
-        <el-table-column prop="status" label="状态" width="120">
+        <el-table-column prop="status" label="状态" width="90">
           <template #default="{ row }">
             <el-tag :type="statusType(row.status)">{{ statusText(row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="进度" width="160">
+        <el-table-column label="进度" width="140">
           <template #default="{ row }">
             <el-progress :percentage="calcProgress(row)" :stroke-width="10" />
           </template>
         </el-table-column>
-        <el-table-column prop="comments_sent" label="已发送" width="90" />
-        <el-table-column prop="comments_verified" label="已验证" width="90" />
-        <el-table-column prop="created_at" label="创建时间" width="180">
+        <el-table-column prop="comments_sent" label="已发送" width="75" />
+        <el-table-column prop="comments_verified" label="已验证" width="75" />
+        <el-table-column label="执行时长" width="100">
+          <template #default="{ row }">{{ formatTaskDuration(row, now) }}</template>
+        </el-table-column>
+        <el-table-column prop="created_at" label="创建时间" width="160">
           <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
         </el-table-column>
         <el-table-column label="操作" width="180" fixed="right">
@@ -137,7 +140,7 @@
 </template>
 
 <script setup>
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { Connection, Plus, Setting } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -149,6 +152,7 @@ import {
   getHongguoSettings,
   updateHongguoSettings,
 } from '../api/hongguo'
+import { formatTaskDuration } from '../utils/taskDuration'
 
 const router = useRouter()
 const tasks = ref([])
@@ -159,6 +163,8 @@ const loadingDevices = ref(false)
 const selectedDeviceAddr = ref('')
 const deviceOptions = ref([])
 const configuredDeviceOnline = ref(true)
+const now = ref(Date.now())
+const durationTimer = ref(null)
 
 const loginStatusTitle = computed(() => {
   if (!loginStatus.value) return ''
@@ -346,6 +352,13 @@ function formatTime(value) {
 onMounted(() => {
   loadTasks()
   loadDeviceSettings()
+  durationTimer.value = setInterval(() => {
+    now.value = Date.now()
+  }, 1000)
+})
+
+onUnmounted(() => {
+  if (durationTimer.value) clearInterval(durationTimer.value)
 })
 </script>
 
