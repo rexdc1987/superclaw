@@ -1332,6 +1332,64 @@ class TestHongguoPlaybackHeuristics:
         ops = HongguoOperations(DummyDevice())
         assert ops._extract_detail_title("一品布衣2") == "一品布衣2：烽火篇"
 
+    def test_renamed_drama_alias_from_search_results_matches_old_playback_title(self):
+        ops = HongguoOperations(object())
+        titles = ["胭脂如梦如雨如尘", "原名：胭脂念念不忘", "胭脂如梦如雨如尘2谍谍不休"]
+
+        ops._search_title_aliases.update(ops._title_aliases_from_search_titles(titles))
+
+        assert ops._title_matches("胭脂如梦如雨如尘", "胭脂念念不忘") is True
+        assert ops._strict_title_matches("胭脂如梦如雨如尘", "胭脂念念不忘") is True
+        assert ops._strict_title_matches("胭脂如梦如雨如尘", "胭脂如梦如雨如尘2谍谍不休") is False
+
+    def test_known_renamed_drama_alias_is_available_before_search(self):
+        ops = HongguoOperations(object())
+
+        assert ops._strict_title_matches("胭脂如梦如雨如尘", "胭脂念念不忘") is True
+
+    def test_extract_detail_title_prefers_current_collection_over_next_season(self):
+        ops = HongguoOperations(object())
+        xml = (
+            '<node package="com.phoenix.read" resource-id="com.phoenix.read:id/d4" '
+            'text="胭脂念念不忘" bounds="[32,926][224,974]" />'
+            '<node package="com.phoenix.read" resource-id="com.phoenix.read:id/h1_" '
+            'text="即将播放下一季《胭脂如梦如雨如尘2谍谍不休》" bounds="[80,1104][620,1144]" />'
+            '<node package="com.phoenix.read" resource-id="com.phoenix.read:id/jxa" '
+            'text="第40集" bounds="[88,48][456,136]" />'
+        )
+
+        assert ops._extract_detail_title("胭脂如梦如雨如尘", xml) == "胭脂念念不忘"
+
+    def test_search_title_extraction_records_renamed_drama_alias(self):
+        ops = HongguoOperations(object())
+        xml = (
+            '<node package="com.phoenix.read" resource-id="com.phoenix.read:id/title" '
+            'text="胭脂如梦如雨如尘" bounds="[20,300][600,360]" />'
+            '<node package="com.phoenix.read" resource-id="com.phoenix.read:id/title" '
+            'text="原名：胭脂念念不忘" bounds="[20,370][600,430]" />'
+        )
+
+        assert ops._extract_drama_titles_from_xml(xml) == ["胭脂如梦如雨如尘", "原名：胭脂念念不忘"]
+        assert ops._strict_title_matches("胭脂如梦如雨如尘", "胭脂念念不忘") is True
+
+    def test_search_title_alias_survives_transient_result_snapshot(self):
+        ops = HongguoOperations(object())
+        first = (
+            '<node package="com.phoenix.read" resource-id="com.phoenix.read:id/title" '
+            'text="胭脂如梦如雨如尘" bounds="[20,300][600,360]" />'
+            '<node package="com.phoenix.read" resource-id="com.phoenix.read:id/title" '
+            'text="原名：胭脂念念不忘" bounds="[20,370][600,430]" />'
+        )
+        second = (
+            '<node package="com.phoenix.read" resource-id="com.phoenix.read:id/title" '
+            'text="胭脂如梦如雨如尘" bounds="[20,300][600,360]" />'
+        )
+
+        ops._extract_drama_titles_from_xml(first)
+        ops._extract_drama_titles_from_xml(second)
+
+        assert ops._strict_title_matches("胭脂如梦如雨如尘", "胭脂念念不忘") is True
+
     def test_extract_detail_title_accepts_two_character_playback_title(self):
         class DummyDevice:
             def dump_hierarchy(self):
@@ -4365,6 +4423,33 @@ class TestHongguoEngineWaits:
         }
         with patch.object(engine, "_log"):
             engine._assert_target_playback(DummyOps(), {"drama_name": "云渺"}, state, 77)
+
+    def test_assert_target_playback_accepts_search_alias_on_playback_page(self):
+        engine = TaskEngine(task_id=257, db_config={}, screenshot_dir="C:/tmp")
+        ops = MagicMock()
+        ops._search_title_aliases = {"胭脂念念不忘": "胭脂如梦如雨如尘"}
+        ops._playback_visible.return_value = True
+        state = {
+            "app": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+            },
+            "app_foreground": True,
+            "launcher_visible": False,
+            "playback_visible": True,
+            "current_episode": 40,
+            "total_episodes": 40,
+            "collection_title": "胭脂念念不忘",
+            "playing_title": "胭脂念念不忘",
+            "detail_title": "",
+        }
+
+        engine._assert_target_playback(
+            ops,
+            {"drama_name": "胭脂如梦如雨如尘"},
+            state,
+            40,
+        )
 
     def test_assert_target_playback_allows_unreadable_first_episode_after_surface_confirmation(self):
         engine = TaskEngine(task_id=176, db_config={}, screenshot_dir="C:/tmp")

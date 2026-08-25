@@ -74,11 +74,21 @@ TAG_KEYWORDS = {
     "热榜",
 }
 
+# Hongguo can publish a renamed drama under the new search title while the
+# playback surface keeps rendering the original title. These mappings are
+# explicit product identity mappings, not fuzzy title matching.
+KNOWN_TITLE_ALIASES = {
+    "胭脂念念不忘": "胭脂如梦如雨如尘",
+}
+
 
 class HongguoOperations:
     def __init__(self, device: Any):
         self.d = device
         self._ad_swipe_pending = False
+        # Search results may expose a renamed drama as "原名：旧标题" while
+        # the playback page still renders the old title.
+        self._search_title_aliases: Dict[str, str] = dict(KNOWN_TITLE_ALIASES)
         try:
             self.width, self.height = get_screen_size(self.d)
         except Exception:
@@ -383,6 +393,9 @@ class HongguoOperations:
 
     def submit_search(self, keyword: str) -> Dict[str, Any]:
         try:
+            # A device may be reused for another drama. Do not let an alias
+            # from the previous search authorize a later playback page.
+            self._search_title_aliases = dict(KNOWN_TITLE_ALIASES)
             submit = self._submit_search(keyword)
             if not submit.get("success"):
                 return {
@@ -3090,7 +3103,33 @@ class HongguoOperations:
             if self._is_title_candidate(text) and text not in seen:
                 titles.append(text)
                 seen.add(text)
+        aliases = self._title_aliases_from_search_titles(titles)
+        if aliases:
+            # Result-page extraction can run more than once while the UI is
+            # settling. Preserve a discovered alias if a later hierarchy
+            # snapshot temporarily omits the "原名" row.
+            self._search_title_aliases.update(aliases)
         return titles
+
+    def _title_aliases_from_search_titles(self, titles: List[str]) -> Dict[str, str]:
+        aliases: Dict[str, str] = {}
+        for index, value in enumerate(titles):
+            match = re.match(r"原名\s*[:：]\s*(.+)$", str(value or "").strip())
+            if not match:
+                continue
+            alias_key = self._normalize_title_key(match.group(1))
+            if not alias_key:
+                continue
+            canonical = ""
+            for candidate in reversed(titles[:index]):
+                candidate = str(candidate or "").strip()
+                if candidate and not re.match(r"原名\s*[:：]", candidate):
+                    canonical = candidate
+                    break
+            canonical_key = self._normalize_title_key(canonical)
+            if canonical_key:
+                aliases[alias_key] = canonical_key
+        return aliases
 
     def _hongguo_nodes(self, xml: str) -> List[str]:
         return [node for node in re.findall(r"<node\b[^>]+>", xml or "") if f'package="{APP_PACKAGE}"' in node]
@@ -3354,6 +3393,21 @@ class HongguoOperations:
         current_title = self._current_playing_title(xml)
         if current_title and (not expected or self._title_matches(expected, current_title)):
             return current_title
+        # On the playback surface the current collection title is exposed as
+        # id/d4, while the same hierarchy may also contain a next-season
+        # recommendation. Prefer the current title node before parsing
+        # recommendation text such as "即将播放下一季《...2...》".
+        for node in self._visible_hongguo_nodes(xml):
+            if 'resource-id="com.phoenix.read:id/d4"' not in node:
+                continue
+            text_match = re.search(r'text="([^"]+)"', node)
+            if not text_match:
+                continue
+            candidate = html.unescape(text_match.group(1)).strip()
+            if self._is_title_candidate(candidate) and (
+                not expected or self._title_matches(expected, candidate)
+            ):
+                return candidate
         candidates: List[str] = []
         seen = set()
         node_text = " ".join(
@@ -3363,6 +3417,8 @@ class HongguoOperations:
         )
         for candidate in re.findall(r"\u300a([^\u300b]{2,25})\u300b", node_text):
             candidate = html.unescape(candidate).strip()
+            if "即将播放下一季" in node_text:
+                continue
             if self._is_title_candidate(candidate) and candidate not in seen:
                 candidates.append(candidate)
                 seen.add(candidate)
@@ -3372,6 +3428,8 @@ class HongguoOperations:
         ]:
             for candidate in re.findall(pattern, node_text):
                 candidate = html.unescape(candidate).strip()
+                if "即将播放下一季" in candidate:
+                    continue
                 if self._is_title_candidate(candidate) and candidate not in seen:
                     candidates.append(candidate)
                     seen.add(candidate)
@@ -3468,6 +3526,8 @@ class HongguoOperations:
         title_key = self._normalize_title_key(title)
         if not keyword_key or not title_key:
             return False
+        if self._search_title_aliases.get(title_key) == keyword_key:
+            return True
         if keyword_key == title_key:
             return True
         if title_key.startswith(keyword_key):
@@ -3490,6 +3550,8 @@ class HongguoOperations:
         title_key = self._normalize_title_key(title)
         if not keyword_key or not title_key:
             return False
+        if self._search_title_aliases.get(title_key) == keyword_key:
+            return True
         if self._season_marker(keyword_key):
             return self._title_matches(keyword, title)
         if self._has_variant_marker(keyword_key):

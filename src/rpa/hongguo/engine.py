@@ -2557,25 +2557,26 @@ class TaskEngine:
         if self._total_mismatch_is_fatal(ops, task, state, expected_total, total, current=current):
             raise RuntimeError(f"检测到短剧总集数不匹配: 期望 {expected_total}，实际 {total}")
         keyword = str(task.get("drama_name") or "").strip()
+        title_aliases = getattr(ops, "_search_title_aliases", {}) or {}
         collection_title = str(state.get("collection_title") or "").strip()
-        if keyword and collection_title and not self._strict_title_matches(keyword, collection_title):
+        if keyword and collection_title and not self._strict_title_matches(keyword, collection_title, title_aliases):
             raise RuntimeError(f"检测到非目标合集: 期望 {keyword}，实际 {collection_title}")
         playing_title = str(state.get("playing_title") or "").strip()
         detail_title = str(state.get("detail_title") or "").strip()
-        if keyword and playing_title and not self._strict_title_matches(keyword, playing_title):
+        if keyword and playing_title and not self._strict_title_matches(keyword, playing_title, title_aliases):
             raise RuntimeError(f"检测到短剧标题不匹配: 期望 {keyword}，实际 {playing_title}")
         title_signals = [playing_title]
         if not state.get("playback_visible"):
             title_signals.append(detail_title)
-        reliable_titles = [title for title in title_signals if self._reliable_title_signal(keyword, title)]
-        if keyword and reliable_titles and not any(self._strict_title_matches(keyword, title) for title in reliable_titles):
+        reliable_titles = [title for title in title_signals if self._reliable_title_signal(keyword, title, title_aliases)]
+        if keyword and reliable_titles and not any(self._strict_title_matches(keyword, title, title_aliases) for title in reliable_titles):
             raise RuntimeError(f"检测到短剧标题不匹配: 期望 {keyword}，实际 {reliable_titles[0]}")
         if (
             keyword
             and state.get("playback_visible")
             and detail_title
-            and self._reliable_title_signal(keyword, detail_title)
-            and not self._strict_title_matches(keyword, detail_title)
+            and self._reliable_title_signal(keyword, detail_title, title_aliases)
+            and not self._strict_title_matches(keyword, detail_title, title_aliases)
         ):
             self._log("warn", f"全流程v3: 忽略播放页相关推荐标题 {detail_title}")
         if not current and bool(state.get("playback_visible") or ops._playback_visible()):
@@ -3348,11 +3349,13 @@ class TaskEngine:
             return bool(before.strip() or after.strip())
         return False
 
-    def _title_matches(self, keyword: str, title: str) -> bool:
+    def _title_matches(self, keyword: str, title: str, aliases: Optional[Dict[str, str]] = None) -> bool:
         keyword_key = self._normalize_title_key(keyword)
         title_key = self._normalize_title_key(title)
         if not keyword_key or not title_key:
             return False
+        if aliases and aliases.get(title_key) == keyword_key:
+            return True
         if keyword_key in title_key:
             return True
         season = self._season_marker(keyword_key)
@@ -3362,13 +3365,15 @@ class TaskEngine:
             return self._season_stem_matches(keyword_key, title_key)
         return title_key in keyword_key and len(title_key) >= 4
 
-    def _strict_title_matches(self, keyword: str, title: str) -> bool:
+    def _strict_title_matches(self, keyword: str, title: str, aliases: Optional[Dict[str, str]] = None) -> bool:
         keyword_key = self._normalize_title_key(keyword)
         title_key = self._normalize_title_key(title)
         if not keyword_key or not title_key:
             return False
+        if aliases and aliases.get(title_key) == keyword_key:
+            return True
         if self._season_marker(keyword_key):
-            return self._title_matches(keyword, title)
+            return self._title_matches(keyword, title, aliases)
         if self._has_variant_marker(keyword_key):
             if title_key == keyword_key:
                 return True
@@ -3386,14 +3391,16 @@ class TaskEngine:
                 return suffix[:1] == "1" and not suffix[1:2].isdigit()
         if self._has_variant_marker(title_key):
             return False
-        return self._title_matches(keyword, title)
+        return self._title_matches(keyword, title, aliases)
 
-    def _reliable_title_signal(self, keyword: str, title: str) -> bool:
+    def _reliable_title_signal(
+        self, keyword: str, title: str, aliases: Optional[Dict[str, str]] = None
+    ) -> bool:
         keyword_key = self._normalize_title_key(keyword)
         title_key = self._normalize_title_key(title)
         if not keyword_key or not title_key:
             return False
-        if self._strict_title_matches(keyword, title):
+        if self._strict_title_matches(keyword, title, aliases):
             return True
         if self._season_marker(title_key):
             return True
