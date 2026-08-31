@@ -756,7 +756,24 @@ class TaskEngine:
         opened = ops.open_search_page(keyword)
         self._log("info", opened.get("message") or "全流程v3: 已进入搜索框")
         if not opened.get("success"):
-            raise RuntimeError(opened.get("message") or "进入搜索框失败")
+            message = opened.get("message") or "进入搜索框失败"
+            diagnostics = opened.get("diagnostics") or {}
+            if diagnostics:
+                self._log(
+                    "warn",
+                    "全流程v3: 搜索入口诊断 "
+                    f"package={diagnostics.get('package') or '-'}，"
+                    f"activity={diagnostics.get('activity') or '-'}，"
+                    f"hierarchy_empty={bool(diagnostics.get('hierarchy_empty'))}",
+                )
+            try:
+                shot = ops.take_screenshot("search_entry_failed", self.screenshot_dir)
+            except Exception as exc:
+                self._log("warn", f"全流程v3: 搜索入口失败，诊断截图失败 - {exc}")
+            else:
+                self._log("error", f"全流程v3: 搜索入口失败，已截图 {shot}")
+                message = f"{message}，已截图 {shot}"
+            raise RuntimeError(message)
 
         input_result = ops.input_search_keyword(keyword)
         self._log("info", input_result.get("message") or f"全流程v3: 已填入搜索词 {keyword}")

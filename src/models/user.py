@@ -10,6 +10,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(64), unique=True, nullable=False, index=True)
     password_hash = Column(String(128), nullable=False)
+    auth_version = Column(Integer, nullable=False, default=1)
     nickname = Column(String(64), default="")
     phone = Column(String(20), default="")
     position = Column(String(64), default="")

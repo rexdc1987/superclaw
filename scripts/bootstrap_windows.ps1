@@ -10,6 +10,8 @@ param(
     [string]$MuMuRoot = '',
     [int]$ApiPort = 8987,
     [int]$FrontendPort = 3000,
+    [string]$AdminUsername = 'admin',
+    [string]$AdminPassword = '',
     [switch]$SkipPlaywright,
     [switch]$SkipTests,
     [switch]$Start
@@ -202,7 +204,8 @@ $env:SUPERCLAW_SETUP_DB_PASSWORD = $DatabasePassword
     --db-port $DatabasePort `
     --db-name $DatabaseName `
     --db-user $DatabaseUser `
-    --mumu-root $MuMuRoot
+    --mumu-root $MuMuRoot `
+    --enable-auth
 
 $env:SUPERCLAW_DB_HOST = $DatabaseHost
 $env:SUPERCLAW_DB_PORT = [string]$DatabasePort
@@ -213,6 +216,25 @@ if ($MuMuRoot) { $env:SUPERCLAW_MUMU_ROOT = $MuMuRoot }
 
 & $VenvPython scripts/init_hongguo_mysql.py
 if ($LASTEXITCODE -ne 0) { throw 'Database schema initialization failed.' }
+
+$userCount = [int]((& $VenvPython -c "import sys; sys.path.insert(0, 'src'); from models.database import init_db, get_session; from models.user import User; init_db(); s=get_session(); print(s.query(User).count()); s.close()").Trim())
+$generatedAdminPassword = ''
+if ($userCount -eq 0) {
+    if (-not $AdminPassword) {
+        $AdminPassword = New-RandomPassword
+        $generatedAdminPassword = $AdminPassword
+    }
+    $env:SUPERCLAW_ADMIN_USERNAME = $AdminUsername
+    $env:SUPERCLAW_ADMIN_PASSWORD = $AdminPassword
+    try {
+        & $VenvPython scripts/create_admin.py
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to create the initial administrator.' }
+    }
+    finally {
+        Remove-Item Env:SUPERCLAW_ADMIN_USERNAME -ErrorAction SilentlyContinue
+        Remove-Item Env:SUPERCLAW_ADMIN_PASSWORD -ErrorAction SilentlyContinue
+    }
+}
 
 if (-not $SkipTests) {
     & $VenvPython -m pytest tests/test_hongguo_templates.py tests/test_server_security.py -q
@@ -225,6 +247,13 @@ Write-Host "Project:  $ProjectRoot"
 Write-Host "Database: ${DatabaseHost}:$DatabasePort/$DatabaseName"
 Write-Host ("MuMu:    " + $(if ($MuMuRoot) { $MuMuRoot } else { 'not detected; install MuMu before device tests' }))
 Write-Host 'Secrets are stored only in ignored config/local.yaml.'
+if ($generatedAdminPassword) {
+    Write-Host ''
+    Write-Host 'Initial administrator (shown once):' -ForegroundColor Yellow
+    Write-Host "  Username: $AdminUsername"
+    Write-Host "  Password: $generatedAdminPassword"
+    Write-Host 'Sign in and change this password immediately.' -ForegroundColor Yellow
+}
 
 if ($Start) {
     & (Join-Path $PSScriptRoot 'start_windows_dev.ps1') -ApiPort $ApiPort -FrontendPort $FrontendPort

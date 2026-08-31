@@ -27,6 +27,11 @@ function handleResponseError(error) {
     const msg = error.response?.data?.detail || error.message || '请求失败'
     ElMessage.error(msg)
   }
+  if (error.response?.status === 401) {
+    localStorage.removeItem('token')
+    localStorage.removeItem('userInfo')
+    window.location.href = '/login'
+  }
   return Promise.reject(error)
 }
 

@@ -2822,6 +2822,8 @@ async def list_logs(
 
 @router.get("/tasks/{task_id}/screenshot")
 async def latest_screenshot(task_id: int):
+    with _connection() as conn:
+        _fetch_one_or_404(conn, task_id)
     latest = _latest_screenshot_file(task_id)
     if latest:
         return {"task_id": task_id, "screenshot_path": latest}
@@ -2858,6 +2860,8 @@ async def latest_screenshot_file(task_id: int):
 
 @router.get("/tasks/{task_id}/screenshot/image")
 async def screenshot_image(task_id: int):
+    with _connection() as conn:
+        _fetch_one_or_404(conn, task_id)
     latest = _latest_screenshot_file(task_id)
     if not latest or not Path(latest).exists():
         raise HTTPException(status_code=404, detail="No screenshot available")

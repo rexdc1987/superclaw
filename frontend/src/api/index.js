@@ -18,7 +18,8 @@ api.interceptors.response.use((response) => response.data, (error) => {
   ElMessage.error(msg)
   if (error.response?.status === 401) {
     localStorage.removeItem('token')
-    window.location.href = '/login'
+    localStorage.removeItem('userInfo')
+    if (!String(error.config?.url || '').includes('/auth/login')) window.location.href = '/login'
   }
   return Promise.reject(error)
 })
@@ -29,6 +30,7 @@ export default api
 export const getAuthStatus = () => api.get('/auth/status')
 export const login = (data) => api.post('/auth/login', data)
 export const getCurrentUser = () => api.get('/auth/me')
+export const changePassword = (data) => api.post('/auth/change-password', data)
 
 // Accounts
 export const getAccounts = (params) => api.get('/accounts/', { params })

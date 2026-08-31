@@ -43,6 +43,8 @@ winget install -e --id Docker.DockerDesktop
 
 ## 3. Agent 一键执行块
 
+公司员工电脑连接共享 MySQL 时，优先使用 `docs/WORKBUDDY_ONE_CLICK_INSTALL.md` 和 `scripts/install_company_pc.ps1`。下面的 `DatabaseMode Auto` 仅用于创建完全独立的开发环境。
+
 让目标电脑 Agent 执行下面整段：
 
 ```powershell
@@ -74,6 +76,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 6. 执行当前数据库迁移并初始化带名称的默认模板。
 7. 运行快速回归测试。
 8. 后台启动 API 和 Vue 开发服务器。
+
+首次安装还会启用公司账号认证并创建首个 `admin` 管理员。自动生成的初始密码只显示一次，登录后应立即修改。公司多电脑部署见 `docs/COMPANY_ACCOUNT_DEPLOYMENT.md`。
 
 数据库随机密码只写入本机 `config/local.yaml`、`config/dev-mysql.env` 和 Docker 容器环境，不进入 Git。保留这两个本机文件即可安全地重复执行安装脚本或重建容器。
 

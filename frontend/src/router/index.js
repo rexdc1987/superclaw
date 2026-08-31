@@ -9,7 +9,7 @@ const routes = [
   },
   {
     path: '/',
-    redirect: '/dashboard'
+    redirect: '/hongguo/multi'
   },
   {
     path: '/dashboard',
@@ -69,7 +69,7 @@ const routes = [
     path: '/users',
     name: 'Users',
     component: () => import('@/views/Users.vue'),
-    meta: { title: '用户管理', icon: 'UserFilled', requiresAdmin: true }
+    meta: { title: '账号管理', icon: 'UserFilled', requiresAdmin: true }
   },
   {
     path: '/douyin-comment',
@@ -127,7 +127,7 @@ router.beforeEach((to, from, next) => {
     next('/login')
   } else if (to.meta.requiresAdmin) {
     const userInfo = JSON.parse(localStorage.getItem('userInfo') || '{}')
-    next(userInfo.role === 'admin' ? undefined : '/dashboard')
+    next(userInfo.role === 'admin' ? undefined : '/hongguo/multi')
   } else {
     next()
   }

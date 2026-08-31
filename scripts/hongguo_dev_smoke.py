@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import urllib.error
 import urllib.request
@@ -26,11 +27,25 @@ def port_open(port: int, timeout: float = 1.5) -> bool:
         return False
 
 
-def get_json(url: str, timeout: float = 10.0) -> Tuple[bool, str, Dict[str, Any]]:
+def request_json(
+    url: str,
+    timeout: float = 10.0,
+    headers: Dict[str, str] | None = None,
+    payload: Dict[str, Any] | None = None,
+) -> Tuple[bool, str, Any]:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            return 200 <= response.status < 300, str(response.status), payload
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json", **(headers or {})},
+            method="POST" if payload is not None else "GET",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            value = json.loads(response.read().decode("utf-8"))
+            return 200 <= response.status < 300, str(response.status), value
+    except urllib.error.HTTPError as exc:
+        return False, str(exc.code), {}
     except (OSError, ValueError, urllib.error.URLError) as exc:
         return False, str(exc), {}
 
@@ -44,7 +59,7 @@ def main() -> int:
         {"name": f"api:{args.api_port}", "ok": port_open(args.api_port)},
     ]
 
-    health_ok, health_detail, health = get_json(f"{api}/health")
+    health_ok, health_detail, health = request_json(f"{api}/health")
     checks.append(
         {
             "name": f"api /health ({health_detail})",
@@ -57,11 +72,36 @@ def main() -> int:
             "detail": health,
         }
     )
-    templates_ok, templates_detail, templates = get_json(f"{api}/api/v1/hongguo/templates")
+    auth_headers: Dict[str, str] = {}
+    auth_ready = True
+    if health.get("auth_required"):
+        username = os.environ.get("SUPERCLAW_SMOKE_USERNAME", "").strip()
+        password = os.environ.get("SUPERCLAW_SMOKE_PASSWORD", "")
+        if username and password:
+            login_ok, login_detail, login_result = request_json(
+                f"{api}/api/v1/auth/login",
+                payload={"username": username, "password": password},
+            )
+            auth_ready = login_ok and bool(login_result.get("access_token"))
+            checks.append({"name": f"authenticated login ({login_detail})", "ok": auth_ready})
+            if auth_ready:
+                auth_headers = {"Authorization": f"Bearer {login_result['access_token']}"}
+
+    templates_ok, templates_detail, templates = request_json(
+        f"{api}/api/v1/hongguo/templates",
+        headers=auth_headers,
+    )
+    protected_without_credentials = (
+        bool(health.get("auth_required"))
+        and not auth_headers
+        and templates_detail == "401"
+    )
     checks.append(
         {
             "name": f"templates API ({templates_detail})",
-            "ok": templates_ok and isinstance(templates, list),
+            "ok": protected_without_credentials or (
+                auth_ready and templates_ok and isinstance(templates, list)
+            ),
         }
     )
     try:
@@ -74,8 +114,8 @@ def main() -> int:
     checks.append({"name": f"frontend / ({frontend_detail})", "ok": frontend_ok})
 
     if args.require_devices:
-        devices_ok, devices_detail, devices = get_json(
-            f"{api}/api/v1/hongguo/multi/devices", timeout=300
+        devices_ok, devices_detail, devices = request_json(
+            f"{api}/api/v1/hongguo/multi/devices", timeout=300, headers=auth_headers
         )
         checks.append(
             {

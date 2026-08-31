@@ -2,7 +2,8 @@
 import os
 import sys
 import yaml
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 Base = declarative_base()
@@ -40,17 +41,33 @@ def _build_url(cfg):
         name = os.environ.get("SUPERCLAW_DB_NAME") or db.get("name", "superclaw")
         user = os.environ.get("SUPERCLAW_DB_USER") or db.get("user", "superclaw")
         pwd = os.environ.get("SUPERCLAW_DB_PASSWORD") or db.get("password", "")
-        return f"mysql+pymysql://{user}:{pwd}@{host}:{port}/{name}?charset=utf8mb4"
+        return URL.create(
+            "mysql+pymysql",
+            username=user,
+            password=pwd,
+            host=host,
+            port=port,
+            database=name,
+            query={"charset": "utf8mb4"},
+        )
     db_path = os.path.join(_get_base_dir(), "data", "superclaw.db")
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     return "sqlite:///{}".format(db_path)
 
 cfg = _load_config()
 engine = create_engine(_build_url(cfg), echo=False, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 def init_db():
     Base.metadata.create_all(engine)
+    inspector = inspect(engine)
+    if "users" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("users")}
+        if "auth_version" not in columns:
+            with engine.begin() as connection:
+                connection.execute(
+                    text("ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 1")
+                )
 
 def get_session():
     return SessionLocal()

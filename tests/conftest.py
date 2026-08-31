@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 import models.database as db_module
 from models.database import Base
@@ -12,6 +13,7 @@ from models.database import Base
 # Import all models to register with Base
 import models.account, models.task, models.comment, models.lead
 import models.action, models.risk, models.audit, models.keyword, models.template, models.playbook, models.strategy
+import models.user
 
 # Import all service modules so we can patch their get_session references
 import services.account_service as acct_mod
@@ -24,12 +26,19 @@ import services.playbook_service as pb_mod
 import services.filter_service as filter_mod
 import services.stealth_service as stealth_mod
 import services.strategy_service as strategy_mod
+import services.user_service as user_mod
 
 
 @pytest.fixture(autouse=True)
 def in_memory_db(monkeypatch):
     """Patch get_session to use in-memory SQLite for ALL modules"""
-    engine = create_engine("sqlite:///:memory:", echo=False)
+    monkeypatch.setenv("SUPERCLAW_AUTH_REQUIRED", "false")
+    engine = create_engine(
+        "sqlite:///:memory:",
+        echo=False,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(engine)
     TestSession = sessionmaker(bind=engine)
 
@@ -48,6 +57,7 @@ def in_memory_db(monkeypatch):
     monkeypatch.setattr(filter_mod, "get_session", new_get_session)
     monkeypatch.setattr(stealth_mod, "get_session", new_get_session)
     monkeypatch.setattr(strategy_mod, "get_session", new_get_session)
+    monkeypatch.setattr(user_mod, "get_session", new_get_session)
 
     yield engine
     Base.metadata.drop_all(engine)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
 from pathlib import Path
 from typing import Any, Dict
 
@@ -22,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-user", required=True)
     parser.add_argument("--db-password", default="")
     parser.add_argument("--mumu-root", default="")
+    parser.add_argument("--enable-auth", action="store_true")
     return parser.parse_args()
 
 
@@ -51,6 +53,14 @@ def main() -> int:
     }
     if args.mumu_root:
         config.setdefault("hongguo", {})["mumu_root"] = args.mumu_root
+    if args.enable_auth:
+        security = config.setdefault("security", {})
+        security["auth_required"] = True
+        security["auth_secret"] = (
+            os.environ.get("SUPERCLAW_SETUP_AUTH_SECRET", "").strip()
+            or str(security.get("auth_secret") or "").strip()
+            or secrets.token_urlsafe(48)
+        )
 
     LOCAL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     with LOCAL_CONFIG.open("w", encoding="utf-8", newline="\n") as stream:

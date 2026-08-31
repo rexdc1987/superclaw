@@ -32,6 +32,7 @@ from rpa.dashboard.routes_hongguo import (
 )
 from models.database import init_db
 from models.task import Task
+from services.user_service import UserService
 
 
 @asynccontextmanager
@@ -70,16 +71,26 @@ app.add_middleware(
 class AuthenticationMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        public = path in {"/", "/health", "/docs", "/openapi.json"} or path.startswith("/api/v1/auth/")
+        public = path in {
+            "/",
+            "/health",
+            "/docs",
+            "/openapi.json",
+            "/api/v1/auth/login",
+            "/api/v1/auth/status",
+        }
         principal = None
         auth_error = None
         try:
             principal = principal_from_authorization(request.headers.get("Authorization", ""))
+            if principal is not None and auth_required():
+                principal = UserService().validate_principal(principal)
         except Exception as exc:
             auth_error = exc
+            principal = None
         if principal is None:
             if auth_required() and path.startswith("/api/v1/") and not public:
-                detail = getattr(auth_error, "detail", "Authentication required")
+                detail = getattr(auth_error, "detail", None) or str(auth_error or "Authentication required")
                 return JSONResponse(status_code=401, content={"detail": detail})
             principal = LOCAL_PRINCIPAL
         token = set_current_principal(principal)

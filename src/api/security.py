@@ -14,12 +14,15 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
+from models.database import cfg
+
 
 @dataclass(frozen=True)
 class Principal:
     user_id: int
     username: str
     role: str
+    auth_version: int = 1
 
     @property
     def is_admin(self) -> bool:
@@ -34,7 +37,10 @@ _principal_context: ContextVar[Principal] = ContextVar(
 
 
 def auth_required() -> bool:
-    return os.environ.get("SUPERCLAW_AUTH_REQUIRED", "false").strip().lower() in {
+    configured = os.environ.get("SUPERCLAW_AUTH_REQUIRED")
+    if configured is None:
+        configured = str((cfg.get("security") or {}).get("auth_required", False))
+    return configured.strip().lower() in {
         "1",
         "true",
         "yes",
@@ -66,7 +72,10 @@ def require_admin() -> Principal:
 
 
 def _secret() -> bytes:
-    value = os.environ.get("SUPERCLAW_AUTH_SECRET", "").strip()
+    value = (
+        os.environ.get("SUPERCLAW_AUTH_SECRET", "").strip()
+        or str((cfg.get("security") or {}).get("auth_secret") or "").strip()
+    )
     if not value:
         value = "local-development-only-secret"
     return value.encode("utf-8")
@@ -75,7 +84,10 @@ def _secret() -> bytes:
 def validate_security_config() -> None:
     if not auth_required():
         return
-    configured = os.environ.get("SUPERCLAW_AUTH_SECRET", "").strip()
+    configured = (
+        os.environ.get("SUPERCLAW_AUTH_SECRET", "").strip()
+        or str((cfg.get("security") or {}).get("auth_secret") or "").strip()
+    )
     if len(configured) < 32:
         raise RuntimeError(
             "SUPERCLAW_AUTH_SECRET must contain at least 32 characters when authentication is required"
@@ -94,6 +106,7 @@ def issue_access_token(
     user_id: int,
     username: str,
     role: str,
+    auth_version: int = 1,
     expires_in: Optional[int] = None,
 ) -> str:
     lifetime = expires_in or int(os.environ.get("SUPERCLAW_AUTH_TOKEN_TTL", "43200"))
@@ -102,6 +115,7 @@ def issue_access_token(
         "uid": int(user_id),
         "sub": str(username),
         "role": str(role or "user"),
+        "ver": max(1, int(auth_version or 1)),
         "iat": now,
         "exp": now + max(300, lifetime),
     }
@@ -123,7 +137,12 @@ def decode_access_token(token: str) -> Principal:
         username = str(payload.get("sub") or "").strip()
         if user_id <= 0 or not username:
             raise ValueError("invalid subject")
-        return Principal(user_id=user_id, username=username, role=str(payload.get("role") or "user"))
+        return Principal(
+            user_id=user_id,
+            username=username,
+            role=str(payload.get("role") or "user"),
+            auth_version=max(1, int(payload.get("ver") or 1)),
+        )
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired access token") from exc
 

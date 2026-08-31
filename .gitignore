@@ -30,6 +30,7 @@ logs/
 # Database
 *.db
 *.sqlite3
+data/exports/*.sql
 
 # Environment
 .env
@@ -43,11 +44,17 @@ Thumbs.db
 
 # Screenshots (binary, not for git)
 screenshots/
+backups/
+tmp/
+tmp_*
+adb_*.out
+adb_*.err
 
 # Health reports / temp files
 health_report.json
 test_warnings.txt
 .run/
+config/hongguo_ai_usage.json
 
 # Grafana dashboards
 grafana/

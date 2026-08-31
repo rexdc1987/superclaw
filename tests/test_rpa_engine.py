@@ -3241,6 +3241,34 @@ class TestHongguoLoginDetails:
             "全流程v3: 搜索提交失败，已截图 C:/tmp/search_submit_failed.png",
         )
 
+    def test_prepare_playback_captures_search_entry_failure(self):
+        engine = TaskEngine(task_id=276, db_config={}, screenshot_dir="C:/tmp")
+        engine._log = MagicMock()
+        engine._check_pause_stop = MagicMock()
+        engine._check_login = MagicMock(return_value={"logged_in": True})
+        engine._reset_search_context = MagicMock(return_value=True)
+        ops = MagicMock()
+        ops.launch_app.return_value = True
+        ops.open_search_page.return_value = {
+            "success": False,
+            "message": "未找到搜索入口",
+            "diagnostics": {
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.pages.main.MainFragmentActivity",
+                "hierarchy_empty": True,
+            },
+        }
+        ops.take_screenshot.return_value = "C:/tmp/search_entry_failed.png"
+
+        with pytest.raises(RuntimeError, match="search_entry_failed.png"):
+            engine._prepare_verified_playback(ops, {"drama_name": "测试短剧"})
+
+        ops.take_screenshot.assert_called_once_with("search_entry_failed", "C:/tmp")
+        engine._log.assert_any_call(
+            "error",
+            "全流程v3: 搜索入口失败，已截图 C:/tmp/search_entry_failed.png",
+        )
+
     def test_hongguo_id_does_not_parse_resource_id_attribute(self):
         ops = HongguoOperations(object())
         xml = '<node resource-id="com.phoenix.read:id/e_container" text="用户名86662668" />'
@@ -4249,6 +4277,32 @@ def test_open_search_page_returns_to_main_when_playback_is_visually_detected():
                                             result = ops.open_search_page("云渺2")
     assert result["success"] is True
     open_main.assert_called_once()
+
+
+def test_open_search_page_cold_retries_after_search_entry_is_temporarily_unavailable():
+    ops = HongguoOperations(object())
+    ops.d = MagicMock()
+    with patch.object(ops, "_close_popups"):
+        with patch.object(ops, "_wait_app_foreground", return_value=True):
+            with patch.object(ops, "_short_series_activity_active", return_value=False):
+                with patch.object(ops, "_playback_visible", return_value=False):
+                    with patch.object(ops, "_current_playing_title", return_value=""):
+                        with patch.object(ops, "_open_theater"):
+                            with patch.object(ops, "_tap_bottom_tab"):
+                                with patch.object(ops, "_open_search", side_effect=[False, False, False, True]):
+                                    with patch.object(ops, "_hierarchy_empty", return_value=True):
+                                        with patch.object(ops, "_xml", return_value=""):
+                                            with patch.object(ops, "_restart_uiautomator_server", return_value=True) as restart_uia:
+                                                with patch.object(ops, "_stop_app") as stop_app:
+                                                    with patch.object(ops, "_start_app") as start_app:
+                                                        with patch.object(ops, "_wait_app_ready", return_value=True):
+                                                            with patch.object(ops, "_sleep"):
+                                                                result = ops.open_search_page("测试短剧")
+
+    assert result["success"] is True
+    restart_uia.assert_called_once()
+    stop_app.assert_called_once()
+    start_app.assert_called_once()
 
 
 def test_pending_comment_episodes_between_ignores_verified_comments():

@@ -5,6 +5,8 @@ database:
   name: superclaw
   user: superclaw
   password: ''
+security:
+  auth_required: false
 logging:
   level: INFO
   dir: logs
@@ -37,7 +39,8 @@ scoring:
   strong_intent_words:
   - 怎么买
   - 多少钱
-  - 在哪买
+  - 链接
+  - 哪里买
   - 求链接
   - 想要
   - 购买

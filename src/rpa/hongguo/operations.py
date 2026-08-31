@@ -343,23 +343,55 @@ class HongguoOperations:
                     "titles": [current_title],
                     "message": "已在目标短剧页面",
                 }
-            for attempt in range(3):
-                if attempt == 0:
-                    self._open_theater()
-                elif attempt == 1:
-                    self._tap_bottom_tab("剧场", 0.37)
-                else:
-                    self._tap_bottom_tab("首页", 0.14)
-                if self._open_search():
-                    break
-            else:
-                return {"success": False, "keyword": keyword, "titles": [], "message": "未找到搜索入口"}
-            self._sleep(1.5, 2.5)
+            for recovery_attempt in range(2):
+                for attempt in range(3):
+                    if attempt == 0:
+                        self._open_theater()
+                    elif attempt == 1:
+                        self._tap_bottom_tab("剧场", 0.37)
+                    else:
+                        self._tap_bottom_tab("首页", 0.14)
+                    if self._open_search():
+                        self._sleep(1.5, 2.5)
+                        return {
+                            "success": True,
+                            "keyword": keyword,
+                            "input_visible": self._exists(self.d(className="android.widget.EditText"), 1),
+                            "message": "已进入搜索框",
+                        }
+
+                if recovery_attempt == 0:
+                    # Activity can be foreground while uiautomator still exposes an
+                    # empty hierarchy. Refresh that session before cold-starting once.
+                    hierarchy_empty = self._hierarchy_empty(self._xml())
+                    uia_restarted = self._restart_uiautomator_server() if hierarchy_empty else False
+                    self._stop_app()
+                    time.sleep(1.5)
+                    self._start_app()
+                    app_ready = self._wait_app_ready(25)
+                    self._wait_app_foreground(5)
+                    self._close_popups()
+                    logger.info(
+                        "Hongguo search entry recovery: addr=%s hierarchy_empty=%s "
+                        "uiautomator_restarted=%s app_ready=%s",
+                        getattr(self.d, "serial", None) or getattr(self.d, "_serial", ""),
+                        hierarchy_empty,
+                        uia_restarted,
+                        app_ready,
+                    )
+
+            current = self._safe_app_current()
+            xml = self._xml()
             return {
-                "success": True,
+                "success": False,
                 "keyword": keyword,
-                "input_visible": self._exists(self.d(className="android.widget.EditText"), 1),
-                "message": "已进入搜索框",
+                "titles": [],
+                "message": "未找到搜索入口",
+                "diagnostics": {
+                    "package": current.get("package", ""),
+                    "activity": current.get("activity", ""),
+                    "hierarchy_empty": self._hierarchy_empty(xml),
+                },
             }
         except Exception as exc:
             return {"success": False, "keyword": keyword, "titles": [], "message": str(exc)}

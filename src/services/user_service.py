@@ -2,7 +2,10 @@
 import hashlib
 import os
 import secrets
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from typing import Optional
+
+from api.security import Principal
 from models.database import get_session
 from models.user import User
 
@@ -55,8 +58,23 @@ class UserService:
         finally:
             session.close()
 
+    @staticmethod
+    def _normalize_username(username):
+        value = str(username or "").strip()
+        if not value:
+            raise ValueError("用户名不能为空")
+        return value
+
+    @staticmethod
+    def _active_admin_count(session, exclude_user_id: Optional[int] = None):
+        query = session.query(User).filter(User.role == "admin", User.status == "active")
+        if exclude_user_id is not None:
+            query = query.filter(User.id != int(exclude_user_id))
+        return sum(1 for user in query.all() if not user.is_expired())
+
     def create_user(self, username, password, nickname="", role="user",
                     usage_days=30, phone="", position="", remark=""):
+        username = self._normalize_username(username)
         session = get_session()
         try:
             existing = session.query(User).filter_by(username=username).first()
@@ -65,6 +83,7 @@ class UserService:
             user = User(
                 username=username,
                 password_hash=_hash_password(password),
+                auth_version=1,
                 nickname=nickname or username,
                 phone=phone,
                 position=position,
@@ -80,33 +99,58 @@ class UserService:
         finally:
             session.close()
 
-    def update_user(self, user_id, **kwargs):
+    def update_user(self, user_id, actor_user_id=None, **kwargs):
         session = get_session()
         try:
             user = session.get(User, user_id)
             if not user:
                 raise ValueError("用户不存在")
+            target_role = kwargs.get("role", user.role)
+            target_status = kwargs.get("status", user.status)
+            if actor_user_id is not None and int(actor_user_id) == int(user_id):
+                if target_role != "admin":
+                    raise ValueError("不能取消当前登录账号的管理员权限")
+                if target_status != "active":
+                    raise ValueError("不能禁用当前登录账号")
+            removes_active_admin = (
+                user.role == "admin"
+                and user.is_active()
+                and (target_role != "admin" or target_status != "active")
+            )
+            if removes_active_admin and self._active_admin_count(session, user_id) == 0:
+                raise ValueError("系统必须保留至少一个可用管理员")
+            security_changed = False
             if "password" in kwargs and kwargs["password"]:
                 user.password_hash = _hash_password(kwargs["password"])
+                security_changed = True
             for field in ["nickname", "phone", "position", "role", "status",
-                          "usage_days", "expire_at", "remark"]:
+                          "expire_at", "remark"]:
                 if field in kwargs:
+                    if field in {"role", "status", "expire_at"} and getattr(user, field) != kwargs[field]:
+                        security_changed = True
                     setattr(user, field, kwargs[field])
+            if "usage_days" in kwargs:
+                user.usage_days = int(kwargs["usage_days"])
+                user.expire_at = datetime.utcnow() + timedelta(days=user.usage_days)
+                security_changed = True
+            if security_changed:
+                user.auth_version = int(user.auth_version or 1) + 1
             session.commit()
             return user
         finally:
             session.close()
 
-    def delete_user(self, user_id):
+    def delete_user(self, user_id, actor_user_id=None):
         session = get_session()
         try:
             user = session.get(User, user_id)
             if not user:
                 raise ValueError("用户不存在")
-            if user.role == "admin":
-                admin_count = session.query(User).filter_by(role="admin").count()
-                if admin_count <= 1:
-                    raise ValueError("不能删除最后一个管理员")
+            if actor_user_id is not None and int(actor_user_id) == int(user_id):
+                raise ValueError("不能删除当前登录账号")
+            if user.role == "admin" and user.is_active():
+                if self._active_admin_count(session, user_id) == 0:
+                    raise ValueError("系统必须保留至少一个可用管理员")
             session.delete(user)
             session.commit()
         finally:
@@ -126,6 +170,25 @@ class UserService:
         finally:
             session.close()
 
+    def validate_principal(self, principal: Principal) -> Principal:
+        session = get_session()
+        try:
+            user = session.get(User, int(principal.user_id))
+            if not user or user.username != principal.username:
+                raise ValueError("登录账号不存在")
+            if not user.is_active():
+                raise ValueError("登录账号已禁用或已到期")
+            if int(user.auth_version or 1) != int(principal.auth_version or 1):
+                raise ValueError("登录状态已失效，请重新登录")
+            return Principal(
+                user_id=int(user.id),
+                username=str(user.username),
+                role=str(user.role or "user"),
+                auth_version=int(user.auth_version or 1),
+            )
+        finally:
+            session.close()
+
     def change_password(self, user_id, old_password, new_password):
         session = get_session()
         try:
@@ -135,7 +198,9 @@ class UserService:
             if not _verify_password(old_password, user.password_hash):
                 raise ValueError("原密码错误")
             user.password_hash = _hash_password(new_password)
+            user.auth_version = int(user.auth_version or 1) + 1
             session.commit()
+            return user
         finally:
             session.close()
 
@@ -150,6 +215,7 @@ class UserService:
                 admin = User(
                     username=os.environ.get("SUPERCLAW_ADMIN_USERNAME", "admin").strip() or "admin",
                     password_hash=_hash_password(password),
+                    auth_version=1,
                     nickname="Administrator",
                     phone="",
                     position="系统管理员",

@@ -1,137 +1,240 @@
 <template>
   <div class="users-page">
     <div class="page-header">
-      <h2><el-icon><UserFilled /></el-icon> 用户管理</h2>
-      <el-button type="primary" @click="showDialog()"><el-icon><Plus /></el-icon> 新增用户</el-button>
+      <div>
+        <h2><el-icon><UserFilled /></el-icon> 账号管理</h2>
+        <span class="summary">共 {{ users.length }} 个公司账号</span>
+      </div>
+      <el-button type="primary" @click="showDialog()">
+        <el-icon><Plus /></el-icon>
+        新增账号
+      </el-button>
     </div>
-    <el-card>
-      <el-table :data="users" style="width: 100%" v-loading="loading">
-        <el-table-column prop="id" label="ID" width="60" />
-        <el-table-column prop="username" label="用户名" width="120" />
-        <el-table-column prop="nickname" label="昵称" width="120" />
-        <el-table-column prop="phone" label="手机号" width="130" />
-        <el-table-column prop="position" label="职位" width="140" />
-        <el-table-column prop="role" label="角色" width="100">
-          <template #default="{ row }">
-            <el-tag :type="row.role === 'admin' ? 'danger' : ''" size="small">{{ row.role === 'admin' ? '管理员' : '普通用户' }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column prop="status" label="状态" width="100">
-          <template #default="{ row }">
-            <el-tag :type="row.status === 'active' ? 'success' : 'info'" size="small">{{ row.status === 'active' ? '正常' : '禁用' }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column prop="expire_at" label="到期时间" width="180">
-          <template #default="{ row }">
-            {{ row.expire_at ? new Date(row.expire_at).toLocaleString() : '永久' }}
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="150">
-          <template #default="{ row }">
-            <el-button link type="primary" @click="showDialog(row)">编辑</el-button>
-            <el-popconfirm title="确定删除?" @confirm="handleDelete(row.id)">
-              <template #reference><el-button link type="danger">删除</el-button></template>
-            </el-popconfirm>
-          </template>
-        </el-table-column>
-      </el-table>
-    </el-card>
 
-    <el-dialog v-model="dialogVisible" :title="editingId ? '编辑用户' : '新增用户'" width="520px">
-      <el-form :model="form" label-width="80px">
-        <el-form-item label="用户名"><el-input v-model="form.username" /></el-form-item>
-        <el-form-item label="昵称"><el-input v-model="form.nickname" /></el-form-item>
-        <el-form-item label="手机号"><el-input v-model="form.phone" /></el-form-item>
-        <el-form-item label="职位"><el-input v-model="form.position" /></el-form-item>
-        <el-form-item label="密码" v-if="!editingId"><el-input v-model="form.password" type="password" show-password /></el-form-item>
-        <el-form-item label="角色">
-          <el-select v-model="form.role" style="width: 100%">
-            <el-option label="管理员" value="admin" />
-            <el-option label="普通用户" value="user" />
-          </el-select>
+    <el-table :data="users" v-loading="loading" border class="users-table">
+      <el-table-column prop="username" label="用户名" min-width="130" />
+      <el-table-column prop="nickname" label="姓名" min-width="120">
+        <template #default="{ row }">{{ row.nickname || '-' }}</template>
+      </el-table-column>
+      <el-table-column prop="position" label="职位" min-width="120">
+        <template #default="{ row }">{{ row.position || '-' }}</template>
+      </el-table-column>
+      <el-table-column prop="role" label="角色" width="100">
+        <template #default="{ row }">
+          <el-tag :type="row.role === 'admin' ? 'danger' : 'info'" size="small">
+            {{ row.role === 'admin' ? '管理员' : '员工' }}
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="status" label="状态" width="100">
+        <template #default="{ row }">
+          <el-tag :type="statusType(row)" size="small">{{ statusText(row) }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="expire_at" label="有效期" min-width="180">
+        <template #default="{ row }">
+          <div>{{ formatDate(row.expire_at) }}</div>
+          <small v-if="row.status === 'active'" class="muted">剩余 {{ row.days_remaining }} 天</small>
+        </template>
+      </el-table-column>
+      <el-table-column prop="last_login" label="最后登录" min-width="180">
+        <template #default="{ row }">{{ row.last_login ? formatDate(row.last_login) : '尚未登录' }}</template>
+      </el-table-column>
+      <el-table-column label="操作" width="230" fixed="right">
+        <template #default="{ row }">
+          <el-button link type="primary" @click="showDialog(row)">编辑</el-button>
+          <el-button
+            link
+            :type="row.status === 'active' ? 'warning' : 'success'"
+            @click="toggleStatus(row)"
+          >
+            {{ row.status === 'active' ? '禁用' : '启用' }}
+          </el-button>
+          <el-button link type="danger" @click="handleDelete(row)">删除</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+
+    <el-dialog
+      v-model="dialogVisible"
+      :title="editingId ? '编辑账号' : '新增账号'"
+      width="540px"
+      :close-on-click-modal="false"
+    >
+      <el-form ref="formRef" :model="form" :rules="rules" label-width="92px">
+        <el-form-item label="用户名" prop="username">
+          <el-input v-model="form.username" :disabled="Boolean(editingId)" maxlength="64" />
         </el-form-item>
-        <el-form-item label="状态">
-          <el-select v-model="form.status" style="width: 100%">
-            <el-option label="正常" value="active" />
-            <el-option label="禁用" value="disabled" />
-          </el-select>
+        <el-form-item label="姓名" prop="nickname">
+          <el-input v-model="form.nickname" maxlength="64" />
         </el-form-item>
-        <el-form-item label="使用天数"><el-input-number v-model="form.usage_days" :min="1" :max="36500" /></el-form-item>
+        <el-form-item label="手机号" prop="phone">
+          <el-input v-model="form.phone" maxlength="20" />
+        </el-form-item>
+        <el-form-item label="职位" prop="position">
+          <el-input v-model="form.position" maxlength="64" />
+        </el-form-item>
+        <el-form-item :label="editingId ? '重置密码' : '初始密码'" prop="password">
+          <el-input
+            v-model="form.password"
+            type="password"
+            show-password
+            maxlength="256"
+            :placeholder="editingId ? '不修改请留空' : '至少 8 位'"
+          />
+        </el-form-item>
+        <el-form-item label="角色" prop="role">
+          <el-segmented
+            v-model="form.role"
+            :options="[{ label: '员工', value: 'user' }, { label: '管理员', value: 'admin' }]"
+          />
+        </el-form-item>
+        <el-form-item v-if="editingId" label="状态" prop="status">
+          <el-switch v-model="form.status" active-value="active" inactive-value="disabled" active-text="启用" inactive-text="禁用" />
+        </el-form-item>
+        <el-form-item :label="editingId ? '续期天数' : '有效天数'" prop="usage_days">
+          <el-input-number v-model="form.usage_days" :min="1" :max="36500" controls-position="right" />
+          <span v-if="editingId" class="field-help">留空则保持原到期时间</span>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="handleSubmit">确定</el-button>
+        <el-button type="primary" :loading="saving" @click="handleSubmit">保存</el-button>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { getUsers, createUser, updateUser, deleteUser } from '@/api'
-import { ElMessage } from 'element-plus'
+import { onMounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { createUser, deleteUser, getUsers, updateUser } from '@/api'
 
 const users = ref([])
 const loading = ref(false)
+const saving = ref(false)
 const dialogVisible = ref(false)
 const editingId = ref(null)
-const defaultForm = { username: '', nickname: '', phone: '', position: '', password: '', role: 'user', status: 'active', usage_days: 30 }
-const form = ref({ ...defaultForm })
+const formRef = ref(null)
+const defaultForm = {
+  username: '', nickname: '', phone: '', position: '', password: '',
+  role: 'user', status: 'active', usage_days: 30,
+}
+const form = reactive({ ...defaultForm })
+const rules = {
+  username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
+  password: [{ validator: validatePassword, trigger: 'blur' }],
+  usage_days: [{ validator: validateUsageDays, trigger: 'change' }],
+}
 
-onMounted(() => loadUsers())
+onMounted(loadUsers)
+
+function validatePassword(_rule, value, callback) {
+  if (!editingId.value && !value) return callback(new Error('请输入初始密码'))
+  if (value && value.length < 8) return callback(new Error('密码至少 8 位'))
+  callback()
+}
+
+function validateUsageDays(_rule, value, callback) {
+  if (!editingId.value && !value) return callback(new Error('请设置有效天数'))
+  callback()
+}
 
 async function loadUsers() {
   loading.value = true
-  try { users.value = await getUsers() }
-  finally { loading.value = false }
+  try {
+    users.value = await getUsers()
+  } finally {
+    loading.value = false
+  }
 }
 
 function showDialog(row) {
-  if (row) {
-    editingId.value = row.id
-    form.value = { username: row.username, nickname: row.nickname || '', phone: row.phone || '', position: row.position || '', password: '', role: row.role, status: row.status, usage_days: row.usage_days || 30 }
-  } else {
-    editingId.value = null
-    form.value = { ...defaultForm }
-  }
+  editingId.value = row?.id || null
+  Object.assign(form, defaultForm, row ? {
+    username: row.username,
+    nickname: row.nickname || '',
+    phone: row.phone || '',
+    position: row.position || '',
+    password: '',
+    role: row.role,
+    status: row.status,
+    usage_days: null,
+  } : {})
   dialogVisible.value = true
+  formRef.value?.clearValidate()
 }
 
 async function handleSubmit() {
+  if (!await formRef.value.validate().catch(() => false)) return
+  saving.value = true
   try {
+    const payload = { ...form }
     if (editingId.value) {
-      await updateUser(editingId.value, form.value)
-      ElMessage.success('更新成功')
+      delete payload.username
+      if (!payload.password) delete payload.password
+      if (!payload.usage_days) delete payload.usage_days
+      await updateUser(editingId.value, payload)
+      ElMessage.success('账号已更新，权限变更立即生效')
     } else {
-      await createUser(form.value)
-      ElMessage.success('创建成功')
+      delete payload.status
+      await createUser(payload)
+      ElMessage.success('账号已创建')
     }
     dialogVisible.value = false
-    loadUsers()
-  } catch (e) { console.error(e) }
+    await loadUsers()
+  } finally {
+    saving.value = false
+  }
 }
 
-async function handleDelete(id) {
-  try {
-    await deleteUser(id)
-    ElMessage.success('删除成功')
-    loadUsers()
-  } catch (e) { console.error(e) }
+async function toggleStatus(row) {
+  const next = row.status === 'active' ? 'disabled' : 'active'
+  await ElMessageBox.confirm(
+    `确定${next === 'active' ? '启用' : '禁用'}账号“${row.username}”吗？`,
+    '账号状态确认',
+    { type: 'warning' },
+  )
+  await updateUser(row.id, { status: next })
+  ElMessage.success(next === 'active' ? '账号已启用' : '账号已禁用')
+  await loadUsers()
+}
+
+async function handleDelete(row) {
+  await ElMessageBox.confirm(
+    `确定删除账号“${row.username}”吗？该账号将无法再次登录。`,
+    '删除账号',
+    { type: 'warning', confirmButtonText: '删除', confirmButtonClass: 'el-button--danger' },
+  )
+  await deleteUser(row.id)
+  ElMessage.success('账号已删除')
+  await loadUsers()
+}
+
+function formatDate(value) {
+  if (!value) return '永久'
+  const text = String(value)
+  const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text)
+  const normalized = hasTimezone ? text : `${text.replace(' ', 'T')}Z`
+  return new Date(normalized).toLocaleString('zh-CN', { hour12: false })
+}
+
+function statusText(row) {
+  if (row.status !== 'active') return '已禁用'
+  return row.is_active ? '正常' : '已到期'
+}
+
+function statusType(row) {
+  if (row.status !== 'active') return 'info'
+  return row.is_active ? 'success' : 'danger'
 }
 </script>
 
 <style scoped>
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 16px;
-}
-.page-header h2 {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0;
-  color: var(--text-primary);
-}
+.users-page { min-width: 760px; }
+.page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.page-header h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 4px; color: var(--text-primary); font-size: 18px; }
+.summary, .muted, .field-help { color: var(--text-secondary); }
+.field-help { margin-left: 10px; font-size: 12px; }
+.users-table { width: 100%; }
 </style>

@@ -53,7 +53,7 @@ async function handleLogin() {
     userStore.setToken(result.access_token)
     userStore.setUserInfo(result.user)
     ElMessage.success('登录成功')
-    router.push('/dashboard')
+    router.push('/hongguo/multi')
   } catch (e) {
     ElMessage.error('登录失败')
   } finally {

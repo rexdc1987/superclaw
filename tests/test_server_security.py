@@ -14,6 +14,7 @@ from api.security import (
     set_current_principal,
 )
 from services.user_service import _hash_password, _verify_password
+from services.user_service import UserService
 
 
 def test_signed_access_token_round_trip(monkeypatch):
@@ -73,6 +74,23 @@ def test_authentication_middleware_rejects_missing_token(monkeypatch):
     assert response.status_code == 401
 
 
+def test_authentication_middleware_rejects_token_for_missing_user(monkeypatch):
+    import api.main as main_module
+
+    monkeypatch.setenv("SUPERCLAW_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("SUPERCLAW_AUTH_SECRET", "x" * 40)
+    monkeypatch.setattr(main_module, "init_db", lambda: None)
+    monkeypatch.setattr(main_module, "reconcile_runtime_state", lambda: {})
+    token = issue_access_token(999999, "missing-user", "admin")
+    with TestClient(main_module.app) as client:
+        response = client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "登录账号不存在"
+
+
 def test_local_login_returns_real_signed_token(monkeypatch):
     import api.main as main_module
 
@@ -95,13 +113,60 @@ def test_regular_user_cannot_change_global_settings(monkeypatch):
     monkeypatch.setenv("SUPERCLAW_AUTH_REQUIRED", "true")
     monkeypatch.setenv("SUPERCLAW_AUTH_SECRET", "x" * 40)
     monkeypatch.setattr(main_module, "reconcile_runtime_state", lambda: {})
-    token = issue_access_token(22, "regular", "user")
+    user = UserService().create_user("regular", "password-123", role="user")
+    token = issue_access_token(user.id, user.username, user.role, user.auth_version)
     with TestClient(main_module.app) as client:
         response = client.get(
             "/api/v1/settings/ai",
             headers={"Authorization": f"Bearer {token}"},
         )
     assert response.status_code == 403
+
+
+def test_password_change_invalidates_existing_token():
+    service = UserService()
+    user = service.create_user("operator", "old-password", role="user")
+    old_principal = Principal(
+        user_id=user.id,
+        username=user.username,
+        role=user.role,
+        auth_version=user.auth_version,
+    )
+
+    service.change_password(user.id, "old-password", "new-password")
+
+    with pytest.raises(ValueError, match="登录状态已失效"):
+        service.validate_principal(old_principal)
+
+
+def test_disabled_user_is_rejected_immediately():
+    service = UserService()
+    user = service.create_user("disabled-user", "password-123", role="user")
+    principal = Principal(user.id, user.username, user.role, user.auth_version)
+
+    service.update_user(user.id, status="disabled")
+
+    with pytest.raises(ValueError, match="已禁用"):
+        service.validate_principal(principal)
+
+
+def test_last_active_admin_cannot_be_disabled_or_deleted():
+    service = UserService()
+    admin = service.create_user("admin", "password-123", role="admin")
+
+    with pytest.raises(ValueError, match="至少一个可用管理员"):
+        service.update_user(admin.id, status="disabled")
+    with pytest.raises(ValueError, match="至少一个可用管理员"):
+        service.delete_user(admin.id)
+
+
+def test_admin_cannot_disable_own_account():
+    service = UserService()
+    first = service.create_user("admin-one", "password-123", role="admin")
+    service.create_user("admin-two", "password-123", role="admin")
+
+    with pytest.raises(ValueError, match="不能禁用当前登录账号"):
+        service.update_user(first.id, actor_user_id=first.id, status="disabled")
 
 
 def test_screenshot_proxy_rejects_paths_outside_root(tmp_path, monkeypatch):
