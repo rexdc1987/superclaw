@@ -1,6 +1,6 @@
-# SuperClaw 公司电脑一键安装指南（WorkBuddy）
+# SuperClaw 公司电脑一键安装指南
 
-本文用于让其他 Windows 电脑上的 WorkBuddy 获取并安装公司版 SuperClaw。每台电脑运行自己的前端、API 和 MuMu，账号、任务、模板及日志统一存储在公司 MySQL 中。
+本文是 SuperClaw 公司版的一键安装指南。WorkBuddy 等电脑助手可以按本文执行安装；也可以由员工直接在 PowerShell 中执行。每台电脑运行自己的前端、API 和 MuMu，账号、任务、模板及日志统一存储在公司 MySQL 中。
 
 ## 一、安装前准备
 

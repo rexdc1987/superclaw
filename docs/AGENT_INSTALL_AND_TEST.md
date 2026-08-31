@@ -43,7 +43,7 @@ winget install -e --id Docker.DockerDesktop
 
 ## 3. Agent 一键执行块
 
-公司员工电脑连接共享 MySQL 时，优先使用 `docs/WORKBUDDY_ONE_CLICK_INSTALL.md` 和 `scripts/install_company_pc.ps1`。下面的 `DatabaseMode Auto` 仅用于创建完全独立的开发环境。
+公司员工电脑连接共享 MySQL 时，优先使用 `docs/SUPERCLAW_ONE_CLICK_INSTALL.md` 和 `scripts/install_company_pc.ps1`。下面的 `DatabaseMode Auto` 仅用于创建完全独立的开发环境。
 
 让目标电脑 Agent 执行下面整段：
 
