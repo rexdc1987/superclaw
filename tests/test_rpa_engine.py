@@ -99,6 +99,55 @@ def test_hongguo_task_device_addr_prefers_bound_instance():
         assert routes_hongguo._task_device_addr({}) == "192.168.3.134:5555"
 
 
+def test_reconcile_runtime_state_only_stops_tasks_owned_by_local_worker(monkeypatch):
+    from rpa.dashboard import routes_hongguo
+
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [{"id": 299}]
+    cursor.rowcount = 1
+    cursor_context = MagicMock()
+    cursor_context.__enter__.return_value = cursor
+    connection = MagicMock()
+    connection.cursor.return_value = cursor_context
+    connection_context = MagicMock()
+    connection_context.__enter__.return_value = connection
+    monkeypatch.setenv("SUPERCLAW_EXECUTION_MODE", "embedded")
+
+    with patch.object(routes_hongguo, "_local_worker_id", return_value="HOST-A"):
+        with patch.object(routes_hongguo, "_connection", return_value=connection_context):
+            result = routes_hongguo.reconcile_runtime_state()
+
+    select_sql, select_params = cursor.execute.call_args_list[0].args
+    assert "worker_id=%s" in select_sql
+    assert select_params == ("HOST-A",)
+    update_sql, update_params = cursor.execute.call_args_list[1].args
+    assert "WHERE id IN" in update_sql
+    assert update_params[-1] == 299
+    delete_sql, delete_params = cursor.execute.call_args_list[2].args
+    assert "DELETE FROM hongguo_device_leases WHERE worker_id=%s" == delete_sql
+    assert delete_params == ("HOST-A",)
+    cursor.executemany.assert_called_once()
+    assert "HOST-A" in cursor.executemany.call_args.args[1][0][1]
+    assert result == {"stopped_tasks": 1, "released_leases": 1}
+
+
+def test_hongguo_connection_preserves_original_error_when_rollback_fails(monkeypatch):
+    from rpa.dashboard import routes_hongguo
+
+    original_error = RuntimeError("query failed")
+    connection = MagicMock()
+    connection.rollback.side_effect = routes_hongguo.pymysql.MySQLError("connection closed")
+    monkeypatch.setattr(routes_hongguo, "_schema_ready", True)
+
+    with patch.object(routes_hongguo.pymysql, "connect", return_value=connection):
+        with pytest.raises(RuntimeError, match="query failed"):
+            with routes_hongguo._connection():
+                raise original_error
+
+    connection.rollback.assert_called_once()
+    connection.close.assert_called_once()
+
+
 def test_stop_multi_run_preserves_terminal_task_statuses():
     from rpa.dashboard import routes_hongguo
 
@@ -4365,6 +4414,30 @@ def test_open_main_activity_cold_starts_when_android_reuses_player_task():
                         assert ops._open_main_activity() is True
     stop_app.assert_called_once()
     start_app.assert_called_once()
+
+
+def test_open_main_activity_accepts_alternate_activity_with_main_navigation():
+    ops = HongguoOperations(object())
+    ops.d = MagicMock()
+    main_nav_xml = """
+    <hierarchy>
+      <node package="com.phoenix.read" text="首页" visible-to-user="true" />
+      <node package="com.phoenix.read" text="剧场" visible-to-user="true" />
+      <node package="com.phoenix.read" text="我的" visible-to-user="true" />
+    </hierarchy>
+    """
+    with patch("rpa.hongguo.operations.call_with_timeout"):
+        with patch.object(
+            ops,
+            "_safe_app_current",
+            return_value={
+                "package": "com.phoenix.read",
+                "activity": "com.dragon.read.pages.home.HomeActivity",
+            },
+        ):
+            with patch.object(ops, "_xml", return_value=main_nav_xml):
+                with patch("rpa.hongguo.operations.time.sleep"):
+                    assert ops._open_main_activity() is True
 
 
 class TestHongguoCommentGeneration:

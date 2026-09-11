@@ -142,11 +142,16 @@ def reconcile_runtime_state() -> Dict[str, int]:
     if os.environ.get("SUPERCLAW_EXECUTION_MODE", "embedded").strip().lower() != "embedded":
         return {"stopped_tasks": 0, "released_leases": 0}
     now = datetime.now()
-    message = "服务进程已重启，原执行线程不存在，请手动重新启动任务"
+    worker_id = _local_worker_id()
+    message = f"执行电脑 {worker_id} 的服务进程已重启，原执行线程不存在，请手动重新启动任务"
     with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id FROM hongguo_comment_tasks WHERE status IN ('running', 'paused')"
+                """
+                SELECT id FROM hongguo_comment_tasks
+                WHERE worker_id=%s AND status IN ('running', 'paused')
+                """,
+                (worker_id,),
             )
             task_ids = [int(row["id"]) for row in (cur.fetchall() or [])]
             if task_ids:
@@ -166,7 +171,7 @@ def reconcile_runtime_state() -> Dict[str, int]:
                     """,
                     [(task_id, message, now) for task_id in task_ids],
                 )
-            cur.execute("DELETE FROM hongguo_device_leases")
+            cur.execute("DELETE FROM hongguo_device_leases WHERE worker_id=%s", (worker_id,))
             released = int(cur.rowcount or 0)
     return {"stopped_tasks": len(task_ids), "released_leases": released}
 
@@ -573,10 +578,18 @@ def _connection():
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        # A remote MySQL disconnect can make rollback fail too. Preserve the
+        # original database error instead of masking it with a cleanup error.
+        try:
+            conn.rollback()
+        except pymysql.MySQLError:
+            pass
         raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except pymysql.MySQLError:
+            pass
 
 
 def _json_dumps(value: Any) -> str:

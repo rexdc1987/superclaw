@@ -790,6 +790,8 @@ class HongguoOperations:
         current = self._safe_app_current()
         if current.get("package") == APP_PACKAGE and current.get("activity") == "com.dragon.read.pages.main.MainFragmentActivity":
             return True
+        if self._main_navigation_visible(current):
+            return True
 
         # Android may reuse the existing short-series task even though am
         # start reports success. Cold-start Hongguo and wait for the real main
@@ -801,8 +803,21 @@ class HongguoOperations:
             current = self._safe_app_current()
             if current.get("package") == APP_PACKAGE and current.get("activity") == "com.dragon.read.pages.main.MainFragmentActivity":
                 return True
+            if self._main_navigation_visible(current):
+                return True
             time.sleep(1)
         return False
+
+    def _main_navigation_visible(self, current: Optional[Dict[str, Any]] = None) -> bool:
+        """Confirm a usable Red Fruit main navigation screen without an exact Activity name."""
+        current = current if current is not None else self._safe_app_current()
+        if current.get("package") != APP_PACKAGE:
+            return False
+        if current.get("activity") == SHORT_SERIES_ACTIVITY:
+            return False
+        xml = self._xml()
+        visible_text = " ".join(self._visible_hongguo_nodes(xml))
+        return all(marker in visible_text for marker in ("首页", "剧场", "我的"))
 
     def _still_on_search_selection_page(self) -> bool:
         current = self._safe_app_current()
