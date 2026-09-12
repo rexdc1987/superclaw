@@ -1,0 +1,626 @@
+warning: in the working copy of 'src/rpa/hongguo/operations.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/package-lock.json b/frontend/package-lock.json
+index b4517e4..8f5c86f 100644
+--- a/frontend/package-lock.json
++++ b/frontend/package-lock.json
+@@ -11,6 +11,7 @@
+         "@element-plus/icons-vue": "^2.3.2",
+         "axios": "^1.18.0",
+         "element-plus": "^2.14.2",
++        "entities": "^8.0.0",
+         "pinia": "^3.0.4",
+         "vue": "^3.5.34",
+         "vue-router": "^4.6.4"
+@@ -515,6 +516,18 @@
+         "source-map-js": "^1.2.1"
+       }
+     },
++    "node_modules/@vue/compiler-core/node_modules/entities": {
++      "version": "7.0.1",
++      "resolved": "https://registry.npmmirror.com/entities/-/entities-7.0.1.tgz",
++      "integrity": "sha512-TWrgLOFUQTH994YUyl1yT4uyavY5nNB5muff+RtWaqNVCAK408b5ZnnbNAUEWLTCpum9w6arT70i1XdQ4UeOPA==",
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=0.12"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/entities?sponsor=1"
++      }
++    },
+     "node_modules/@vue/compiler-dom": {
+       "version": "3.5.38",
+       "resolved": "https://registry.npmmirror.com/@vue/compiler-dom/-/compiler-dom-3.5.38.tgz",
+@@ -847,12 +860,12 @@
+       }
+     },
+     "node_modules/entities": {
+-      "version": "7.0.1",
+-      "resolved": "https://registry.npmmirror.com/entities/-/entities-7.0.1.tgz",
+-      "integrity": "sha512-TWrgLOFUQTH994YUyl1yT4uyavY5nNB5muff+RtWaqNVCAK408b5ZnnbNAUEWLTCpum9w6arT70i1XdQ4UeOPA==",
++      "version": "8.0.0",
++      "resolved": "https://registry.npmmirror.com/entities/-/entities-8.0.0.tgz",
++      "integrity": "sha512-zwfzJecQ/Uej6tusMqwAqU/6KL2XaB2VZ2Jg54Je6ahNBGNH6Ek6g3jjNCF0fG9EWQKGZNddNjU5F1ZQn/sBnA==",
+       "license": "BSD-2-Clause",
+       "engines": {
+-        "node": ">=0.12"
++        "node": ">=20.19.0"
+       },
+       "funding": {
+         "url": "https://github.com/fb55/entities?sponsor=1"
+diff --git a/frontend/package.json b/frontend/package.json
+index ec7ed7b..81002a9 100644
+--- a/frontend/package.json
++++ b/frontend/package.json
+@@ -12,6 +12,7 @@
+     "@element-plus/icons-vue": "^2.3.2",
+     "axios": "^1.18.0",
+     "element-plus": "^2.14.2",
++    "entities": "^8.0.0",
+     "pinia": "^3.0.4",
+     "vue": "^3.5.34",
+     "vue-router": "^4.6.4"
+diff --git a/pyproject.toml b/pyproject.toml
+index e97a480..ab02b72 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [build-system]
+ requires = ["setuptools>=68.0", "wheel"]
+-build-backend = "setuptools.backends._legacy:_Backend"
++build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "superclaw"
+diff --git a/src/rpa/hongguo/operations.py b/src/rpa/hongguo/operations.py
+index dc4b4de..874457c 100644
+--- a/src/rpa/hongguo/operations.py
++++ b/src/rpa/hongguo/operations.py
+@@ -1,7 +1,7 @@
+-"""Atomic UI operations for Hongguo comment automation."""
+-
+-from __future__ import annotations
+-
++"""Atomic UI operations for Hongguo comment automation."""
++
++from __future__ import annotations
++
+ import html
+ import logging
+ import random
+@@ -10,7 +10,7 @@ import time
+ import unicodedata
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+-
++
+ from .device import call_with_timeout, connect_exact, get_screen_size, screenshot
+ 
+ 
+@@ -56,21 +56,39 @@ REWARD_RAIN_MARKERS = (
+     "金币全归你",
+     "一大波金币红包来了",
+ )
++# 搜索结果页顶部 tab。红果不同版本 tab 组合不同：
++#   旧版：综合 / 短剧 / 影视 / 用户
++#   新版：综合 / 小说 / 听书   ← 2026-09 实测（com.phoenix.read）
++# 漏掉新版组合会导致结果页明明已展示却被判为"未进入搜索结果页"。
++SEARCH_RESULT_TAB_MARKERS = (
++    "综合",
++    "小说",
++    "听书",
++    "短剧",
++    "影视",
++    "用户",
++    "漫画",
++    "番剧",
++)
++SEARCH_RESULT_PAGE_HINTS = ("搜索", "剧场", "播放", "热度", "全部")
++# 播放页右上角的金币红包悬浮球（"16888 立即领取"），会盖一层透明 Compose
++# 触摸层导致评论按钮点不动，需要主动消除。
++REWARD_FLOAT_MARKERS = ("立即领取", "开心收下", "点击领取")
+ TAG_KEYWORDS = {
+-    "玄幻",
+-    "传统",
+-    "都市",
+-    "甜宠",
+-    "逆袭",
+-    "悬疑",
+-    "搞笑",
+-    "古装",
+-    "现代",
+-    "仙侠",
+-    "武侠",
+-    "异界",
+-    "脑洞",
+-    "新剧",
++    "玄幻",
++    "传统",
++    "都市",
++    "甜宠",
++    "逆袭",
++    "悬疑",
++    "搞笑",
++    "古装",
++    "现代",
++    "仙侠",
++    "武侠",
++    "异界",
++    "脑洞",
++    "新剧",
+     "热榜",
+ }
+ 
+@@ -80,9 +98,9 @@ TAG_KEYWORDS = {
+ KNOWN_TITLE_ALIASES = {
+     "胭脂念念不忘": "胭脂如梦如雨如尘",
+ }
+-
+-
+-class HongguoOperations:
++
++
++class HongguoOperations:
+     def __init__(self, device: Any):
+         self.d = device
+         self._ad_swipe_pending = False
+@@ -93,7 +111,7 @@ class HongguoOperations:
+             self.width, self.height = get_screen_size(self.d)
+         except Exception:
+             self.width, self.height = 1080, 1920
+-
++
+     def launch_app(self) -> bool:
+         try:
+             current = self._safe_app_current()
+@@ -146,22 +164,22 @@ class HongguoOperations:
+         try:
+             self._close_popups_quick()
+             xml = self._xml()
+-            if self._playback_visible(xml):
+-                return {"logged_in": True, "status": "in_app", "message": "红果播放页可用"}
+-            for text in ["我的", "我的tab"]:
+-                el = self.d(text=text)
+-                if self._exists(el, 1):
+-                    el.click()
+-                    time.sleep(2)
+-                    break
+-            else:
+-                self.d.click(int(self.width * 0.9), int(self.height * 0.95))
+-                time.sleep(2)
+-
+-            xml = self._xml()
+-            logged_in_markers = ["我的钱包", "观看历史", "红果号", "编辑资料", "提现", "收藏"]
+-            if any(text in xml for text in logged_in_markers):
+-                return {"logged_in": True, "status": "logged_in", "message": "已登录"}
++            if self._playback_visible(xml):
++                return {"logged_in": True, "status": "in_app", "message": "红果播放页可用"}
++            for text in ["我的", "我的tab"]:
++                el = self.d(text=text)
++                if self._exists(el, 1):
++                    el.click()
++                    time.sleep(2)
++                    break
++            else:
++                self.d.click(int(self.width * 0.9), int(self.height * 0.95))
++                time.sleep(2)
++
++            xml = self._xml()
++            logged_in_markers = ["我的钱包", "观看历史", "红果号", "编辑资料", "提现", "收藏"]
++            if any(text in xml for text in logged_in_markers):
++                return {"logged_in": True, "status": "logged_in", "message": "已登录"}
+             if self._playback_visible(xml):
+                 return {"logged_in": True, "status": "in_app", "message": "红果播放页可用"}
+             if any(text in xml for text in ["登录", "手机号", "微信登录", "抖音登录"]):
+@@ -284,7 +302,7 @@ class HongguoOperations:
+         except Exception as exc:
+             result["message"] = str(exc)
+             return result
+-
++
+     def search_drama(self, keyword: str) -> Dict[str, Any]:
+         try:
+             opened = self.open_search_page(keyword)
+@@ -844,7 +862,7 @@ class HongguoOperations:
+     def _detail_markers_visible(self, xml: Optional[str] = None) -> bool:
+         xml = " ".join(self._hongguo_nodes(self._xml() if xml is None else xml))
+         return bool(re.search(r"全\d+集|第\d+集", xml) or any(marker in xml for marker in ("剧情简介", "剧评", "选集")))
+-
++
+     def play_episode(self, episode_number: int) -> bool:
+         try:
+             xml = self._xml()
+@@ -932,7 +950,7 @@ class HongguoOperations:
+                 self.d.click(int(self.width * 0.5), int(self.height * 0.28))
+             time.sleep(0.8)
+         return self._current_speed_matches(target)
+-
++
+     def _episode_panel_selector(self) -> Optional[Any]:
+         for selector in (self.d(textContains="选集"), self.d(textContains="合集")):
+             if self._exists(selector, 1):
+@@ -1291,7 +1309,7 @@ class HongguoOperations:
+             "3.0": "3.0x",
+         }
+         return aliases.get(text)
+-
++
+     def get_current_episode(self, xml: Optional[str] = None, assume_foreground: bool = False) -> int:
+         if not assume_foreground and not self._is_app_foreground():
+             return 0
+@@ -1876,10 +1894,79 @@ class HongguoOperations:
+         except Exception:
+             return False
+ 
++    def _reward_float_point(self, xml: Optional[str] = None) -> Optional[tuple[int, int]]:
++        xml = self._xml() if xml is None else xml
++        if not isinstance(xml, str):
++            return None
++        for node in re.findall(r"<node\b[^>]+>", xml or ""):
++            text_match = re.search(r'text="([^"]*)"', node)
++            if not text_match:
++                continue
++            node_text = html.unescape(text_match.group(1)).strip()
++            if node_text not in REWARD_FLOAT_MARKERS:
++                continue
++            bounds = self._node_bounds(node)
++            if not bounds:
++                continue
++            left, top, right, bottom = bounds
++            # 只认上半屏靠右的悬浮球，避免误判底部操作按钮
++            if right >= self.width * 0.5 and bottom <= self.height * 0.5:
++                return ((left + right) // 2, (top + bottom) // 2)
++        return None
++
++    def _reward_float_visible(self, xml: Optional[str] = None) -> bool:
++        return self._reward_float_point(xml) is not None
++
++    def _dismiss_reward_float(self) -> bool:
++        """消除播放页右上角的金币红包悬浮球（"16888 立即领取"）。
++
++        该悬浮球会在播放页上叠一层透明 Compose 触摸层，导致评论按钮点击
++        完全无效。2026-09-11 任务340 第22集失败即由此引起。
++        关闭顺序按破坏性从小到大：显式关闭控件 -> 点开悬浮球后返回。
++        """
++        if not self._reward_float_visible():
++            return False
++
++        for selector in (
++            {"description": "关闭"},
++            {"descriptionContains": "关闭"},
++            {"text": "关闭"},
++        ):
++            try:
++                button = self.d(**selector)
++                if not self._exists(button, 0.4):
++                    continue
++                button.click()
++                time.sleep(0.8)
++                if not self._reward_float_visible():
++                    return True
++            except Exception:
++                pass
++
++        # 悬浮球本身通常没有关闭控件，点开后其奖励页有；此时按返回键
++        # 只会退回播放页（不同于播放页返回，不会退出 ShortSeriesActivity）。
++        point = self._reward_float_point()
++        if point:
++            try:
++                self.d.click(*point)
++                time.sleep(1.5)
++                if self._ad_continue_visible():
++                    self.skip_ad_if_present()
++                    time.sleep(1.5)
++                self.d.press("back")
++                time.sleep(1.0)
++                if not self._reward_float_visible():
++                    return True
++            except Exception:
++                pass
++
++        return False
++
+     def _open_comment_panel(self, timeout: float = 2, prefer_coordinate: bool = False) -> bool:
+         self._recover_anr_dialog()
+         if self._reward_rain_page_active():
+             self._dismiss_reward_rain_page()
++        self._dismiss_reward_float()
+         self._close_xiaoguo_ai_panel()
+         if self._comment_panel_open():
+             return True
+@@ -2283,6 +2370,8 @@ class HongguoOperations:
+         return any(marker in xml for marker in ("全屏观看", "选集", "合集", "有趣评论", "说点什么"))
+ 
+     def prepare_comment_window(self, episode_number: int = 0) -> bool:
++        # 红包悬浮球会盖住评论按钮，先清掉再走后续判定
++        self._dismiss_reward_float()
+         if self._ad_continue_visible():
+             self.skip_ad_if_present()
+             time.sleep(2)
+@@ -2379,7 +2468,7 @@ class HongguoOperations:
+             return {"success": False, "message": "未找到评论发送按钮"}
+         except Exception as exc:
+             return {"success": False, "message": str(exc)}
+-
++
+     def verify_comment(self, content: str, episode_number: int = 0, screenshot_dir: str = "") -> Dict[str, Any]:
+         screenshot_path = ""
+         try:
+@@ -2425,7 +2514,7 @@ class HongguoOperations:
+             self._close_comment_panel()
+             if episode_number and not self._login_prompt_visible():
+                 self.ensure_playback_page(episode_number)
+-
++
+     def take_screenshot(self, tag: str, screenshot_dir: str) -> str:
+         ts = int(time.time() * 1000)
+         safe_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", tag).strip("_") or "screen"
+@@ -2653,10 +2742,10 @@ class HongguoOperations:
+             for text in ["关闭", "跳过", "取消", "暂不加入", "以后再说", "我知道了", "同意"]:
+                 el = self.d(text=text) if text == "关闭" else self.d(textContains=text)
+                 if self._exists(el, 0.5):
+-                    el.click()
+-                    time.sleep(1)
+-                    clicked = True
+-                    break
++                    el.click()
++                    time.sleep(1)
++                    clicked = True
++                    break
+             if not clicked:
+                 break
+         if self._anr_dialog_visible():
+@@ -2707,18 +2796,18 @@ class HongguoOperations:
+             if "没有响应" not in xml and "isn't responding" not in xml:
+                 break
+         return True
+-
++
+     def _wait_app_ready(self, timeout: float = 30) -> bool:
+         deadline = time.time() + timeout
+-        ready_markers = [
+-            "首页",
+-            "剧场",
+-            "我的",
+-            "全屏观看",
+-            "合集",
+-            "搜索",
+-            "红果号",
+-        ]
++        ready_markers = [
++            "首页",
++            "剧场",
++            "我的",
++            "全屏观看",
++            "合集",
++            "搜索",
++            "红果号",
++        ]
+         while time.time() < deadline:
+             try:
+                 current = self._safe_app_current()
+@@ -2878,7 +2967,7 @@ class HongguoOperations:
+             call_with_timeout(lambda: self.d.shell(f"am force-stop {APP_PACKAGE}"), 5, "am force-stop")
+         except Exception:
+             pass
+-
++
+     def _open_theater(self) -> None:
+         for _ in range(3):
+             xml = self._xml()
+@@ -2909,8 +2998,8 @@ class HongguoOperations:
+             self.d(resourceId="com.phoenix.read:id/hds"),
+             self.d(textContains="搜索"),
+             self.d(descriptionContains="搜索"),
+-        )
+-        for selector in selectors:
++        )
++        for selector in selectors:
+             if self._exists(selector, 1):
+                 selector.click()
+                 return True
+@@ -2925,17 +3014,17 @@ class HongguoOperations:
+             if self._exists(self.d(className="android.widget.EditText"), 2):
+                 return True
+         return False
+-
+-    def _click_first_search_suggestion(self) -> bool:
+-        xml = self._xml()
+-        if "即将上线" not in xml and "万热度" not in xml and "播放" not in xml:
+-            return False
+-        # The first playable suggestion sits below the search bar. Avoid the second row, which
+-        # often represents a reserved/upcoming season.
+-        self.d.click(int(self.width * 0.38), int(self.height * 0.105))
+-        time.sleep(1)
+-        return True
+-
++
++    def _click_first_search_suggestion(self) -> bool:
++        xml = self._xml()
++        if "即将上线" not in xml and "万热度" not in xml and "播放" not in xml:
++            return False
++        # The first playable suggestion sits below the search bar. Avoid the second row, which
++        # often represents a reserved/upcoming season.
++        self.d.click(int(self.width * 0.38), int(self.height * 0.105))
++        time.sleep(1)
++        return True
++
+     def _current_playing_title(self, xml: Optional[str] = None) -> str:
+         xml = xml if xml is not None else self._xml()
+         for pattern in [
+@@ -2945,7 +3034,7 @@ class HongguoOperations:
+             if match:
+                 return match.group(1).strip("《》 ")
+         return ""
+-
++
+     def _click_first_play_button(self) -> bool:
+         for text in ["立即观看", "开始播放", "播放全部", "看全集"]:
+             for el in (self.d(text=text), self.d(textContains=text)):
+@@ -2970,7 +3059,7 @@ class HongguoOperations:
+                     el.click()
+                     return True
+         return False
+-
++
+     def _click_episode_number(self, episode_number: int) -> bool:
+         current_episode = self.get_current_episode()
+         self._click_episode_range_tab(episode_number)
+@@ -3705,24 +3794,24 @@ class HongguoOperations:
+         if re.fullmatch(r"[\d\s:：/\\.-]+", text):
+             return False
+         skip_words = {
+-            "搜索",
+-            "综合",
+-            "漫剧",
+-            "社区",
+-            "影视",
+-            "小说",
+-            "听书",
+-            "用户",
+-            "热度",
+-            "收藏",
+-            "全屏",
+-            "倍速",
+-            "选集",
+-            "已完结",
+-            "作者声明",
+-            "播放",
+-            "观看",
+-        }
++            "搜索",
++            "综合",
++            "漫剧",
++            "社区",
++            "影视",
++            "小说",
++            "听书",
++            "用户",
++            "热度",
++            "收藏",
++            "全屏",
++            "倍速",
++            "选集",
++            "已完结",
++            "作者声明",
++            "播放",
++            "观看",
++        }
+         if any(word in text for word in skip_words):
+             return False
+         if any(word in text for word in TAG_KEYWORDS) and len(text) <= 8:
+@@ -3730,7 +3819,7 @@ class HongguoOperations:
+         if re.fullmatch(r"[\d.万亿共集热度]+", text):
+             return False
+         return True
+-
++
+     def _xiaoguo_ai_panel_open(self, xml: Optional[str] = None) -> bool:
+         xml = self._xml() if xml is None else xml
+         return "小果AI" in xml and any(marker in xml for marker in ("还想了解什么", "发送"))
+@@ -3759,26 +3848,26 @@ class HongguoOperations:
+         xml = xml if xml is not None else self._xml()
+         markers = ("请输入您的手机号", "获取验证码", "微信登录", "抖音登录")
+         return any(marker in xml for marker in markers)
+-
++
+     def _close_comment_panel(self) -> bool:
+         if not self._comment_panel_open():
+             return False
+         self.d.press("back")
+         time.sleep(1)
+         return True
+-
+-    def _focus_comment_input(self) -> bool:
+-        for hint in ["有趣评论千千万", "说点什么", "写评论", "发条友善"]:
+-            el = self.d(textContains=hint)
+-            if self._exists(el, 2):
+-                el.click()
+-                return True
+-        inp = self.d(className="android.widget.EditText")
+-        if self._exists(inp, 2):
+-            inp.click()
+-            return True
+-        return False
+-
++
++    def _focus_comment_input(self) -> bool:
++        for hint in ["有趣评论千千万", "说点什么", "写评论", "发条友善"]:
++            el = self.d(textContains=hint)
++            if self._exists(el, 2):
++                el.click()
++                return True
++        inp = self.d(className="android.widget.EditText")
++        if self._exists(inp, 2):
++            inp.click()
++            return True
++        return False
++
+     def _clear_input(self, inp: Any) -> None:
+         try:
+             inp.clear_text()
+@@ -3933,8 +4022,8 @@ class HongguoOperations:
+ 
+     def _search_results_visible(self, xml: str = "") -> bool:
+         text = " ".join(self._visible_hongguo_nodes(xml or self._xml()))
+-        tab_hits = sum(1 for marker in ("综合", "短剧", "影视", "用户") if marker in text)
+-        return tab_hits >= 2 and any(marker in text for marker in ("搜索", "剧场", "播放", "热度", "全部"))
++        tab_hits = sum(1 for marker in SEARCH_RESULT_TAB_MARKERS if marker in text)
++        return tab_hits >= 2 and any(marker in text for marker in SEARCH_RESULT_PAGE_HINTS)
+ 
+     def _candidate_results_visible(self, keyword: str, xml: str = "") -> bool:
+         if not keyword:
+@@ -4020,7 +4109,7 @@ class HongguoOperations:
+             return True
+         except Exception:
+             return False
+-
++
+     def _exists(self, el: Any, timeout: float = 3) -> bool:
+         try:
+             # A selector timeout does not bound a wedged uiautomator HTTP call.
+@@ -4031,28 +4120,28 @@ class HongguoOperations:
+                     "element exists",
+                 )
+             )
+-        except TypeError:
+-            start = time.time()
+-            while time.time() - start < timeout:
+-                try:
+-                    if el.exists:
+-                        return True
+-                except Exception:
+-                    return False
+-                time.sleep(0.2)
+-            return False
+-        except Exception:
+-            return False
+-
++        except TypeError:
++            start = time.time()
++            while time.time() - start < timeout:
++                try:
++                    if el.exists:
++                        return True
++                except Exception:
++                    return False
++                time.sleep(0.2)
++            return False
++        except Exception:
++            return False
++
+     def _xml(self) -> str:
+         try:
+             return call_with_timeout(lambda: self.d.dump_hierarchy(), 5, "dump hierarchy")
+         except Exception:
+             return ""
+-
+-    def _sleep(self, lo: float, hi: float) -> None:
+-        time.sleep(random.uniform(lo, hi))
+-
++
++    def _sleep(self, lo: float, hi: float) -> None:
++        time.sleep(random.uniform(lo, hi))
++
+     def _swipe_up(self, distance: float = 0.5) -> None:
+         cx = self.width // 2 + random.randint(-30, 30)
+         start_y = int(self.height * 0.65)
