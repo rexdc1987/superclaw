@@ -6,6 +6,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+try:  # Windows-only project; the guard degrades to a no-op elsewhere.
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised only on non-Windows hosts
+    msvcrt = None
+
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -35,9 +40,51 @@ from models.task import Task
 from services.user_service import UserService
 
 
+_EMBEDDED_LOCK_HANDLE: Optional[object] = None
+
+
+def _embedded_lock_path() -> Path:
+    return Path(__file__).resolve().parents[2] / ".run" / "embedded-api.lock"
+
+
+def acquire_embedded_runtime_lock() -> bool:
+    """Claim a process-lifetime lock so one machine runs one embedded API.
+
+    uvicorn runs lifespan startup *before* it binds the port, so a second
+    instance would otherwise still call ``reconcile_runtime_state()`` and stop
+    the tasks the live instance is actively running. The lock is held by the OS
+    and released automatically when the owning process exits, so a crashed
+    instance never blocks a clean restart.
+    """
+    global _EMBEDDED_LOCK_HANDLE
+    if os.environ.get("SUPERCLAW_EXECUTION_MODE", "embedded").strip().lower() != "embedded":
+        return True
+    if msvcrt is None:  # pragma: no cover - non-Windows fallback
+        return True
+    try:
+        lock_path = _embedded_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+b")
+    except OSError:
+        return True  # never block startup just because the lock file is unusable
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        handle.close()
+        return False
+    _EMBEDDED_LOCK_HANDLE = handle
+    return True
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     validate_security_config()
+    if not acquire_embedded_runtime_lock():
+        raise RuntimeError(
+            "本机已有另一个嵌入式 SuperClaw API 实例在运行。"
+            "请先停止它再启动本服务，否则新实例会在启动时误停正在执行的任务。"
+        )
     init_db()
     reconcile_runtime_state()
     yield

@@ -61,3 +61,19 @@ def in_memory_db(monkeypatch):
 
     yield engine
     Base.metadata.drop_all(engine)
+
+
+@pytest.fixture(autouse=True)
+def isolated_embedded_lock(tmp_path, monkeypatch):
+    """Keep the embedded-API singleton guard away from the real .run lock file.
+
+    Without this, any test building ``TestClient(api.main.app)`` would take the
+    process-lifetime lock and occupy it for the rest of the test session.
+    """
+    import api.main as main_module
+
+    monkeypatch.setattr(
+        main_module, "_embedded_lock_path", lambda: tmp_path / "embedded-api.lock"
+    )
+    monkeypatch.setattr(main_module, "_EMBEDDED_LOCK_HANDLE", None)
+    yield

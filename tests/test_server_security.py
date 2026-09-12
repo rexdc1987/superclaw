@@ -186,3 +186,52 @@ def test_screenshot_proxy_rejects_paths_outside_root(tmp_path, monkeypatch):
             params={"path": str(outside)},
         )
     assert response.status_code == 403
+
+
+def test_embedded_runtime_lock_blocks_a_second_instance(monkeypatch):
+    import api.main as main_module
+
+    monkeypatch.setenv("SUPERCLAW_EXECUTION_MODE", "embedded")
+    assert main_module.acquire_embedded_runtime_lock() is True
+    # A second instance opens its own handle and must be refused.
+    assert main_module.acquire_embedded_runtime_lock() is False
+
+
+def test_embedded_runtime_lock_is_released_when_the_owner_exits(monkeypatch):
+    import api.main as main_module
+
+    monkeypatch.setenv("SUPERCLAW_EXECUTION_MODE", "embedded")
+    assert main_module.acquire_embedded_runtime_lock() is True
+    main_module._EMBEDDED_LOCK_HANDLE.close()  # the owning process exits
+    main_module._EMBEDDED_LOCK_HANDLE = None
+    assert main_module.acquire_embedded_runtime_lock() is True
+
+
+def test_embedded_runtime_lock_is_skipped_outside_embedded_mode(monkeypatch):
+    import api.main as main_module
+
+    monkeypatch.setenv("SUPERCLAW_EXECUTION_MODE", "api")
+    assert main_module.acquire_embedded_runtime_lock() is True
+
+
+def test_lifespan_refuses_start_without_running_reconcile(monkeypatch):
+    """A second instance must fail before reconcile can stop live tasks."""
+    import asyncio
+
+    import api.main as main_module
+
+    monkeypatch.setattr(main_module, "validate_security_config", lambda: None)
+    monkeypatch.setattr(main_module, "init_db", lambda: None)
+    monkeypatch.setattr(main_module, "acquire_embedded_runtime_lock", lambda: False)
+    reconciled = []
+    monkeypatch.setattr(
+        main_module, "reconcile_runtime_state", lambda: reconciled.append(True)
+    )
+
+    async def enter_lifespan():
+        async with main_module.lifespan(None):
+            pass
+
+    with pytest.raises(RuntimeError, match="已有另一个嵌入式"):
+        asyncio.run(enter_lifespan())
+    assert reconciled == []
