@@ -31,9 +31,6 @@ powershell -ExecutionPolicy Bypass -File .\deploy-kit\deploy_superclaw.ps1 -Targ
 > 这两个值**刻意不写在仓库任何文件里**，由每个部署者自行提供 ——
 > 这样仓库即使公开，也不会泄露你的服务器位置和凭据。
 
-> **数据库密码去哪拿**：向部署发起人索取。密码不写在任何仓库文件里，
-> 每个部署者自行提供 —— 这样仓库即使公开也不会泄密。
-
 ---
 
 ## 一、部署包里有什么
@@ -195,19 +192,19 @@ D:\superclaw\start_superclaw.bat
 ### 步骤 1 — 克隆仓库
 
 ```bat
-git clone --branch codex/hongguo-server-ready https://github.com/rexdc1987/superclaw.git D:\superclaw
+git clone --branch codex/hongguo-deploy-kit https://github.com/rexdc1987/superclaw.git D:\superclaw
 cd /d D:\superclaw
 ```
 
 > ⚠️ **坑 1：分支名带斜杠，克隆后可能没有本地分支**
-> `--branch codex/hongguo-server-ready` 在部分 git 版本下不会生成 `refs/heads/codex/...`，
+> `--branch codex/hongguo-deploy-kit` 在部分 git 版本下不会生成 `refs/heads/codex/...`，
 > 结果 `git log` 报 `does not have any commits yet`。修复：
 > ```bat
-> git fetch origin codex/hongguo-server-ready
-> git rev-parse origin/codex/hongguo-server-ready
+> git fetch origin codex/hongguo-deploy-kit
+> git rev-parse origin/codex/hongguo-deploy-kit
 > REM 把上面输出的 sha 写进本地 ref（注意目录要一层层建）：
 > mkdir .git\refs\heads\codex
-> echo <上一步的sha> > .git\refs\heads\codex\hongguo-server-ready
+> echo <上一步的sha> > .git\refs\heads\codex\hongguo-deploy-kit
 > git log --oneline -1
 > ```
 
@@ -357,7 +354,7 @@ curl.exe -s --noproxy "*" http://127.0.0.1:8987/health
 
 | # | 现象 | 根因 | 规避 |
 | --- | --- | --- | --- |
-| 1 | `git log` 报 `does not have any commits yet` | 分支名含 `/`，`clone --branch` 未生成本地 ref | 手动写 `.git/refs/heads/codex/hongguo-server-ready` |
+| 1 | `git log` 报 `does not have any commits yet` | 分支名含 `/`，`clone --branch` 未生成本地 ref | 手动写 `.git/refs/heads/codex/hongguo-deploy-kit` |
 | 2 | pip/npm 装到一半失败，包残缺 | WorkBuddy 沙箱注入的 `safe-delete` 拦截器把临时文件清理误判为批量删除 | 设 `CODEBUDDY_SAFE_DELETE_ENABLED=0` |
 | 3 | `pip install -e .` 报 `Cannot import 'setuptools.backends._legacy'` | setuptools ≥84 已移除该模块（分支自身 bug） | 改 `pyproject.toml` 为 `setuptools.build_meta`；**或干脆不做可编辑安装** |
 | 4 | 服务启动后命令一结束就没了 | 沙箱会回收它拉起的后台进程（`nohup`/`&`/`Start-Process` 都会被回收，`schtasks` 被列入黑名单） | 用 `.bat` 在用户自己的会话里启动 |
@@ -477,8 +474,8 @@ setuptools ≥84 已移除 `setuptools.backends._legacy`：
 | 项 | 值 |
 | --- | --- |
 | 仓库 | `https://github.com/rexdc1987/superclaw.git` |
-| 分支 | `codex/hongguo-server-ready` |
-| 提交 | `d48182f` |
+| 部署分支 | `codex/hongguo-deploy-kit` |
+| 手册对应提交 | `e4a5f21` |
 | 数据库 | 地址由部署发起人提供（库名/用户名均为 `superclaw`，端口 `3306`） |
 | API 端口 | `8987`（监听 `0.0.0.0`） |
 | 前端端口 | `3000`（Vite，`/api` 代理到 `127.0.0.1:8987`） |
