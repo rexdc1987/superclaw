@@ -1628,8 +1628,62 @@ class TestHongguoPlaybackHeuristics:
                 result = ops._submit_search("丧尸狂潮")
 
         assert result["success"] is True
-        assert result["action"] == "tap_search_button"
-        ops.d.click.assert_called_once_with(669, 53)
+        # On a 720x1280 screen the measured submit button spans y=76..124, so
+        # the fallback must hit the y ratio 0.078 row (y=99) first instead of
+        # the legacy 0.042 row (y=53), which lands above the button.
+        assert result["action"] == "tap_search_button_y0.078"
+        ops.d.click.assert_called_once_with(655, 99)
+
+    def test_search_submit_points_prefers_measured_header_button(self):
+        xml = (
+            '<hierarchy><node package="com.phoenix.read" text="\u641c\u7d22" '
+            'resource-id="com.phoenix.read:id/hj_" clickable="true" '
+            'visible-to-user="true" bounds="[624,76][688,124]" /></hierarchy>'
+        )
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 720, 1280
+        ops.d = MagicMock()
+
+        points = ops._search_submit_points(xml)
+
+        assert points == [(656, 100)]
+
+    def test_search_submit_points_drops_hidden_lower_and_foreign_nodes(self):
+        xml = (
+            '<hierarchy>'
+            '<node package="com.phoenix.read" text="\u641c\u7d22" visible-to-user="false" '
+            'bounds="[624,76][688,124]" />'
+            '<node package="com.phoenix.read" text="\u641c\u7d22" visible-to-user="true" '
+            'bounds="[600,900][700,980]" />'
+            '<node package="com.other.app" text="\u641c\u7d22" visible-to-user="true" '
+            'bounds="[624,76][688,124]" />'
+            '<node package="com.phoenix.read" text="\u641c\u7d22" visible-to-user="true" '
+            'bounds="[48,76][112,124]" />'
+            '</hierarchy>'
+        )
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 720, 1280
+        ops.d = MagicMock()
+
+        points = ops._search_submit_points(xml)
+
+        # Hidden nodes, other packages and the lower band are dropped. The
+        # remaining top-left node is still returned so a shifted button can be
+        # retried instead of the submit giving up with "button not found".
+        assert points == [(80, 100)]
+
+    def test_click_visible_search_button_accepts_shifted_top_band_node(self):
+        xml = (
+            '<hierarchy><node package="com.phoenix.read" text="\u641c\u7d22" '
+            'visible-to-user="true" bounds="[48,76][112,124]" /></hierarchy>'
+        )
+        ops = HongguoOperations(object())
+        ops.width, ops.height = 720, 1280
+        ops.d = MagicMock()
+        with patch.object(ops, "_xml", return_value=xml):
+            ops._click_visible_search_button()
+
+        ops.d.click.assert_called_once_with(80, 100)
 
     def test_wait_search_results_tolerates_transient_foreground_misses(self):
         ops = HongguoOperations(object())
@@ -6796,6 +6850,22 @@ def test_hongguo_task_payload_defaults_enable_random_engagements():
 
     with pytest.raises(ValueError):
         TaskBase(drama_name="胭脂念念不忘", random_favorite_count=2)
+
+
+def test_guess_emulator_name_recognizes_mumu_localhost_adb_ports():
+    from rpa.hongguo.operations import HongguoOperations
+
+    ops = HongguoOperations.__new__(HongguoOperations)
+
+    assert ops._guess_emulator_name("127.0.0.1:16416", "23127PN0CC", "houji", "Xiaomi") == "MuMu 模拟器"
+    assert ops._guess_emulator_name("localhost:16512", "Redmi", "k70", "Xiaomi") == "MuMu 模拟器"
+    assert ops._guess_emulator_name("emulator-5556", "Redmi", "k70", "Xiaomi") == "MuMu 模拟器"
+    assert ops._guess_emulator_name("127.0.0.1:5555", "LDPlayer", "ld", "ld") == "雷电模拟器"
+    assert (
+        ops._guess_emulator_name("192.168.1.20:5555", "23127PN0CC", "houji", "Xiaomi")
+        == "真机/网络 ADB"
+    )
+    assert ops._guess_emulator_name("127.0.0.1:12345", "unknown", "unknown", "unknown") == "未识别模拟器"
 
 
 # TASK_COMPLETE: phase2_rpa_engine

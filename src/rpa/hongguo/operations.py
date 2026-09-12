@@ -9,7 +9,7 @@ import re
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .device import call_with_timeout, connect_exact, get_screen_size, screenshot
 
@@ -2646,6 +2646,12 @@ class HongguoOperations:
             return "MuMu \u6a21\u62df\u5668"
         if re.match(r"^(?:192\.168\.|10\.|172\.(?:1[6-9]|2\d|3[0-1])\.)", serial):
             return "\u771f\u673a/\u7f51\u7edc ADB"
+        # MuMu 12/15 exposes each VM as 127.0.0.1:(16384 + 32 * index) instead
+        # of the legacy 5555/7555 ports, so match that range before the
+        # generic port heuristics below.
+        local_port = re.match(r"^(?:127\.0\.0\.1|localhost):(\d+)$", serial)
+        if local_port and 16384 <= int(local_port.group(1)) <= 16768:
+            return "MuMu \u6a21\u62df\u5668"
         if "mumu" in text or "netease" in text:
             return "MuMu \u6a21\u62df\u5668"
         if "leidian" in text or "ldplayer" in text:
@@ -3860,15 +3866,38 @@ class HongguoOperations:
 
     def _submit_search(self, keyword: str) -> Dict[str, Any]:
         actions = []
-        for action_name, action in (
+        submit_actions: List[Tuple[str, Any]] = [
             ("click_search_button", self._click_visible_search_button),
-            ("tap_search_button", lambda: self.d.click(int(self.width * 0.93), int(self.height * 0.042))),
-            ("press_enter", lambda: self.d.press("enter")),
-            ("keyevent_enter", lambda: self.d.shell("input keyevent 66")),
-            ("press_search", lambda: self.d.press("search")),
-            ("keyevent_search", lambda: self.d.shell("input keyevent 84")),
-            ("tap_search_icon", lambda: self.d.click(int(self.width * 0.9), int(self.height * 0.042))),
-        ):
+        ]
+        # The in-page submit button drifts with the app build and shifts again
+        # once the keyboard or the suggestion sheet opens, so retry every
+        # position the hierarchy actually exposes and only then fall back to
+        # fixed ratios. A single hard-coded ratio (previously y=0.042*height,
+        # i.e. y=53 on a 720x1280 screen) landed above the real button centre
+        # near y=100, so one miss left every remaining retry on the same wrong
+        # row and the whole submit ran out of attempts.
+        for point_index, point in enumerate(self._search_submit_points()[1:], start=1):
+            submit_actions.append(
+                (f"tap_search_button_{point_index}", lambda point=point: self.d.click(*point))
+            )
+        for y_ratio in (0.078, 0.042, 0.10):
+            submit_actions.append(
+                (
+                    f"tap_search_button_y{y_ratio:g}",
+                    lambda y_ratio=y_ratio: self.d.click(
+                        int(self.width * 0.91), int(self.height * y_ratio)
+                    ),
+                )
+            )
+        submit_actions.extend(
+            [
+                ("press_enter", lambda: self.d.press("enter")),
+                ("keyevent_enter", lambda: self.d.shell("input keyevent 66")),
+                ("press_search", lambda: self.d.press("search")),
+                ("keyevent_search", lambda: self.d.shell("input keyevent 84")),
+            ]
+        )
+        for action_name, action in submit_actions:
             try:
                 action()
                 actions.append(action_name)
@@ -3974,24 +4003,49 @@ class HongguoOperations:
                 break
         return has_input and has_top_search_button
 
-    def _click_visible_search_button(self) -> None:
-        xml = self._xml()
-        for node in re.findall(r"<node\b[^>]+>", xml):
-            if (
-                'package="com.phoenix.read"' not in node
-                or 'visible-to-user="false"' in node
-                or 'text="搜索"' not in node
-            ):
+    def _search_submit_points(self, xml: str = "") -> List[Tuple[int, int]]:
+        """Return tappable points of the in-page "搜索" submit button.
+
+        The button is pinned to the top right of the search box, but its exact
+        offsets move between app builds and shift again once the keyboard or
+        the suggestion sheet opens. Return the preferred top-right point first
+        and any other visible 搜索 node after it, so callers can retry on a
+        different position instead of giving up when one fixed spot misses.
+        """
+        text = xml or self._xml()
+        if not isinstance(text, str) or not text:
+            return []
+        points: List[Tuple[int, int]] = []
+        for node in re.findall(r"<node\b[^>]+>", text):
+            if 'package="com.phoenix.read"' not in node:
+                continue
+            if 'visible-to-user="false"' in node:
+                continue
+            if 'text="搜索"' not in node and 'content-desc="搜索"' not in node:
                 continue
             bounds_match = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
             if not bounds_match:
                 continue
             left, top, right, bottom = (int(value) for value in bounds_match.groups())
-            if left < self.width * 0.65 or bottom > self.height * 0.18:
+            if right <= left or bottom <= top:
                 continue
-            self.d.click((left + right) // 2, (top + bottom) // 2)
-            return
-        raise RuntimeError("未找到右上角搜索按钮")
+            # Keep the top band only: lower hits are keyboard rows or result
+            # entries that must never be tapped as the submit button.
+            if top > self.height * 0.3:
+                continue
+            points.append(((left + right) // 2, (top + bottom) // 2))
+        preferred = [
+            point
+            for point in points
+            if point[0] >= self.width * 0.65 and point[1] <= self.height * 0.18
+        ]
+        return preferred + [point for point in points if point not in preferred]
+
+    def _click_visible_search_button(self) -> None:
+        points = self._search_submit_points()
+        if not points:
+            raise RuntimeError("未找到右上角搜索按钮")
+        self.d.click(*points[0])
 
     def _type_text(self, text: str) -> None:
         value = str(text or "")
