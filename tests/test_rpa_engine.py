@@ -6911,6 +6911,157 @@ def test_episode_probe_due_probes_early_once_then_keeps_slow_cadence():
     assert probe(1000.0, 1015.0, 1060.0) is True
 
 
+def test_reopen_target_episode_reuses_open_search_page_without_cold_reset():
+    """关掉直播页后落到 SearchActivity：复用现成搜索页，跳过冷重置重搜。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._reset_search_context = MagicMock(return_value=True)
+    engine._wait_for_episode_verified = MagicMock(return_value=True)
+    ops = MagicMock()
+    ops._live_lite_activity_active.return_value = False
+    ops._is_app_foreground.return_value = True
+    ops._still_on_search_selection_page.return_value = True
+    ops.input_search_keyword.return_value = {"success": True, "message": "关键词已填入"}
+    ops.submit_search.return_value = {"success": True, "message": "搜索完成"}
+    ops._extract_drama_titles.return_value = ["胭脂如梦如雨如尘2"]
+    ops._choose_title.return_value = "胭脂如梦如雨如尘2"
+    ops.select_drama.return_value = {"success": True}
+    ops.play_episode.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._reopen_target_episode(
+            ops,
+            {"drama_name": "胭脂如梦如雨如尘2", "playback_speed": "1.0x"},
+            21,
+            48,
+        ) is True
+
+    engine._reset_search_context.assert_not_called()
+    ops.open_search_page.assert_not_called()
+    ops.input_search_keyword.assert_called_once_with("胭脂如梦如雨如尘2")
+    ops.play_episode.assert_called_once_with(21)
+
+
+def test_reopen_target_episode_cold_resets_when_search_page_is_gone():
+    """不在搜索页时仍走原来的冷重置 + 重新进搜索框。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._reset_search_context = MagicMock(return_value=True)
+    engine._wait_for_episode_verified = MagicMock(return_value=True)
+    ops = MagicMock()
+    ops._live_lite_activity_active.return_value = False
+    ops._is_app_foreground.return_value = True
+    ops._still_on_search_selection_page.return_value = False
+    ops.open_search_page.return_value = {"success": True, "message": "已进入搜索框"}
+    ops.input_search_keyword.return_value = {"success": True, "message": "关键词已填入"}
+    ops.submit_search.return_value = {"success": True, "message": "搜索完成"}
+    ops._extract_drama_titles.return_value = ["胭脂如梦如雨如尘2"]
+    ops._choose_title.return_value = "胭脂如梦如雨如尘2"
+    ops.select_drama.return_value = {"success": True}
+    ops.play_episode.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._reopen_target_episode(
+            ops,
+            {"drama_name": "胭脂如梦如雨如尘2", "playback_speed": "1.0x"},
+            21,
+            48,
+        ) is True
+
+    engine._reset_search_context.assert_called_once()
+    ops.open_search_page.assert_called_once_with("胭脂如梦如雨如尘2")
+
+
+def test_reopen_target_episode_falls_back_to_cold_reset_when_reused_input_fails():
+    """复用搜索页但填词失败时，必须退回复用前的冷重置流程，不能直接放弃。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._reset_search_context = MagicMock(return_value=True)
+    engine._wait_for_episode_verified = MagicMock(return_value=True)
+    ops = MagicMock()
+    ops._live_lite_activity_active.return_value = False
+    ops._is_app_foreground.return_value = True
+    ops._still_on_search_selection_page.return_value = True
+    ops.open_search_page.return_value = {"success": True, "message": "已进入搜索框"}
+    ops.input_search_keyword.side_effect = [
+        {"success": False, "message": "搜索框关键词不一致"},
+        {"success": True, "message": "关键词已填入"},
+    ]
+    ops.submit_search.return_value = {"success": True, "message": "搜索完成"}
+    ops._extract_drama_titles.return_value = ["胭脂如梦如雨如尘2"]
+    ops._choose_title.return_value = "胭脂如梦如雨如尘2"
+    ops.select_drama.return_value = {"success": True}
+    ops.play_episode.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._reopen_target_episode(
+            ops,
+            {"drama_name": "胭脂如梦如雨如尘2", "playback_speed": "1.0x"},
+            21,
+            48,
+        ) is True
+
+    engine._reset_search_context.assert_called_once()
+    ops.open_search_page.assert_called_once_with("胭脂如梦如雨如尘2")
+    assert ops.input_search_keyword.call_count == 2
+
+
+def test_return_to_playback_page_confirms_target_after_single_back():
+    """直播页浮层关掉后落在非播放页：一次返回键回到播放页且正好在目标集。"""
+    from rpa.hongguo.engine import SHORT_SERIES_ACTIVITY, TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._has_playback_context = MagicMock(return_value=True)
+    engine._total_mismatch_is_fatal = MagicMock(return_value=False)
+    engine._pause_pending_action_episode = MagicMock(return_value=True)
+    engine._page_state = MagicMock(
+        return_value={
+            "app": {"activity": SHORT_SERIES_ACTIVITY},
+            "current_episode": 21,
+            "total_episodes": 48,
+        }
+    )
+    ops = MagicMock()
+    ops.press_back.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._return_to_playback_page(ops, {"drama_name": "x"}, 21, 48) is True
+
+    ops.press_back.assert_called_once_with()
+    engine._pause_pending_action_episode.assert_called_once()
+
+
+def test_return_to_playback_page_gives_up_when_back_lands_on_search_page():
+    """返回键没能回到播放页时必须放弃，交给上层走完整恢复，不得误判成功。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._has_playback_context = MagicMock(return_value=True)
+    engine._recover_live_lite_next_episode_locally = MagicMock(return_value=True)
+    engine._page_state = MagicMock(
+        return_value={
+            "app": {"activity": "com.dragon.read.component.biz.impl.SearchActivity"},
+            "current_episode": 0,
+            "total_episodes": 0,
+        }
+    )
+    ops = MagicMock()
+    ops.press_back.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._return_to_playback_page(ops, {"drama_name": "x"}, 21, 48) is False
+
+    engine._recover_live_lite_next_episode_locally.assert_not_called()
+
+
 # TASK_COMPLETE: phase2_rpa_engine
 
 

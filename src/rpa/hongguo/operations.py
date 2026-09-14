@@ -1819,6 +1819,21 @@ class HongguoOperations:
         except Exception:
             return False
 
+    def press_back(self) -> bool:
+        """Send a single back key press to leave an accidental overlay page.
+
+        Closing the in-feed LiveLite ad can drop the app on SearchActivity
+        instead of the player. One back press is far cheaper than a cold reset
+        plus a full re-search, so expose it as a first-class action.
+        """
+        try:
+            self.d.press("back")
+            self._sleep(1.0, 1.8)
+            return True
+        except Exception as exc:
+            logger.warning("Hongguo press back failed: %s", exc)
+            return False
+
     def _live_lite_activity_active(self) -> bool:
         current = self._safe_app_current()
         return current.get("package") == APP_PACKAGE and current.get("activity") == LIVE_LITE_ACTIVITY

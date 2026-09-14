@@ -1702,6 +1702,8 @@ class TaskEngine:
                                 f"全流程v3: 关闭红果内部直播页后未回到短剧播放页，"
                                 f"当前 activity={restored_activity or '-'}",
                             )
+                            if self._return_to_playback_page(ops, task, target, expected_total):
+                                return True
                 total = int(state.get("total_episodes") or 0)
                 if self._recover_to_verified_episode(
                     ops,
@@ -2057,6 +2059,73 @@ class TaskEngine:
         )
         return paused
 
+    def _return_to_playback_page(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        target: int,
+        expected_total: int,
+    ) -> bool:
+        """Back out of an accidental overlay page and resume the local flow.
+
+        Closing the in-feed LiveLite ad often drops the app on SearchActivity.
+        A single back press returns to the player far cheaper than a cold reset
+        plus a full re-search, so try it before falling back to that.
+        """
+        press_back = getattr(ops, "press_back", None)
+        if not callable(press_back):
+            return False
+        pressed = bool(press_back())
+        self._log(
+            "info" if pressed else "warn",
+            f"全流程v3: 尝试按一次返回键离开当前页面以回到播放页={pressed}",
+        )
+        if not pressed:
+            return False
+
+        state = self._page_state(ops, task)
+        app = state.get("app") or {}
+        activity = str(app.get("activity") or "")
+        if activity != SHORT_SERIES_ACTIVITY or not self._has_playback_context(state):
+            time.sleep(1.5)
+            state = self._page_state(ops, task)
+            app = state.get("app") or {}
+            activity = str(app.get("activity") or "")
+            if activity != SHORT_SERIES_ACTIVITY or not self._has_playback_context(state):
+                self._log(
+                    "warn",
+                    f"全流程v3: 返回键未回到短剧播放页，当前 activity={activity or '-'}",
+                )
+                return False
+
+        current = int(state.get("current_episode") or 0)
+        total = int(state.get("total_episodes") or 0)
+        if self._total_mismatch_is_fatal(
+            ops,
+            task,
+            state,
+            expected_total,
+            total,
+            current=current,
+            target=target,
+        ):
+            self._log(
+                "warn",
+                f"全流程v3: 返回键回到播放页但检测到错误合集，期望{expected_total}集，实际{total}集",
+            )
+            return False
+        if current == target:
+            self._pause_pending_action_episode(ops, task, target, state)
+            self._log("info", f"全流程v3: 返回键回到播放页且已进入第{target}集")
+            return True
+        if self._recover_live_lite_next_episode_locally(ops, task, target, expected_total):
+            return True
+        self._log(
+            "warn",
+            f"全流程v3: 返回键回到播放页（第{current or 0}集）但无法切换到第{target}集",
+        )
+        return False
+
     def _recover_live_lite_next_episode_locally(
         self,
         ops: HongguoOperations,
@@ -2256,11 +2325,27 @@ class TaskEngine:
                 self._log("info" if foreground else "warn", f"全流程v3: 重新搜索前拉回红果前台={foreground}")
                 if not foreground:
                     return False
-            if not self._reset_search_context(ops, f"恢复第{target}集"):
-                return False
-            opened = ops.open_search_page(keyword)
-            self._log("info" if opened.get("success") else "warn", opened.get("message") or "重新进入搜索框")
-            if not opened.get("success"):
+            reuse_flags = {"reused": False}
+
+            def _enter_search_entry(force_reset: bool = False) -> bool:
+                if not force_reset:
+                    on_search = getattr(ops, "_still_on_search_selection_page", None)
+                    try:
+                        if callable(on_search) and on_search() is True:
+                            reuse_flags["reused"] = True
+                            self._log(
+                                "info",
+                                f"全流程v3: 已在搜索/选剧页，复用现有页面恢复第{target}集（跳过冷重置）",
+                            )
+                            return True
+                    except Exception as exc:
+                        self._log("warn", f"全流程v3: 复用搜索页探测异常: {exc}")
+                if not self._reset_search_context(ops, f"恢复第{target}集"):
+                    return False
+                opened = ops.open_search_page(keyword)
+                self._log("info" if opened.get("success") else "warn", opened.get("message") or "重新进入搜索框")
+                if opened.get("success"):
+                    return True
                 open_main = getattr(ops, "_open_main_activity", None)
                 opened_main = bool(open_main()) if callable(open_main) else False
                 self._log(
@@ -2275,9 +2360,16 @@ class TaskEngine:
                     "info" if opened.get("success") else "warn",
                     opened.get("message") or "强制回主页面后重新进入搜索框",
                 )
-                if not opened.get("success"):
-                    return False
+                return bool(opened.get("success"))
+
+            if not _enter_search_entry():
+                return False
             input_result = ops.input_search_keyword(keyword)
+            if not input_result.get("success") and reuse_flags["reused"]:
+                self._log("warn", "全流程v3: 复用搜索页填入关键词失败，回退为冷重置后重新搜索")
+                if not _enter_search_entry(force_reset=True):
+                    return False
+                input_result = ops.input_search_keyword(keyword)
             if not input_result.get("success"):
                 self._log("warn", input_result.get("message") or "重新填入关键词失败")
                 return False
