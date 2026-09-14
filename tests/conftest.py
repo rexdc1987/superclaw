@@ -69,6 +69,13 @@ def isolated_embedded_lock(tmp_path, monkeypatch):
 
     Without this, any test building ``TestClient(api.main.app)`` would take the
     process-lifetime lock and occupy it for the rest of the test session.
+
+    Bypassing the lock is only half the job: with it out of the way the startup
+    lifespan would also run ``reconcile_runtime_state()``, which stops every
+    ``running`` task owned by this machine's worker id and deletes its device
+    leases. Because the test process reports the same hostname as the live API,
+    running the suite while a batch is in flight silently kills it - it did, on
+    2026-09-14 (tasks 362-365). Neutralise reconcile for the whole session.
     """
     import api.main as main_module
 
@@ -76,4 +83,9 @@ def isolated_embedded_lock(tmp_path, monkeypatch):
         main_module, "_embedded_lock_path", lambda: tmp_path / "embedded-api.lock"
     )
     monkeypatch.setattr(main_module, "_EMBEDDED_LOCK_HANDLE", None)
+    monkeypatch.setattr(
+        main_module,
+        "reconcile_runtime_state",
+        lambda: {"stopped_tasks": 0, "released_leases": 0},
+    )
     yield
