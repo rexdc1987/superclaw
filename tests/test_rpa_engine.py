@@ -4957,6 +4957,8 @@ class TestHongguoEngineWaits:
         assert result["total_episodes"] == 40
 
     def test_reopen_target_episode_closes_live_lite_before_opening_search(self):
+        from rpa.hongguo.engine import COLD_RESET_ATTEMPTS
+
         engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
         engine._log = MagicMock()
         events = []
@@ -4979,7 +4981,9 @@ class TestHongguoEngineWaits:
             ) is False
 
         assert events == ["detect_live", "close_live"]
-        ops._stop_app.assert_called_once()
+        # A failed cold reset is retried once, and every attempt stops the app
+        # before reopening it (see COLD_RESET_ATTEMPTS in the engine).
+        assert ops._stop_app.call_count == COLD_RESET_ATTEMPTS
         ops.open_search_page.assert_not_called()
 
     def test_recover_to_verified_episode_skips_duplicate_retry_for_wrong_collection(self):
@@ -7060,6 +7064,124 @@ def test_return_to_playback_page_gives_up_when_back_lands_on_search_page():
         assert engine._return_to_playback_page(ops, {"drama_name": "x"}, 21, 48) is False
 
     engine._recover_live_lite_next_episode_locally.assert_not_called()
+
+
+def test_am_start_main_activity_rebuilds_session_once_after_shell_timeout():
+    """A timed-out `am start` must rebuild the session and retry, not give up."""
+    from rpa.hongguo.device import DeviceCallTimeout
+    from rpa.hongguo.operations import HongguoOperations
+
+    ops = HongguoOperations(object())
+    ops.d = MagicMock()
+    attempts = []
+
+    def fake_call(func, timeout, label="device call"):
+        attempts.append(label)
+        if len(attempts) == 1:
+            raise DeviceCallTimeout("open hongguo main activity timed out after 5s")
+        return func()
+
+    with patch("rpa.hongguo.operations.call_with_timeout", side_effect=fake_call):
+        with patch.object(ops, "_refresh_connection", return_value=True) as refresh:
+            assert ops._am_start_main_activity() is True
+
+    refresh.assert_called_once()
+    assert len(attempts) == 2
+
+
+def test_am_start_main_activity_records_device_fault_when_channel_stays_wedged():
+    """Two consecutive timeouts must leave a diagnosable fault behind."""
+    from rpa.hongguo.device import DeviceCallTimeout
+    from rpa.hongguo.operations import HongguoOperations
+
+    ops = HongguoOperations(object())
+    ops.d = MagicMock()
+
+    with patch(
+        "rpa.hongguo.operations.call_with_timeout",
+        side_effect=DeviceCallTimeout("open hongguo main activity timed out after 5s"),
+    ):
+        with patch.object(ops, "_refresh_connection", return_value=True) as refresh:
+            assert ops._am_start_main_activity() is False
+
+    refresh.assert_called_once()
+    assert "设备调用超时" in ops._last_fault
+
+
+def test_open_main_activity_reports_device_fault_when_main_page_never_appears():
+    from rpa.hongguo.operations import HongguoOperations
+
+    ops = HongguoOperations(object())
+    ops.d = MagicMock()
+
+    with patch.object(ops, "_am_start_main_activity", return_value=True):
+        with patch.object(ops, "_safe_app_current", return_value={"package": "com.phoenix.read"}):
+            with patch.object(ops, "_main_navigation_visible", return_value=False):
+                with patch.object(ops, "_stop_app"):
+                    with patch.object(ops, "_start_app"):
+                        with patch("rpa.hongguo.operations.time.sleep"):
+                            assert ops._open_main_activity() is False
+
+    assert "未出现红果主页面" in ops._last_fault
+
+
+def test_reset_search_context_retries_once_when_cold_reset_reports_false():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops._last_fault = "设备调用超时(broken pipe)"
+    ops._open_main_activity.side_effect = [False, True]
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._reset_search_context(ops, "首次选剧") is True
+
+    assert ops._open_main_activity.call_count == 2
+    assert ops._refresh_connection.called
+    logged = [str(item.args[1]) for item in engine._log.call_args_list]
+    assert any("重试一次" in text for text in logged)
+    assert any(text == "全流程v3: 首次选剧前冷重置红果主页面=True" for text in logged)
+
+
+def test_reset_search_context_surfaces_device_fault_when_retry_also_fails():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops._last_fault = "设备调用超时(broken pipe)"
+    ops._open_main_activity.return_value = False
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._reset_search_context(ops, "首次选剧") is False
+
+    assert ops._open_main_activity.call_count == 2
+    logged = " | ".join(str(item.args[1]) for item in engine._log.call_args_list)
+    assert "设备调用超时(broken pipe)" in logged
+    assert "冷重置红果主页面=False" in logged
+
+
+def test_reset_search_context_ignores_non_string_fault_from_test_doubles():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()  # ops._last_fault is a MagicMock, not a str
+    ops._open_main_activity.return_value = False
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._reset_search_context(ops, "首次选剧") is False
+
+    logged = " | ".join(str(item.args[1]) for item in engine._log.call_args_list)
+    assert "MagicMock" not in logged
+
+
+def test_reset_search_context_skips_retry_when_first_attempt_succeeds():
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops._open_main_activity.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._reset_search_context(ops, "首次选剧") is True
+
+    assert ops._open_main_activity.call_count == 1
+    ops._refresh_connection.assert_not_called()
 
 
 # TASK_COMPLETE: phase2_rpa_engine

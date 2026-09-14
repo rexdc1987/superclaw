@@ -11,7 +11,13 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .device import call_with_timeout, connect_exact, get_screen_size, screenshot
+from .device import (
+    DeviceCallTimeout,
+    call_with_timeout,
+    connect_exact,
+    get_screen_size,
+    screenshot,
+)
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -88,6 +94,9 @@ class HongguoOperations:
     def __init__(self, device: Any):
         self.d = device
         self._ad_swipe_pending = False
+        # Last device-level fault (a shell call timing out, etc.) so callers
+        # can surface the real cause instead of "page not reached".
+        self._last_fault = ""
         # Search results may expose a renamed drama as "原名：旧标题" while
         # the playback page still renders the old title.
         self._search_title_aliases: Dict[str, str] = dict(KNOWN_TITLE_ALIASES)
@@ -777,16 +786,34 @@ class HongguoOperations:
                 time.sleep(1)
         return False
 
+    def _am_start_main_activity(self) -> bool:
+        """Start Hongguo's main activity, rebuilding the session on timeout.
+
+        A wedged shell channel (the ADB forward tunnel is lost after an ADB
+        server restart) makes every shell call hit its timeout while UI reads
+        keep working. Rebuild the device session once instead of reporting the
+        generic "main page not reached".
+        """
+        command = f"am start -n {APP_PACKAGE}/com.dragon.read.pages.main.MainFragmentActivity"
+        for attempt in range(2):
+            try:
+                call_with_timeout(lambda: self.d.shell(command), 5, "open hongguo main activity")
+                return True
+            except DeviceCallTimeout as exc:
+                self._last_fault = f"设备调用超时({exc})"
+                if attempt:
+                    logger.warning("Hongguo am start timed out twice: %s", exc)
+                    return False
+                logger.warning("Hongguo am start timed out; rebuilding device session: %s", exc)
+                self._refresh_connection()
+            except Exception as exc:
+                self._last_fault = f"am start 失败({exc})"
+                return False
+        return False
+
     def _open_main_activity(self) -> bool:
-        try:
-            call_with_timeout(
-                lambda: self.d.shell(
-                    f"am start -n {APP_PACKAGE}/com.dragon.read.pages.main.MainFragmentActivity"
-                ),
-                5,
-                "open hongguo main activity",
-            )
-        except Exception:
+        self._last_fault = ""
+        if not self._am_start_main_activity():
             return False
         time.sleep(2)
         current = self._safe_app_current()
@@ -808,6 +835,7 @@ class HongguoOperations:
             if self._main_navigation_visible(current):
                 return True
             time.sleep(1)
+        self._last_fault = self._last_fault or "冷启动后未出现红果主页面"
         return False
 
     def _main_navigation_visible(self, current: Optional[Dict[str, Any]] = None) -> bool:

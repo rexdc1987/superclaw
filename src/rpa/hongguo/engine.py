@@ -36,6 +36,13 @@ REGULAR_RECOVERY_BUDGET_SECONDS = 90
 UNREADABLE_FIRST_PROBE_SECONDS = 15
 UNREADABLE_PROBE_INTERVAL_SECONDS = 45
 
+# A wedged ADB shell channel made every device call in the cold reset hit
+# its timeout and the task died on the spot (tasks 358-361, 312-314). One
+# cheap retry with a rebuilt session keeps a flaky device from killing a
+# whole multi-device batch.
+COLD_RESET_ATTEMPTS = 2
+COLD_RESET_RETRY_DELAY_SECONDS = 3
+
 
 class TaskEngine:
     """Runs one Hongguo task in a daemon thread."""
@@ -2496,14 +2503,33 @@ class TaskEngine:
         if not callable(open_main):
             self._log("warn", f"全流程v3: {reason}前无法调用红果主页面重置")
             return False
-        try:
-            if callable(stop_app):
-                stop_app()
-                time.sleep(1)
-            opened_main = bool(open_main())
-        except Exception as exc:
-            self._log("warn", f"全流程v3: {reason}前重置红果主页面异常: {exc}")
-            return False
+        opened_main = False
+        for attempt in range(COLD_RESET_ATTEMPTS):
+            try:
+                if callable(stop_app):
+                    stop_app()
+                    time.sleep(1)
+                opened_main = bool(open_main())
+            except Exception as exc:
+                self._log("warn", f"全流程v3: {reason}前重置红果主页面异常: {exc}")
+                opened_main = False
+            if opened_main or attempt + 1 >= COLD_RESET_ATTEMPTS:
+                break
+            fault = getattr(ops, "_last_fault", "")
+            fault = fault.strip() if isinstance(fault, str) else ""
+            self._log(
+                "warn",
+                f"全流程v3: {reason}前冷重置未通过"
+                + (f"（{fault}）" if fault else "")
+                + f"，{COLD_RESET_RETRY_DELAY_SECONDS}秒后重试一次",
+            )
+            refresh = getattr(ops, "_refresh_connection", None)
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception:
+                    pass
+            time.sleep(COLD_RESET_RETRY_DELAY_SECONDS)
         self._log(
             "info" if opened_main else "warn",
             f"全流程v3: {reason}前冷重置红果主页面={opened_main}",
