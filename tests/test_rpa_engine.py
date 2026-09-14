@@ -6868,6 +6868,49 @@ def test_guess_emulator_name_recognizes_mumu_localhost_adb_ports():
     assert ops._guess_emulator_name("127.0.0.1:12345", "unknown", "unknown", "unknown") == "未识别模拟器"
 
 
+def test_ad_continue_markers_cover_countdown_prompt_variant():
+    """红果直播广告会写成「1s后可继续上滑观看短剧」，旧的标记全是「上滑继续…」拼不上。"""
+    from rpa.hongguo.operations import AD_CONTINUE_PROMPT_MARKERS
+
+    for text in (
+        "1s后可继续上滑观看短剧",
+        "2秒后可继续上滑看短剧",
+        "上滑继续看短剧",
+    ):
+        assert any(marker in text for marker in AD_CONTINUE_PROMPT_MARKERS), text
+
+
+def test_skip_ad_reads_second_granularity_countdown_and_shrinks_wait():
+    """倒计时是「1s后」而不是「1秒后」时也要认出来，等待从 15 秒降到 8 秒。"""
+    from rpa.hongguo.operations import HongguoOperations
+
+    ops = HongguoOperations.__new__(HongguoOperations)
+    ops._ad_swipe_pending = False
+    ops._xml = MagicMock(return_value='<x><y text="1s后可继续上滑观看短剧" /></x>')
+    ops._ad_continue_visible = MagicMock(side_effect=[True, True, False])
+    ops._ad_play_overlay_visual_visible = MagicMock(return_value=False)
+    ops._swipe_up_continue_ad = MagicMock()
+    ops.d = MagicMock()
+
+    with patch("rpa.hongguo.operations.time.sleep") as sleep:
+        assert ops.skip_ad_if_present() is True
+
+    assert sleep.call_args_list[0].args[0] == 8
+    assert ops._ad_swipe_pending is True
+    ops._swipe_up_continue_ad.assert_called_once_with()
+
+
+def test_episode_probe_due_probes_early_once_then_keeps_slow_cadence():
+    """集数长时间不可见时先在第 15 秒探一次，之后回到 45 秒节奏（原来首探要等 45 秒）。"""
+    probe = TaskEngine._episode_probe_due
+
+    assert probe(0.0, 0.0, 5000.0) is False
+    assert probe(1000.0, 0.0, 1014.0) is False
+    assert probe(1000.0, 0.0, 1015.0) is True
+    assert probe(1000.0, 1015.0, 1059.0) is False
+    assert probe(1000.0, 1015.0, 1060.0) is True
+
+
 # TASK_COMPLETE: phase2_rpa_engine
 
 

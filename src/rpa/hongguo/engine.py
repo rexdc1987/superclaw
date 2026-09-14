@@ -29,6 +29,12 @@ DEFAULT_SCREENSHOT_ROOT = os.environ.get(
     str((Path(__file__).resolve().parents[3] / "screenshots" / "hongguo").as_posix()),
 )
 REGULAR_RECOVERY_BUDGET_SECONDS = 90
+# A playback page with a hidden episode label used to be probed only after
+# 45s of blind waiting. The live-ad overlay cases in tasks 353-356 sat there
+# for ~60s before the engine gave up and re-searched the whole drama, so probe
+# once early and then keep the slower cadence.
+UNREADABLE_FIRST_PROBE_SECONDS = 15
+UNREADABLE_PROBE_INTERVAL_SECONDS = 45
 
 
 class TaskEngine:
@@ -1732,7 +1738,7 @@ class TaskEngine:
                 now = time.time()
                 if unreadable_since <= 0:
                     unreadable_since = now
-                if now - unreadable_since >= 45 and now - last_episode_probe_at >= 45:
+                if self._episode_probe_due(unreadable_since, last_episode_probe_at, now):
                     confirmed = self._confirm_current_episode(ops, target)
                     last_episode_probe_at = now
                     if confirmed > 0:
@@ -3125,6 +3131,15 @@ class TaskEngine:
             return max(0.5, float(value))
         except (TypeError, ValueError):
             return 1.0
+
+    @staticmethod
+    def _episode_probe_due(unreadable_since: float, last_probe_at: float, now: float) -> bool:
+        """Probe a stuck playback page early once, then back off to the slow cadence."""
+        if unreadable_since <= 0:
+            return False
+        if last_probe_at <= 0:
+            return now - unreadable_since >= UNREADABLE_FIRST_PROBE_SECONDS
+        return now - last_probe_at >= UNREADABLE_PROBE_INTERVAL_SECONDS
 
     def _watch_episode_plan(self, total: int, start_episode: int = 1) -> List[int]:
         total = max(1, int(total or 1))

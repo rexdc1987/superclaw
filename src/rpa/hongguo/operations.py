@@ -32,6 +32,8 @@ AD_CONTINUE_PROMPT_MARKERS = (
     "滑动继续看短剧",
     "滑动继续观看",
     "滑动继续看",
+    "继续上滑观看短剧",
+    "继续上滑看短剧",
 )
 AD_PAGE_MARKERS = (
     "广告",
@@ -1246,7 +1248,7 @@ class HongguoOperations:
         # A fixed delay was too short for ads that start with a 7-second gate.
         raw_xml = self._xml()
         xml = html.unescape(raw_xml) if isinstance(raw_xml, str) else ""
-        countdown = re.search(r"(\d{1,2})\s*\u79d2\s*\u540e", xml)
+        countdown = re.search(r"(\d{1,2})\s*(?:\u79d2|[sS])\s*\u540e", xml)
         ready_wait = max(8, min(16, int(countdown.group(1)) + 1)) if countdown else 15
         time.sleep(ready_wait)
         if not self._ad_continue_visible():
