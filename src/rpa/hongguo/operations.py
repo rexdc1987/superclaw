@@ -331,6 +331,7 @@ class HongguoOperations:
 
     def open_search_page(self, keyword: str = "") -> Dict[str, Any]:
         try:
+            entry_started = time.monotonic()
             self._close_popups()
             if not self._wait_app_foreground():
                 self.bring_to_foreground()
@@ -364,6 +365,13 @@ class HongguoOperations:
                         self._tap_bottom_tab("首页", 0.14)
                     if self._open_search():
                         self._sleep(1.5, 2.5)
+                        logger.info(
+                            "Hongguo search entry: addr=%s round=%d attempt=%d elapsed=%.1fs",
+                            getattr(self.d, "serial", None) or "",
+                            recovery_attempt,
+                            attempt,
+                            time.monotonic() - entry_started,
+                        )
                         return {
                             "success": True,
                             "keyword": keyword,

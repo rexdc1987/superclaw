@@ -2213,8 +2213,22 @@ class TaskEngine:
     ) -> bool:
         self._log("warn", f"全流程v3: 恢复目标第{target}集，原因={reason}")
         regular_deadline = time.monotonic() + REGULAR_RECOVERY_BUDGET_SECONDS
+        # The regular phase can only nudge a player that is already on screen: it
+        # keeps calling ensure_playback_page on whatever page is showing. When
+        # 红果 was pulled back from the launcher it usually resumes on its main
+        # page, so the loop spends the whole budget probing a page that holds no
+        # player and then falls through to the re-search anyway. Detect that up
+        # front and go straight to reopening the drama.
+        regular_viable = self._recovery_page_has_player(ops)
+        if not regular_viable:
+            self._log(
+                "warn",
+                f"全流程v3: 第{target}集恢复时不在播放页，跳过常规恢复直接重新进入短剧",
+            )
         for attempt in range(2):
             self._check_pause_stop()
+            if not regular_viable:
+                break
             if time.monotonic() >= regular_deadline:
                 self._log("warn", f"全流程v3: 常规恢复第{target}集已用尽90秒总预算，转为重新搜索")
                 break
@@ -2256,6 +2270,13 @@ class TaskEngine:
                     self._log("warn", f"全流程v3: 常规恢复第{target}集总预算即将耗尽，转为重新搜索")
                     break
                 time.sleep(2)
+        else:
+            # Falling out of the loop used to reach the re-search silently, which
+            # made a 53s stall look like the task had hung.
+            self._log(
+                "warn",
+                f"全流程v3: 常规恢复第{target}集未成功，转为重新搜索目标短剧",
+            )
 
         if not allow_reopen:
             self._log("warn", f"全流程v3: 常规恢复第{target}集失败，当前上下文禁止重新搜索")
@@ -2347,6 +2368,19 @@ class TaskEngine:
                             return True
                     except Exception as exc:
                         self._log("warn", f"全流程v3: 复用搜索页探测异常: {exc}")
+                    if self._on_warm_hongguo_page(ops):
+                        self._log(
+                            "info",
+                            f"全流程v3: 红果已在主页面（非播放页），复用现有页面恢复第{target}集（跳过冷重置）",
+                        )
+                        opened = ops.open_search_page(keyword)
+                        if opened.get("success"):
+                            reuse_flags["reused"] = True
+                            return True
+                        self._log(
+                            "warn",
+                            f"全流程v3: 主页面直达搜索入口失败（{opened.get('message') or '-'}），回退冷重置",
+                        )
                 if not self._reset_search_context(ops, f"恢复第{target}集"):
                     return False
                 opened = ops.open_search_page(keyword)
@@ -3336,6 +3370,69 @@ class TaskEngine:
         self._log("error", f"等待第{target}集超时，{state}")
         return False
 
+    def _recovery_page_has_player(self, ops: HongguoOperations) -> bool:
+        """Whether the regular recovery phase below can possibly succeed.
+
+        ``ensure_playback_page`` only ever nudges a player that is already on
+        screen. When 红果 sits on its main page - which is where it usually
+        lands after being pulled back from the launcher - the phase just burns
+        its whole budget probing a page that holds no player. Anything
+        unreadable returns True so the previous behaviour is kept.
+        """
+        current_getter = getattr(ops, "_safe_app_current", None)
+        xml_getter = getattr(ops, "_xml", None)
+        ad_marker = getattr(ops, "_ad_continue_visible", None)
+        playback = getattr(ops, "_playback_visible", None)
+        try:
+            current = current_getter() if callable(current_getter) else {}
+            if current.get("activity") == SHORT_SERIES_ACTIVITY:
+                return True
+            xml = xml_getter() if callable(xml_getter) else ""
+            if callable(ad_marker) and ad_marker(xml):
+                return True
+            return bool(playback(xml)) if callable(playback) else True
+        except Exception:
+            return True
+
+    def _on_warm_hongguo_page(self, ops: HongguoOperations) -> bool:
+        """True when 红果 sits on one of its main tab pages.
+
+        Pulling the app back from the launcher usually lands here, and the
+        search entry is then a single tap away, so a cold reset (force-stop,
+        relaunch, ready wait ~20s) is pure overhead. Requiring the tab labels
+        keeps a page that would only fail the search entry - which costs far
+        more to retry than the cold reset it avoided - out of this path.
+        """
+        is_foreground = getattr(ops, "_is_app_foreground", None)
+        active = getattr(ops, "_short_series_activity_active", None)
+        xml_getter = getattr(ops, "_xml", None)
+        if not callable(is_foreground) or not callable(active) or not callable(xml_getter):
+            return False
+        try:
+            if is_foreground() is not True or active() is True:
+                return False
+            xml = xml_getter()
+        except Exception:
+            return False
+        return any(text in xml for text in ("首页", "剧场", "我的"))
+
+    def _capture_foreground_loss(self, ops: HongguoOperations, episode: int) -> None:
+        """Screenshot the page that pushed 红果 out of the foreground.
+
+        Nothing in this module sends a HOME key event, so a launcher-visible
+        state means the app left on its own (crash, killed, an ad SDK exiting).
+        The polls around the event are pure playback chatter, so this frame is
+        the only evidence available for the next investigation.
+        """
+        take = getattr(ops, "take_screenshot", None)
+        if not callable(take):
+            return
+        try:
+            shot = take("ep%d_foreground_lost" % episode, self.screenshot_dir)
+            self._log("info", f"全流程v3: 前台丢失现场已截图 {shot}")
+        except Exception as exc:
+            self._log("warn", f"全流程v3: 前台丢失现场截图失败: {exc}")
+
     def _restore_foreground_if_needed(self, ops: HongguoOperations, episode: int) -> bool:
         is_foreground = getattr(ops, "_is_app_foreground", None)
         if not callable(is_foreground):
@@ -3359,13 +3456,25 @@ class TaskEngine:
             return False
         first_package = first_visible_package(xml) if callable(first_visible_package) else ""
         self._log("warn", f"第{episode}集观察时红果不在前台，当前={app.get('package') or '-'}，可见={first_package or '-'}，尝试拉回")
+        self._capture_foreground_loss(ops, episode)
         bring_to_foreground = getattr(ops, "bring_to_foreground", None)
         launch_app = getattr(ops, "launch_app", None)
         resume = getattr(ops, "resume_playback_if_paused", None)
         foreground = bring_to_foreground() if callable(bring_to_foreground) else False
-        if not foreground and callable(launch_app):
-            foreground = launch_app()
+        escalated = not foreground
+        if escalated and callable(launch_app):
+            foreground = bool(launch_app())
         resumed = resume(allow_center_fallback=True) if callable(resume) else False
+        # A truthy bring_to_foreground() is not proof 红果 is actually in front:
+        # it falls back to a generic UI-ready probe, so it can report True with
+        # the launcher still showing. When nothing is playing either, the caller
+        # is about to probe a page that holds no player and will burn its entire
+        # recovery budget doing so, so escalate to a real launch. This is a no-op
+        # when the player is genuinely up.
+        if not escalated and not resumed and callable(launch_app):
+            if bool(launch_app()):
+                foreground = True
+                resumed = resume(allow_center_fallback=True) if callable(resume) else False
         self._log("info", f"红果前台恢复={foreground}，继续播放={resumed}")
         return True
 

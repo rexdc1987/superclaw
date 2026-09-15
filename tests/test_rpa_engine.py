@@ -7184,6 +7184,290 @@ def test_reset_search_context_skips_retry_when_first_attempt_succeeds():
     ops._refresh_connection.assert_not_called()
 
 
+class _ForegroundLossOps:
+    """Stand-in for HongguoOperations during a launcher-visible stall.
+
+    ``bring_to_foreground`` reports success the way the real one can: it falls
+    back to a generic UI-ready probe, so it returns True while 红果 never
+    actually came back. Nothing is playing either, which is what the engine
+    must treat as "the pull-back did not work".
+    """
+
+    def __init__(self):
+        self.launch_calls = 0
+        self.shots = []
+
+    def _is_app_foreground(self):
+        return False
+
+    def _safe_app_current(self):
+        return {"package": "app.lawnchair", "activity": "app.lawnchair.Launcher"}
+
+    def _xml(self):
+        return '<node package="app.lawnchair" bounds="[0,0][900,1600]" />'
+
+    def _first_visible_package(self, xml):
+        return "app.lawnchair"
+
+    def _launcher_visible(self, xml):
+        return True
+
+    def _has_large_hongguo_window(self, xml):
+        return False
+
+    def bring_to_foreground(self):
+        return True
+
+    def resume_playback_if_paused(self, allow_center_fallback=False):
+        return self.launch_calls > 0
+
+    def launch_app(self):
+        self.launch_calls += 1
+        return True
+
+    def take_screenshot(self, name, directory):
+        self.shots.append(name)
+        return "C:/tmp/%s.png" % name
+
+
+def test_restore_foreground_relaunches_when_the_pull_back_does_not_take():
+    """bring_to_foreground 报 True 但没真正回前台、也没在播放时必须升级为完整启动。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = _ForegroundLossOps()
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._restore_foreground_if_needed(ops, 16) is True
+
+    assert ops.launch_calls == 1
+    logged = " ".join(call.args[1] for call in engine._log.call_args_list)
+    assert "红果前台恢复=True，继续播放=True" in logged
+
+
+def test_restore_foreground_screenshots_the_page_that_stole_the_foreground():
+    """前台丢失现场必须留证：代码里没有任何 HOME 键，责任不在本模块。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = _ForegroundLossOps()
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        engine._restore_foreground_if_needed(ops, 37)
+
+    assert ops.shots == ["ep37_foreground_lost"]
+
+
+def test_restore_foreground_keeps_old_behaviour_when_resume_succeeds():
+    """正常拉回（已在播放）时不该触发任何额外重启。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+
+    class Ops(_ForegroundLossOps):
+        def resume_playback_if_paused(self, allow_center_fallback=False):
+            return True
+
+    ops = Ops()
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._restore_foreground_if_needed(ops, 12) is True
+
+    assert ops.launch_calls == 0
+
+
+class _PageOps:
+    """Minimal ops double carrying one page state for the recovery probe."""
+
+    def __init__(self, activity, playback_visible, ad_visible=False):
+        self.activity = activity
+        self.playback_visible = playback_visible
+        self.ad_visible = ad_visible
+
+    def _safe_app_current(self):
+        return {"package": "com.phoenix.read", "activity": self.activity}
+
+    def _xml(self):
+        return '<node package="com.phoenix.read" text="首页" />'
+
+    def _ad_continue_visible(self, xml):
+        return self.ad_visible
+
+    def _playback_visible(self, xml):
+        return self.playback_visible
+
+
+def test_recovery_page_has_player_is_false_on_the_hongguo_main_page():
+    """红果主页面没有播放器：常规恢复在那里永远不可能成功。"""
+    from rpa.hongguo.engine import SHORT_SERIES_ACTIVITY, TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+
+    on_main = _PageOps("com.dragon.read.pages.main.MainFragmentActivity", playback_visible=False)
+    assert engine._recovery_page_has_player(on_main) is False
+
+    on_player = _PageOps(SHORT_SERIES_ACTIVITY, playback_visible=True)
+    assert engine._recovery_page_has_player(on_player) is True
+
+    on_player_unreadable = _PageOps(SHORT_SERIES_ACTIVITY, playback_visible=False)
+    assert engine._recovery_page_has_player(on_player_unreadable) is True
+
+
+def test_recover_to_verified_episode_skips_the_regular_phase_without_a_player():
+    """没有播放器时不再空烧 90 秒常规恢复，直接重新进入短剧。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recovery_page_has_player = MagicMock(return_value=False)
+    engine._reopen_target_episode = MagicMock(return_value=True)
+    engine._confirm_current_episode = MagicMock(return_value=14)
+    ops = MagicMock()
+
+    assert engine._recover_to_verified_episode(
+        ops,
+        {"drama_name": "80年代之我的嫂子"},
+        14,
+        41,
+        "第16集后红果不在前台",
+    ) is True
+
+    ops.ensure_playback_page.assert_not_called()
+    ops._skip_ad_if_present.assert_not_called()
+    engine._reopen_target_episode.assert_called_once()
+
+
+def test_recover_to_verified_episode_logs_when_the_regular_phase_gives_up():
+    """常规恢复用尽尝试却未成功时必须有日志，否则 53 秒静默看起来像卡死。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._skip_ad_if_present = MagicMock(return_value=False)
+    engine._recovery_page_has_player = MagicMock(return_value=True)
+    engine._reopen_target_episode = MagicMock(return_value=True)
+    engine._confirm_current_episode = MagicMock(return_value=14)
+    ops = MagicMock()
+    ops.ensure_playback_page.return_value = False
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._recover_to_verified_episode(
+            ops,
+            {"drama_name": "80年代之我的嫂子"},
+            14,
+            41,
+            "第16集后红果不在前台",
+        ) is True
+
+    assert ops.ensure_playback_page.call_count == 2
+    logged = " ".join(call.args[1] for call in engine._log.call_args_list)
+    assert "常规恢复第14集未成功，转为重新搜索目标短剧" in logged
+
+
+def test_on_warm_hongguo_page_requires_a_main_tab_page():
+    """只有停在红果主 tab 页才复用；播放页或状态不明时仍走冷重置。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+
+    class Ops:
+        def __init__(self, foreground, active, xml):
+            self.fg = foreground
+            self.active = active
+            self.xml = xml
+
+        def _is_app_foreground(self):
+            return self.fg
+
+        def _short_series_activity_active(self):
+            return self.active
+
+        def _xml(self):
+            return self.xml
+
+    main_xml = '<node package="com.phoenix.read" text="首页" /><node text="我的" />'
+    detail_xml = '<node package="com.phoenix.read" text="选集" />'
+
+    assert engine._on_warm_hongguo_page(Ops(True, False, main_xml)) is True
+    assert engine._on_warm_hongguo_page(Ops(True, True, main_xml)) is False
+    assert engine._on_warm_hongguo_page(Ops(False, False, main_xml)) is False
+    assert engine._on_warm_hongguo_page(Ops(True, False, detail_xml)) is False
+
+
+def test_reopen_target_episode_reuses_warm_main_page_without_cold_reset():
+    """拉回前台后停在红果主页面时，直接复用该页进搜索框，跳过冷重置。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._reset_search_context = MagicMock(return_value=True)
+    engine._wait_for_episode_verified = MagicMock(return_value=True)
+    engine._on_warm_hongguo_page = MagicMock(return_value=True)
+    ops = MagicMock()
+    ops._live_lite_activity_active.return_value = False
+    ops._is_app_foreground.return_value = True
+    ops._still_on_search_selection_page.return_value = False
+    ops.open_search_page.return_value = {"success": True, "message": "已进入搜索框"}
+    ops.input_search_keyword.return_value = {"success": True, "message": "关键词已填入"}
+    ops.submit_search.return_value = {"success": True, "message": "搜索完成"}
+    ops._extract_drama_titles.return_value = ["80年代之我的嫂子"]
+    ops._choose_title.return_value = "80年代之我的嫂子"
+    ops.select_drama.return_value = {"success": True}
+    ops.play_episode.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._reopen_target_episode(
+            ops,
+            {"drama_name": "80年代之我的嫂子", "playback_speed": "1.0x"},
+            17,
+            41,
+        ) is True
+
+    engine._reset_search_context.assert_not_called()
+    ops.open_search_page.assert_called_once_with("80年代之我的嫂子")
+    ops.play_episode.assert_called_once_with(17)
+
+
+def test_reopen_target_episode_falls_back_to_cold_reset_when_warm_page_has_no_search_entry():
+    """主页面复用失败时必须退回冷重置，不能直接放弃整批恢复。"""
+    from rpa.hongguo.engine import TaskEngine
+
+    engine = TaskEngine(task_id=1, db_config={}, screenshot_dir="/tmp/shot")
+    engine._log = MagicMock()
+    engine._reset_search_context = MagicMock(return_value=True)
+    engine._wait_for_episode_verified = MagicMock(return_value=True)
+    engine._on_warm_hongguo_page = MagicMock(return_value=True)
+    ops = MagicMock()
+    ops._live_lite_activity_active.return_value = False
+    ops._is_app_foreground.return_value = True
+    ops._still_on_search_selection_page.return_value = False
+    ops.open_search_page.side_effect = [
+        {"success": False, "message": "未找到搜索入口"},
+        {"success": True, "message": "已进入搜索框"},
+    ]
+    ops.input_search_keyword.return_value = {"success": True, "message": "关键词已填入"}
+    ops.submit_search.return_value = {"success": True, "message": "搜索完成"}
+    ops._extract_drama_titles.return_value = ["80年代之我的嫂子"]
+    ops._choose_title.return_value = "80年代之我的嫂子"
+    ops.select_drama.return_value = {"success": True}
+    ops.play_episode.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._reopen_target_episode(
+            ops,
+            {"drama_name": "80年代之我的嫂子", "playback_speed": "1.0x"},
+            38,
+            41,
+        ) is True
+
+    engine._reset_search_context.assert_called_once()
+    assert ops.open_search_page.call_count == 2
+
+
 # TASK_COMPLETE: phase2_rpa_engine
 
 
