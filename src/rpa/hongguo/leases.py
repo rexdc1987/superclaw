@@ -10,8 +10,22 @@ from typing import Any, Dict
 import pymysql
 from pymysql.cursors import DictCursor
 
+from .dbresilience import apply_timeouts
+
 
 class DeviceLeaseStore:
+    """One row per ``worker_id|device_addr``, refreshed while a task runs.
+
+    Every helper here is best-effort: a lease that cannot be read or written is
+    reported as a plain ``False``/``0`` rather than raised, because a database
+    blip in this bookkeeping must never take a running task down.
+
+    Connections go through :func:`apply_timeouts` so a dead link fails in
+    seconds.  That matters most for :meth:`renew`, which the engine calls
+    synchronously from its heartbeat: without a socket timeout a stalled link
+    would block the task thread on the OS default TCP timeout instead.
+    """
+
     def __init__(self, db_config: Dict[str, Any]):
         self.db_config = dict(db_config)
         self.db_config.setdefault("cursorclass", DictCursor)
@@ -23,12 +37,35 @@ class DeviceLeaseStore:
         )
         self.lease_hours = max(1, int(os.environ.get("SUPERCLAW_DEVICE_LEASE_HOURS", "24")))
 
+    def _connect(self):
+        """Open one connection with socket timeouts already applied."""
+        return pymysql.connect(**apply_timeouts(self.db_config))
+
+    @staticmethod
+    def _safe_rollback(conn: Any) -> None:
+        if conn is None:
+            return
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _safe_close(conn: Any) -> None:
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            pass
+
     def acquire(self, task_id: int, device_addr: str) -> bool:
         now = datetime.now()
         expires_at = now + timedelta(hours=self.lease_hours)
         lease_key = f"{self.worker_id}|{device_addr}"
-        conn = pymysql.connect(**self.db_config)
+        conn = None
         try:
+            conn = self._connect()
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM hongguo_device_leases WHERE expires_at <= %s", (now,))
                 cur.execute(
@@ -83,26 +120,28 @@ class DeviceLeaseStore:
             conn.commit()
             return True
         except Exception:
-            conn.rollback()
+            self._safe_rollback(conn)
             return False
         finally:
-            conn.close()
+            self._safe_close(conn)
 
     def release(self, task_id: int) -> None:
-        conn = pymysql.connect(**self.db_config)
+        conn = None
         try:
+            conn = self._connect()
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM hongguo_device_leases WHERE task_id=%s", (int(task_id),))
             conn.commit()
         except Exception:
-            conn.rollback()
+            self._safe_rollback(conn)
         finally:
-            conn.close()
+            self._safe_close(conn)
 
     def renew(self, task_id: int) -> None:
         expires_at = datetime.now() + timedelta(hours=self.lease_hours)
-        conn = pymysql.connect(**self.db_config)
+        conn = None
         try:
+            conn = self._connect()
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -114,13 +153,14 @@ class DeviceLeaseStore:
                 )
             conn.commit()
         except Exception:
-            conn.rollback()
+            self._safe_rollback(conn)
         finally:
-            conn.close()
+            self._safe_close(conn)
 
     def release_inactive(self) -> int:
-        conn = pymysql.connect(**self.db_config)
+        conn = None
         try:
+            conn = self._connect()
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -137,7 +177,7 @@ class DeviceLeaseStore:
             conn.commit()
             return count
         except Exception:
-            conn.rollback()
+            self._safe_rollback(conn)
             return 0
         finally:
-            conn.close()
+            self._safe_close(conn)

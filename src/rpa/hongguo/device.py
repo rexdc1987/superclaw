@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import json
@@ -14,10 +15,19 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar, Tuple
 
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_ADDR = os.environ.get("SUPERCLAW_HONGGUO_DEVICE_ADDR", "127.0.0.1:5555")
 FALLBACK_ADDRS = ("127.0.0.1:5555", "127.0.0.1:7555", "emulator-5554")
 DEFAULT_MUMU_ROOT = Path(os.environ.get("SUPERCLAW_MUMU_ROOT", r"D:\Program Files\Netease\MuMu"))
 T = TypeVar("T")
+
+# Last observed failure of the discovery primitives. Discovery degrades to an
+# empty list on failure (the caller treats it as "no devices"), which looks
+# identical to "the user really has no emulator running". Keep the reason so the
+# UI can tell the two apart instead of showing a bare "0 台".
+_LAST_ADB_ERROR: Optional[str] = None
+_LAST_MANAGER_ERROR: Optional[str] = None
 
 
 class DeviceCallTimeout(TimeoutError):
@@ -58,6 +68,8 @@ def _load_u2():
 
 
 def _discover_addrs() -> list[str]:
+    global _LAST_ADB_ERROR
+
     def list_devices() -> list[str]:
         import adbutils
 
@@ -65,9 +77,41 @@ def _discover_addrs() -> list[str]:
         return [device.serial for device in client.device_list() if getattr(device, "serial", None)]
 
     try:
-        return call_with_timeout(list_devices, 5, "adb device list")
-    except Exception:
+        addrs = call_with_timeout(list_devices, 5, "adb device list")
+    except Exception as exc:
+        # Do not swallow silently: an unavailable ADB server and a machine with
+        # genuinely zero emulators must not look the same to the operator.
+        _LAST_ADB_ERROR = f"{type(exc).__name__}: {exc}"
+        logger.warning("Hongguo ADB device discovery failed: %s", _LAST_ADB_ERROR, exc_info=True)
         return []
+    _LAST_ADB_ERROR = None
+    return addrs
+
+
+def discovery_diagnostics() -> Dict[str, Any]:
+    """Describe why device discovery may have come back empty.
+
+    ``config`` values are safe to show in the UI (no credentials are involved),
+    so a "0 台" result can explain itself instead of looking like a bug.
+    """
+    manager: Optional[Path] = None
+    adb: Optional[Path] = None
+    try:
+        manager = _mumu_manager_path()
+    except Exception:
+        manager = None
+    try:
+        adb = _mumu_adb_path()
+    except Exception:
+        adb = None
+    return {
+        "adb_error": _LAST_ADB_ERROR,
+        "mumu_manager_error": _LAST_MANAGER_ERROR,
+        "mumu_root": str(DEFAULT_MUMU_ROOT),
+        "mumu_root_exists": DEFAULT_MUMU_ROOT.exists(),
+        "mumu_manager_path": str(manager) if manager else None,
+        "adb_path": str(adb) if adb else None,
+    }
 
 
 def discover_online_addrs() -> list[str]:
@@ -111,8 +155,15 @@ def _mumu_adb_path() -> Optional[Path]:
 
 
 def _run_mumu_manager(args: List[str], timeout: float = 12) -> Dict[str, Any]:
+    global _LAST_MANAGER_ERROR
+
     manager = _mumu_manager_path()
     if not manager:
+        _LAST_MANAGER_ERROR = (
+            f"MuMuManager.exe 未找到（已在 {DEFAULT_MUMU_ROOT} 下查找；"
+            "可用 SUPERCLAW_MUMU_ROOT 或 SUPERCLAW_MUMU_MANAGER 指定）"
+        )
+        logger.warning("Hongguo MuMuManager unavailable: %s", _LAST_MANAGER_ERROR)
         return {"success": False, "message": "MuMuManager.exe not found"}
 
     def run() -> subprocess.CompletedProcess[str]:
@@ -128,6 +179,8 @@ def _run_mumu_manager(args: List[str], timeout: float = 12) -> Dict[str, Any]:
     try:
         proc = call_with_timeout(run, timeout + 2, "mumu manager")
     except Exception as exc:
+        _LAST_MANAGER_ERROR = f"{type(exc).__name__}: {exc}"
+        logger.warning("Hongguo MuMuManager call failed (%s): %s", args, exc, exc_info=True)
         return {"success": False, "message": str(exc)}
     output = (proc.stdout or "").strip()
     if not output:
@@ -136,6 +189,12 @@ def _run_mumu_manager(args: List[str], timeout: float = 12) -> Dict[str, Any]:
         data = json.loads(output) if output else {}
     except json.JSONDecodeError:
         data = {"raw": output}
+    if proc.returncode != 0:
+        detail = ((proc.stderr or "") + (proc.stdout or "")).strip()[:200]
+        _LAST_MANAGER_ERROR = f"MuMuManager 退出码 {proc.returncode}: {detail or '(无输出)'}"
+        logger.warning("Hongguo MuMuManager returned %s for %s: %s", proc.returncode, args, detail)
+    else:
+        _LAST_MANAGER_ERROR = None
     return {
         "success": proc.returncode == 0,
         "returncode": proc.returncode,

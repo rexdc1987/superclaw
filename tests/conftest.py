@@ -89,3 +89,41 @@ def isolated_embedded_lock(tmp_path, monkeypatch):
         lambda: {"stopped_tasks": 0, "released_leases": 0},
     )
     yield
+
+
+@pytest.fixture(autouse=True)
+def no_queue_dispatcher(monkeypatch):
+    """Keep the queue dispatcher thread out of the test process.
+
+    ``TestClient(api.main.app)`` runs the real startup lifespan, which now
+    starts a background dispatcher. That thread talks to whatever database
+    ``config/local.yaml`` points at - the shared production one - and would
+    cheerfully create and start a real emulator batch from inside a test run.
+    Same class of accident as the reconcile sweep on 2026-09-14, so it is off
+    for the whole suite.
+
+    Deliberately not unit-tested: a test asserting "the guard holds" fails by
+    doing exactly the thing the guard exists to prevent, and a broken patch
+    would then be indistinguishable from a working one.
+    """
+    monkeypatch.setenv("SUPERCLAW_QUEUE_DISPATCHER", "0")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def isolated_db_spool(tmp_path, monkeypatch):
+    """Keep engine log spooling out of the real repository and out of each other.
+
+    Most engine tests build ``TaskEngine(..., db_config={})``.  Whenever such a
+    test drives a code path that logs, the row cannot reach MySQL and is spooled
+    instead - by default into ``logs/db_spool`` in the working tree, where the
+    next test would then try to flush it.  Point the spool at ``tmp_path`` and
+    forget anything learned about the link so one test's simulated outage cannot
+    leak into the next.
+    """
+    import rpa.hongguo.dbresilience as dbresilience
+
+    monkeypatch.setenv("SUPERCLAW_DB_SPOOL_DIR", str(tmp_path / "db_spool"))
+    dbresilience.DB_HEALTH.reset()
+    yield
+    dbresilience.DB_HEALTH.reset()

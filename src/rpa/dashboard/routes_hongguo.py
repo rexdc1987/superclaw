@@ -28,6 +28,8 @@ from pymysql.cursors import DictCursor
 
 from api.security import current_principal, require_admin
 from rpa.hongguo.ai_usage import load_usage_stats, record_usage, reset_usage_stats
+from rpa.hongguo import dbresilience
+from rpa.hongguo.attribution import bind_machine_account, ensure_machine_columns
 from rpa.hongguo.comment_gen import CommentGenerator
 from rpa.hongguo.device import (
     DEFAULT_ADDR,
@@ -37,11 +39,12 @@ from rpa.hongguo.device import (
     discover_addrs,
     discover_mumu_instances,
     discover_online_addrs,
+    discovery_diagnostics,
     launch_mumu_app,
 )
 from rpa.hongguo.engine import DEFAULT_SCREENSHOT_ROOT, TaskEngineManager
 from rpa.hongguo.operations import APP_PACKAGE, HongguoOperations
-from rpa.hongguo.schema import ensure_base_schema
+from rpa.hongguo.schema import ensure_base_schema, ensure_queue_schema
 from services.ai_config_service import (
     ai_config,
     app_config,
@@ -282,6 +285,9 @@ def _normalize_playback_speed(value: Optional[str]) -> str:
 
 def _ensure_task_schema(conn) -> None:
     ensure_base_schema(conn)
+    # CREATE TABLE IF NOT EXISTS skips tables SQLAlchemy already made, which is
+    # how the playlist lost its UNIQUE key on drama_name (see ensure_queue_schema).
+    ensure_queue_schema(conn)
     db_name = _db_config()["database"]
     managed_columns = {
         "playback_speed",
@@ -503,7 +509,7 @@ def _ensure_task_schema(conn) -> None:
                 expires_at DATETIME NOT NULL,
                 INDEX idx_hongguo_lease_task (task_id),
                 INDEX idx_hongguo_lease_owner (owner_user_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
             """
         )
         cur.execute(
@@ -541,10 +547,15 @@ def _ensure_task_schema(conn) -> None:
                 host VARCHAR(160) NOT NULL,
                 status VARCHAR(20) NOT NULL DEFAULT 'online',
                 metadata_json TEXT DEFAULT NULL,
+owner_user_id BIGINT NOT NULL DEFAULT 0,
+owner_username VARCHAR(64) NOT NULL DEFAULT '',
+owner_bound_at DATETIME DEFAULT NULL,
+owner_conflict VARCHAR(255) NOT NULL DEFAULT '',
                 last_seen_at DATETIME NOT NULL,
                 created_at DATETIME NOT NULL,
-                updated_at DATETIME NOT NULL
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                updated_at DATETIME NOT NULL,
+INDEX idx_hongguo_worker_owner (owner_user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
             """
         )
         cur.execute(
@@ -559,15 +570,44 @@ def _ensure_task_schema(conn) -> None:
                 last_seen_at DATETIME NOT NULL,
                 PRIMARY KEY (worker_id, device_addr),
                 INDEX idx_hongguo_device_seen (last_seen_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
             """
         )
+        # 存量库的 hongguo_workers 建表语句不会重跑，归属列必须单独补。
+        ensure_machine_columns(cur, db_name)
 
 
 @contextmanager
 def _connection():
     global _schema_ready
-    conn = pymysql.connect(**_db_config())
+    # Fail in seconds instead of sitting on the OS TCP timeout: on 2026-09-16 a
+    # dead link made every dashboard call appear to hang for ~21s.
+    #
+    # A blip must not surface as a 500 either - on 2026-09-18 a single
+    # ``2003 timed out`` turned GET /tasks into a traceback while the request
+    # right next to it succeeded.  Both guards below act on the *connect* phase
+    # only, where no statement has run yet, so neither can double-apply work.
+    #   * ``resilient_connect`` keeps one breaker for the whole process, so the
+    #     API and every task thread agree about whether MySQL is reachable.
+    #   * While the breaker is open, answer 503 immediately rather than pay a
+    #     fresh connect timeout per request: 29 handlers here are ``async`` and
+    #     would otherwise stall the event loop for the entire server.
+    if dbresilience.DB_HEALTH.is_down():
+        raise HTTPException(
+            status_code=503,
+            detail="数据库暂时不可用（连接中断），请稍后重试",
+            headers={"Retry-After": str(int(dbresilience.DOWN_PROBE_INTERVAL_SECONDS))},
+        )
+    try:
+        conn = dbresilience.resilient_connect(_db_config())
+    except BaseException as exc:  # noqa: BLE001 - non-transient re-raised below
+        if dbresilience.is_transient_error(exc):
+            raise HTTPException(
+                status_code=503,
+                detail="数据库暂时不可用（{0}），请稍后重试".format(type(exc).__name__),
+                headers={"Retry-After": str(int(dbresilience.DOWN_PROBE_INTERVAL_SECONDS))},
+            ) from exc
+        raise
     try:
         if not _schema_ready:
             with _SCHEMA_LOCK:
@@ -999,8 +1039,40 @@ def _insert_task_record(
             ),
         )
         task_id = int(cur.lastrowid)
+    _claim_machine_for_task(conn, task_id, worker_id or _local_worker_id())
     _increment_template_usage(conn, payload.templates, payload.template_ids)
     return task_id
+
+
+def _claim_machine_for_task(conn, task_id: int, worker_id: str) -> None:
+    """把执行机器认领给创建任务的账号（首次生效，冲突只记日志不覆盖）。
+
+    没有这一步，机器与账号之间就没有档案关系：`hongguo_workers` 只在 api 模式的
+    执行节点里写入、且不带账号，embedded 模式（安装包默认）根本不写。于是
+    「这台机是谁的、产出了多少」只能反查任务表去猜。
+
+    归属是附加信息，任何失败都不允许拖垮任务创建本身。
+    """
+    try:
+        principal = current_principal()
+        result = bind_machine_account(
+            conn, worker_id, principal.user_id, principal.username
+        )
+    except Exception as exc:
+        logger.warning("机器归属写入失败 worker=%s: %s", worker_id, exc)
+        return
+    if result.get("conflict"):
+        _insert_log(
+            conn,
+            task_id,
+            "机器 %s 已归属 %s，本次由 %s 创建任务，未改动归属"
+            % (
+                worker_id,
+                result.get("owner_username") or result.get("owner_user_id"),
+                result.get("attempted_username") or result.get("attempted_user_id"),
+            ),
+            "warn",
+        )
 
 
 @router.post("/tasks")
@@ -3249,6 +3321,50 @@ def _mark_task_waiting_login(task_id: int, message: str) -> Dict[str, Any]:
         return _serialize_task(_fetch_one_or_404(conn, task_id))
 
 
+def _annotate_detection_reason(
+    result: Dict[str, Any], mumu_instances: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    """Explain a zero-device detection result.
+
+    ``success`` stays True: the request itself succeeded, there is simply
+    nothing to show. Without ``reason``/``reason_text`` the caller cannot tell
+    "no emulator is running" from "ADB is broken" from "this instance is a
+    control plane that never looks at local MuMu" - all three collapsed into a
+    misleading green "在线 0 台".
+    """
+    diagnostics = result.get("diagnostics") or {}
+    if int(result.get("online_count") or 0) > 0:
+        return result
+    pending = [item for item in (result.get("devices") or []) if item.get("status") == "adb_not_ready"]
+    if result.get("remote_workers"):
+        result["reason"] = "no_online_worker"
+        result["reason_text"] = (
+            "当前实例是控制端模式（execution_mode=api），不检测本机模拟器。"
+            "未发现 90 秒内有心跳的执行节点：请在本机改用 embedded 模式，"
+            "或在负责执行的机器上运行 run_worker.py。"
+        )
+    elif diagnostics.get("adb_error"):
+        result["reason"] = "adb_unavailable"
+        result["reason_text"] = "ADB 设备枚举失败，无法判断模拟器状态：%s" % diagnostics.get("adb_error")
+    elif diagnostics.get("mumu_manager_error"):
+        result["reason"] = "mumu_manager_unavailable"
+        result["reason_text"] = "MuMuManager 调用失败，未能枚举 MuMu 多开实例：%s" % diagnostics.get("mumu_manager_error")
+    elif not mumu_instances:
+        result["reason"] = "mumu_not_found"
+        result["reason_text"] = (
+            "未发现任何 MuMu 实例。请确认 MuMu 多开器已启动；"
+            "若安装在非默认目录，请设置 SUPERCLAW_MUMU_ROOT，"
+            "或在 diagnostics.mumu_root 里核对当前扫描的目录。"
+        )
+    elif pending:
+        result["reason"] = "adb_not_ready"
+        result["reason_text"] = "已发现 %d 个 MuMu 实例，但 ADB 尚未就绪，请稍后重试。" % len(pending)
+    else:
+        result["reason"] = "no_online_device"
+        result["reason_text"] = "已发现 MuMu 实例，但没有任何一个在线可用。"
+    return result
+
+
 def _detect_multi_devices_uncached() -> Dict[str, Any]:
     devices: List[Dict[str, Any]] = []
     ignored_devices = []
@@ -3347,13 +3463,16 @@ def _detect_multi_devices_uncached() -> Dict[str, Any]:
             result["ignored"] = True
             result["ignore_reason"] = "非 MuMu/模拟器实例，已从红果多开检测结果中过滤"
             ignored_devices.append(result)
-    return {
+    result = {
         "success": True,
+        "device_source": "local_mumu",
         "devices": devices,
         "ignored_devices": ignored_devices,
         "online_count": sum(1 for item in devices if item.get("online")),
         "logged_in_count": sum(1 for item in devices if item.get("logged_in")),
+        "diagnostics": discovery_diagnostics(),
     }
+    return _annotate_detection_reason(result, mumu_instances)
 
 
 def _list_registered_worker_devices() -> Dict[str, Any]:
@@ -3393,12 +3512,15 @@ def _list_registered_worker_devices() -> Dict[str, Any]:
         devices.append(payload)
     result = {
         "success": True,
+        "device_source": "remote_workers",
         "devices": devices,
         "ignored_devices": [],
         "online_count": sum(1 for item in devices if item.get("online")),
         "logged_in_count": sum(1 for item in devices if item.get("logged_in")),
         "remote_workers": True,
+        "diagnostics": discovery_diagnostics(),
     }
+    _annotate_detection_reason(result, None)
     return _apply_device_lease_visibility(result)
 
 
@@ -3491,11 +3613,14 @@ def list_multi_devices():
         logger.warning("list_multi_devices database error: %s", exc)
         return {
             "success": False,
+            "reason": "backend_error",
+            "reason_text": "设备检测接口内部错误，请看板后端日志获取堆栈。",
             "devices": [],
             "ignored_devices": [],
             "online_count": 0,
             "logged_in_count": 0,
             "database_error": f"MySQL 连接失败: {exc}",
+            "diagnostics": discovery_diagnostics(),
         }
 
 

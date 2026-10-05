@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from api.attribution.router import router as attribution_router
 from api.auth import router as auth_router
 from api.audit import record_api_action
 from api.deps import get_db
@@ -30,11 +31,19 @@ from api.security import (
 )
 from api.users import router as users_router
 from api.settings import router as settings_router
+from api.system import service as system_service
+from api.system.router import router as system_router
+from api.soda.router import router as soda_router
 from rpa.dashboard.routes_hongguo import (
     hongguo_runtime_health,
     reconcile_runtime_state,
     router as hongguo_router,
 )
+from rpa.dashboard.routes_hongguo_queue import (
+    playlist_router as hongguo_playlist_router,
+    router as hongguo_queue_router,
+)
+from rpa.hongguo.queue import start_dispatcher as start_queue_dispatcher
 from models.database import init_db
 from models.task import Task
 from services.user_service import UserService
@@ -85,15 +94,37 @@ async def lifespan(_app: FastAPI):
             "本机已有另一个嵌入式 SuperClaw API 实例在运行。"
             "请先停止它再启动本服务，否则新实例会在启动时误停正在执行的任务。"
         )
+    # The launcher restarts the app in-process after applying an update, so the
+    # updater's phase has to be cleared here or the UI would keep showing the
+    # pre-restart "applying…" state.
+    system_service.reset_download_state()
     init_db()
     reconcile_runtime_state()
+    # After reconcile, never before: the dispatcher starts runs, and reconcile
+    # stops whatever this worker id left behind. Starting it first would let it
+    # launch a drama that reconcile is about to sweep away.
+    start_queue_dispatcher()
     yield
+
+
+def _release_version() -> str:
+    """Single source of truth for the release number.
+
+    ``VERSION`` sits next to the app root both when packaged (<install>/app) and
+    when running from a checkout, so ``parents[2]`` resolves either way.
+    """
+    version_file = Path(__file__).resolve().parents[2] / "VERSION"
+    if version_file.is_file():
+        text = version_file.read_text(encoding="utf-8").strip().lstrip("vV")
+        if text:
+            return text
+    return "0.0.0"
 
 
 app = FastAPI(
     title="SuperClaw API",
     description="社交媒体评论引流运营系统",
-    version="0.2.0",
+    version=_release_version(),
     lifespan=lifespan,
 )
 
@@ -164,6 +195,11 @@ app.add_middleware(AuthenticationMiddleware)
 # The Hongguo router owns its full /api/v1/hongguo prefix.
 app.include_router(settings_router)
 app.include_router(hongguo_router)
+app.include_router(hongguo_queue_router)
+app.include_router(hongguo_playlist_router)
+app.include_router(soda_router)
+app.include_router(system_router)
+app.include_router(attribution_router)
 app.include_router(auth_router)
 app.include_router(users_router)
 
@@ -182,7 +218,7 @@ def root():
     index = frontend_dist / "index.html"
     if index.is_file():
         return FileResponse(str(index))
-    return {"message": "SuperClaw API", "version": "0.2.0"}
+    return {"message": "SuperClaw API", "version": _release_version()}
 
 
 @app.get("/health")

@@ -13,6 +13,8 @@ from models.hongguo_task import HongguoTask
 from models.hongguo_record import HongguoRecord
 from models.hongguo_log import HongguoLog
 from models.hongguo_template import HongguoTemplate
+from models.soda_song import SodaSong
+from models.hongguo_queue import HongguoDramaPlaylist, HongguoQueueItem, HongguoQueueConfig
 
 __all__ = [
     "AccountGroup", "Account",
@@ -23,4 +25,6 @@ __all__ = [
     "Comment", "KeywordGroup",
     "User",
     "HongguoTask", "HongguoRecord", "HongguoLog", "HongguoTemplate",
+    "SodaSong",
+    "HongguoDramaPlaylist", "HongguoQueueItem", "HongguoQueueConfig",
 ]

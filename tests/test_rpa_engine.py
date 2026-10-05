@@ -4659,11 +4659,16 @@ class TestHongguoEngineWaits:
                 allow_unreadable_first_episode=True,
             )
 
+    # 集数只朝一个方向判死（2026-10-01 seq3 的教训）：少读是"页面没读全"，
+    # 多读是"第一次读早了"，两者都不是"进错剧"的证据，所以 58→59 不再报
+    # 「总集数不匹配」；但它也**不会**被放行 —— 当前集数读不出来时依旧拒绝继续，
+    # 只是理由变成"未识别到当前集数"。真正少一大截（12）时防线照旧。
     @pytest.mark.parametrize(
         ("state_override", "error"),
         [
-            ({"total_episodes": 59}, "总集数不匹配"),
+            ({"total_episodes": 12}, "总集数不匹配"),
             ({"collection_title": "神奇宇宙"}, "非目标合集"),
+            ({"total_episodes": 59}, "未识别到当前集数"),
         ],
     )
     def test_unreadable_first_episode_fallback_keeps_drama_validation(self, state_override, error):
@@ -7466,6 +7471,509 @@ def test_reopen_target_episode_falls_back_to_cold_reset_when_warm_page_has_no_se
 
     engine._reset_search_context.assert_called_once()
     assert ops.open_search_page.call_count == 2
+
+
+# ============================================================================
+# 集数懒加载 / 互动复核
+#
+# 2026-10-01 seq3《丧尸狂潮》的真实账：红果合集的集数是懒加载的，切第 1 集时
+# 只读到了 29，任务行就写成了 29；下一拍页面渲染全了读到 30，而
+# ``_total_mismatch_is_fatal`` 对 total > expected 一律判致命，于是整部剧在
+# 347 秒时死在「切集时短剧总集数不匹配: 期望 29，实际 30」，队列又把 4 台设备
+# 一起从第 1 集重跑（首轮 1h40m × 4 台全部作废）。同一批里还有 7 次
+# 「第 1 次完成证据校验失败」是同一类读数：期望 30 实际 61 / 期望 40 实际 48。
+# ============================================================================
+
+
+def test_stable_total_reads_through_lazy_episode_rendering():
+    """懒加载只会单调增长 ⇒ 末值即真值（29,29,30,30 → 30）。"""
+    engine = TaskEngine(task_id=240, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops.get_total_episodes.side_effect = [29, 29, 30, 30]
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._read_stable_total_episodes(ops) == 30
+
+
+def test_stable_total_ignores_a_neighbouring_card_spike():
+    """跳上去又掉回来的是隔壁推荐位的集数（30 集旁边挂着 61），取众数。"""
+    engine = TaskEngine(task_id=241, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops.get_total_episodes.side_effect = [30, 61, 30, 30]
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._read_stable_total_episodes(ops) == 30
+
+
+def test_stable_total_is_zero_when_the_page_never_answers():
+    engine = TaskEngine(task_id=242, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops.get_total_episodes.return_value = 0
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._read_stable_total_episodes(ops) == 0
+
+
+def test_stable_total_survives_a_read_that_raises():
+    """一次设备抖动不能把整部剧变成"总集数未知"。"""
+    engine = TaskEngine(task_id=243, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops.get_total_episodes.side_effect = [RuntimeError("adb 掉了"), 30]
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._read_stable_total_episodes(ops, attempts=2) == 30
+
+
+def test_a_bigger_on_screen_total_is_no_longer_fatal():
+    """期望 29 / 实际 30 的正确解释是"第一次读早了"，不是"进错剧"。"""
+    engine = TaskEngine(task_id=244, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+    state = {"detail_title": "", "collection_title": "", "playing_title": ""}
+
+    assert (
+        engine._total_mismatch_is_fatal(
+            ops, {"drama_name": "丧尸狂潮"}, state, 29, 30, current=1, target=1
+        )
+        is False
+    )
+
+
+def test_a_bigger_total_on_a_matching_collection_is_not_fatal():
+    """播放页相关推荐位/残留节点会读到大数字（期望 40 实际 48），别判死。"""
+    engine = TaskEngine(task_id=245, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+    state = {"collection_title": "丧尸狂潮", "playing_title": "丧尸狂潮"}
+
+    assert (
+        engine._total_mismatch_is_fatal(
+            ops, {"drama_name": "丧尸狂潮"}, state, 30, 61, current=30
+        )
+        is False
+    )
+
+
+def test_a_bigger_total_in_the_wrong_season_is_still_fatal():
+    """进错季是**可靠**信号：集数更大也不能继续跑下去。"""
+    engine = TaskEngine(task_id=246, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+    state = {"collection_title": "胭脂如梦如雨如尘2", "playing_title": ""}
+
+    assert (
+        engine._total_mismatch_is_fatal(
+            ops, {"drama_name": "胭脂如梦如雨如尘"}, state, 40, 48
+        )
+        is True
+    )
+
+
+def test_a_shortfall_beyond_one_episode_is_still_fatal():
+    """少读那一侧的防线没动：确认是目标剧却少了一大截，照样判致命。"""
+    engine = TaskEngine(task_id=247, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+    ops._title_matches.return_value = True
+    state = {"detail_title": "丧尸狂潮", "collection_title": ""}
+
+    assert (
+        engine._total_mismatch_is_fatal(
+            ops, {"drama_name": "丧尸狂潮"}, state, 40, 12, current=40
+        )
+        is True
+    )
+
+
+def test_completion_evidence_tolerates_a_bigger_on_screen_total():
+    """P1：完成证据那一拍读到 61（残留/推荐位），跑完的剧仍要能正常收官。"""
+    engine = TaskEngine(task_id=248, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recover_to_verified_episode = MagicMock()
+    state = {
+        "app": {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        },
+        "playback_visible": True,
+        "current_episode": 30,
+        "total_episodes": 61,
+        "collection_title": "丧尸狂潮",
+        "playing_title": "丧尸狂潮",
+    }
+    engine._page_state_with_empty_retry = MagicMock(return_value=state)
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+    ops.pause_playback_if_playing.return_value = True
+    ops.take_screenshot.return_value = "C:/tmp/task_completed_summary.png"
+
+    result = engine._capture_final_episode_evidence(ops, {"drama_name": "丧尸狂潮"}, 30)
+
+    assert result == "C:/tmp/task_completed_summary.png"
+    engine._recover_to_verified_episode.assert_not_called()
+
+
+def test_assert_target_playback_still_rejects_a_wrong_collection():
+    """放宽带内的读数不等于放行错剧：无关合集仍被挡下。"""
+    engine = TaskEngine(task_id=249, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    state = {
+        "app": {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        },
+        "playback_visible": True,
+        "current_episode": 1,
+        "total_episodes": 480,
+        "collection_title": "别的剧",
+    }
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+
+    with pytest.raises(RuntimeError, match="非目标合集"):
+        engine._assert_target_playback(ops, {"drama_name": "丧尸狂潮"}, state, 30)
+
+
+def test_recheck_uncertain_favorite_returns_to_the_clicked_episode():
+    """P3：待确认的收藏是在某一集上点的，复核就得回到那一集。
+
+    10-01 seq3 的 536：30/30 跑完、点赞 2/2，只因「收藏 0/1」整部判失败；
+    而旧代码只对点赞做恢复，收藏是在最后一集上读的 —— 读到的当然是别的集。
+    """
+    engine = TaskEngine(task_id=250, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._increment_engagement_counter = MagicMock()
+    engine._uncertain_engagement_episodes = {"like": set(), "favorite": {12}}
+    ops = MagicMock()
+    ops.inspect_current_episode_engagement.return_value = {
+        "success": True,
+        "selected": True,
+        "message": "已通过截图确认收藏已生效",
+    }
+    ops.take_screenshot.return_value = "C:/tmp/ep12_favorite_recheck_verified.png"
+
+    engine._recheck_uncertain_engagements_before_completion(ops, {}, 30)
+
+    engine._recover_to_verified_episode.assert_called_once_with(
+        ops, {}, 12, 30, "复核待确认收藏"
+    )
+    assert engine._completed_engagement_episodes["favorite"] == {12}
+    assert engine._uncertain_engagement_episodes["favorite"] == set()
+    ops.favorite_current_episode.assert_not_called()
+
+
+def test_recheck_rereads_an_unreadable_engagement_state():
+    """状态不可读多半是控件还没渲染完，再读两拍就能确认（只读，不重点）。"""
+    engine = TaskEngine(task_id=251, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._increment_engagement_counter = MagicMock()
+    engine._uncertain_engagement_episodes = {"like": set(), "favorite": {12}}
+    ops = MagicMock()
+    ops.inspect_current_episode_engagement.side_effect = [
+        {"success": False, "selected": None, "message": "收藏状态不可读"},
+        {"success": True, "selected": True, "message": "已确认收藏已生效"},
+    ]
+    ops.take_screenshot.return_value = "C:/tmp/ep12_favorite_recheck_verified.png"
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        engine._recheck_uncertain_engagements_before_completion(ops, {}, 30)
+
+    assert ops.inspect_current_episode_engagement.call_count == 2
+    assert engine._completed_engagement_episodes["favorite"] == {12}
+    ops.favorite_current_episode.assert_not_called()
+
+
+def test_recheck_never_clicks_an_explicitly_inactive_engagement():
+    """明确读到"未生效"就清掉不确定，交给补偿轮；复核本身绝不点击。"""
+    engine = TaskEngine(task_id=252, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._uncertain_engagement_episodes = {"like": set(), "favorite": {12}}
+    ops = MagicMock()
+    ops.inspect_current_episode_engagement.return_value = {
+        "success": True,
+        "selected": False,
+        "message": "已通过控件确认收藏未生效",
+    }
+
+    engine._recheck_uncertain_engagements_before_completion(ops, {}, 30)
+
+    assert engine._uncertain_engagement_episodes["favorite"] == set()
+    assert engine._completed_engagement_episodes["favorite"] == set()
+    ops.favorite_current_episode.assert_not_called()
+
+
+# ============================================================================
+# P4：剧末红果自动跳到相关推荐，不能当成"任务失败"
+#
+# 2026-10-03 seq4《胭脂如梦如雨如尘2》(48 集) 首轮 4 台里 563/566 两台失败，
+# 两台都只差 1 集、已经跑了 93~105 分钟，队列整批重跑白烧 3.3 设备·小时：
+#   563 第48集（最后一集）读到合集「铁齿铜牙纪晓岚」，恢复函数报「已恢复到
+#       第48集」，3 秒后校验又失败 —— 恢复只比对了集数，没比对是哪部剧；
+#   566 第47集（倒数第二集）等第48集时读到「第1集」，直接 raise「回退异常」。
+# 同一批里这个现象还出现 9 次，都被完成证据的既有重试兜住了。
+# ============================================================================
+
+
+def test_tail_grace_covers_only_the_last_episodes():
+    """尾段 = 最后 TAIL_SWITCH_GRACE_EPISODES 集；没到剧末不算。"""
+    engine = TaskEngine(task_id=260, db_config={}, screenshot_dir="C:/tmp")
+
+    assert engine._in_drama_tail(48, 46) is False
+    assert engine._in_drama_tail(48, 47) is True
+    assert engine._in_drama_tail(48, 48) is True
+    assert engine._in_drama_tail(0, 10) is False
+
+
+def test_tail_switch_budget_is_bounded():
+    """预算有界：尾段最多恢复 3 次，之后照旧判死。"""
+    engine = TaskEngine(task_id=261, db_config={}, screenshot_dir="C:/tmp")
+
+    assert [
+        engine._tail_switch_recovery_allowed(48, 48) for _ in range(4)
+    ] == [True, True, True, False]
+
+
+def test_tail_switch_budget_is_not_spent_before_the_tail():
+    """没到剧末的异常回退不消耗预算，也不放行。"""
+    engine = TaskEngine(task_id=262, db_config={}, screenshot_dir="C:/tmp")
+
+    assert engine._tail_switch_recovery_allowed(48, 20) is False
+    assert engine._tail_switch_recoveries == 0
+
+
+def test_other_drama_detection_uses_the_same_yardstick_as_playback_checks():
+    """身份校验与 `_assert_target_playback` 同口径：合集/播放标题说了算。"""
+    engine = TaskEngine(task_id=263, db_config={}, screenshot_dir="C:/tmp")
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+    task = {"drama_name": "胭脂如梦如雨如尘2"}
+
+    assert engine._state_is_other_drama(ops, task, {"collection_title": "铁齿铜牙纪晓岚"}) is True
+    assert engine._state_is_other_drama(ops, task, {"playing_title": "铁齿铜牙纪晓岚"}) is True
+    assert engine._state_is_other_drama(ops, task, {"collection_title": "胭脂如梦如雨如尘2"}) is False
+    assert engine._state_is_other_drama(ops, task, {}) is False
+
+
+def test_a_tail_switch_rewind_is_recovered_instead_of_failing():
+    """566：剧末读到「第1集」是红果切走了，不是回退，重进目标剧即可。"""
+    engine = TaskEngine(task_id=264, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._page_state = MagicMock(return_value={
+        "app": {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        },
+        "playback_visible": True,
+        "current_episode": 1,
+        "total_episodes": 48,
+        "collection_title": "铁齿铜牙纪晓岚",
+    })
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    ops = MagicMock()
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._wait_for_next_episode_verified(
+            ops, {"drama_name": "胭脂如梦如雨如尘2"}, 47, 48, 48
+        ) is True
+
+    engine._recover_to_verified_episode.assert_called_once()
+
+
+def test_a_rewind_before_the_tail_is_still_fatal():
+    """防线没动：还没到剧末就回退到第 1 集，照样判死。"""
+    engine = TaskEngine(task_id=265, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._page_state = MagicMock(return_value={
+        "app": {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        },
+        "playback_visible": True,
+        "current_episode": 1,
+        "total_episodes": 48,
+        "collection_title": "胭脂如梦如雨如尘2",
+    })
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    ops = MagicMock()
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        with pytest.raises(RuntimeError, match="回退异常"):
+            engine._wait_for_next_episode_verified(
+                ops, {"drama_name": "胭脂如梦如雨如尘2"}, 20, 21, 48
+            )
+
+    engine._recover_to_verified_episode.assert_not_called()
+
+
+def test_recovery_refuses_a_matching_episode_counter_on_another_drama():
+    """563 的假成功：集数读到 48，页面却还是别的剧 —— 不许宣布恢复成功。"""
+    engine = TaskEngine(task_id=266, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recovery_page_has_player = MagicMock(return_value=True)
+    engine._wait_for_episode_verified = MagicMock(return_value=True)
+    engine._confirm_current_episode = MagicMock(return_value=48)
+    engine._reopen_target_episode = MagicMock(return_value=False)
+    engine._page_state = MagicMock(return_value={
+        "current_episode": 48,
+        "collection_title": "铁齿铜牙纪晓岚",
+        "playing_title": "铁齿铜牙纪晓岚",
+    })
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+    ops.ensure_playback_page.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        recovered = engine._recover_to_verified_episode(
+            ops, {"drama_name": "胭脂如梦如雨如尘2"}, 48, 48, "测试假成功"
+        )
+
+    assert recovered is False
+    engine._reopen_target_episode.assert_called()
+
+
+def test_recovery_accepts_a_true_return_to_the_target_drama():
+    """对照：集数对上且确实是目标剧，恢复才成立。"""
+    engine = TaskEngine(task_id=267, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recovery_page_has_player = MagicMock(return_value=True)
+    engine._wait_for_episode_verified = MagicMock(return_value=True)
+    engine._confirm_current_episode = MagicMock(return_value=48)
+    engine._page_state = MagicMock(return_value={
+        "current_episode": 48,
+        "collection_title": "胭脂如梦如雨如尘2",
+        "playing_title": "胭脂如梦如雨如尘2",
+    })
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+    ops.ensure_playback_page.return_value = True
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._recover_to_verified_episode(
+            ops, {"drama_name": "胭脂如梦如雨如尘2"}, 48, 48, "测试"
+        ) is True
+
+
+def test_target_context_retries_once_in_the_tail():
+    """剧末恢复后又被切走，再给一次机会，而不是当场判死（563 的现场）。"""
+    engine = TaskEngine(task_id=268, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    error = RuntimeError("检测到非目标合集: 期望 胭脂如梦如雨如尘2，实际 铁齿铜牙纪晓岚")
+    engine._assert_target_playback = MagicMock(side_effect=[error, error, None])
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._page_state = MagicMock(return_value={"current_episode": 48})
+    ops = MagicMock()
+
+    state = engine._ensure_target_playback_context(
+        ops, {"drama_name": "胭脂如梦如雨如尘2"}, {}, 48, 48
+    )
+
+    assert state == {"current_episode": 48}
+    assert engine._recover_to_verified_episode.call_count == 2
+
+
+def test_target_context_does_not_retry_outside_the_tail():
+    """没到剧末时恢复仍是一次机会，失败即抛。"""
+    engine = TaskEngine(task_id=269, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    error = RuntimeError("检测到非目标合集: 期望 胭脂如梦如雨如尘2，实际 铁齿铜牙纪晓岚")
+    engine._assert_target_playback = MagicMock(side_effect=[error, error])
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._page_state = MagicMock(return_value={"current_episode": 1})
+    ops = MagicMock()
+
+    with pytest.raises(RuntimeError, match="非目标合集"):
+        engine._ensure_target_playback_context(
+            ops, {"drama_name": "胭脂如梦如雨如尘2"}, {}, 20, 48
+        )
+
+    assert engine._recover_to_verified_episode.call_count == 1
+
+
+def test_final_evidence_gives_the_last_episode_a_longer_leash():
+    """最后一集正是红果推荐位最活跃的时候，多给几次机会。"""
+    engine = TaskEngine(task_id=270, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    app = {
+        "package": "com.phoenix.read",
+        "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+    }
+    other = {
+        "app": app,
+        "playback_visible": True,
+        "current_episode": 48,
+        "total_episodes": 48,
+        "collection_title": "铁齿铜牙纪晓岚",
+    }
+    target = {
+        "app": app,
+        "playback_visible": True,
+        "current_episode": 48,
+        "total_episodes": 48,
+        "collection_title": "胭脂如梦如雨如尘2",
+        "playing_title": "胭脂如梦如雨如尘2",
+    }
+    engine._page_state_with_empty_retry = MagicMock(
+        side_effect=[other, other, other, other, target, target, target]
+    )
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+    ops.pause_playback_if_playing.return_value = True
+    ops.take_screenshot.return_value = "C:/tmp/task_completed_summary.png"
+
+    result = engine._capture_final_episode_evidence(
+        ops, {"drama_name": "胭脂如梦如雨如尘2"}, 48
+    )
+
+    assert result == "C:/tmp/task_completed_summary.png"
+
+
+def test_final_evidence_still_fails_on_a_permanently_wrong_collection():
+    """防线没动：最后一集始终是别的剧，预算用尽后仍然失败。"""
+    engine = TaskEngine(task_id=271, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._recover_to_verified_episode = MagicMock(return_value=True)
+    engine._page_state_with_empty_retry = MagicMock(return_value={
+        "app": {
+            "package": "com.phoenix.read",
+            "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity",
+        },
+        "playback_visible": True,
+        "current_episode": 48,
+        "total_episodes": 48,
+        "collection_title": "铁齿铜牙纪晓岚",
+    })
+    ops = MagicMock()
+    ops._search_title_aliases = {}
+    ops.pause_playback_if_playing.return_value = True
+    ops.take_screenshot.return_value = "C:/tmp/x.png"
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        with pytest.raises(RuntimeError, match="无法取得目标短剧最后一集完成证据"):
+            engine._capture_final_episode_evidence(
+                ops, {"drama_name": "胭脂如梦如雨如尘2"}, 48
+            )
 
 
 # TASK_COMPLETE: phase2_rpa_engine

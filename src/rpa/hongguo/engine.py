@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
@@ -20,9 +21,23 @@ from pymysql.cursors import DictCursor
 from .ai_usage import record_usage
 from .comment_gen import CommentGenerator
 from .device import DEFAULT_ADDR, check_connection, connect
+from .dbresilience import (
+    BEST_EFFORT_BUDGET_SECONDS,
+    DB_HEALTH,
+    OUTAGE_BUDGET_SECONDS,
+    LogSpool,
+    call_with_retry,
+    execution_log_row,
+    flush_spooled_logs,
+    resilient_connect,
+    wait_for_database,
+)
 from .leases import DeviceLeaseStore
 from .operations import LIVE_LITE_ACTIVITY, SHORT_SERIES_ACTIVITY, HongguoOperations
+from .reclaim import is_foreign_fleet_reconcile, is_watchdog_reap
 
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SCREENSHOT_ROOT = os.environ.get(
     "SUPERCLAW_SCREENSHOT_ROOT",
@@ -43,6 +58,16 @@ UNREADABLE_PROBE_INTERVAL_SECONDS = 45
 COLD_RESET_ATTEMPTS = 2
 COLD_RESET_RETRY_DELAY_SECONDS = 3
 
+# 红果会在剧终前后开始推荐同系列短剧，播放页因此会自己切到别的剧：合集标题
+# 变成另一部，集数读成那部剧的第 1 集，或是在播放页上残留旧集数。2026-10-03
+# seq4《胭脂如梦如雨如尘2》就是被这个吃掉的 —— 563 在第 48 集（最后一集）读到
+# 「铁齿铜牙纪晓岚」、566 在第 47 集读成「第 1 集」，两台都差 1 集、已经跑了
+# 93~105 分钟，重跑白烧 3.3 设备·小时。
+# 已连续跑到倒数 TAIL_SWITCH_GRACE_EPISODES 集时，这种走位按「可恢复」处理，
+# 但预算有界：真错剧仍然会被判死。
+TAIL_SWITCH_GRACE_EPISODES = 1
+MAX_TAIL_SWITCH_RECOVERIES = 3
+
 
 class TaskEngine:
     """Runs one Hongguo task in a daemon thread."""
@@ -55,6 +80,8 @@ class TaskEngine:
         ai_config: Optional[Dict[str, Any]] = None,
         device_addr: str = DEFAULT_ADDR,
         lease_heartbeat: Optional[Callable[[int], None]] = None,
+        spool_dir: Optional[str] = None,
+        db_outage_budget: Optional[float] = None,
     ):
         self.task_id = int(task_id)
         self.db_config = dict(db_config)
@@ -80,6 +107,30 @@ class TaskEngine:
         self._generator = CommentGenerator(self.ai_config)
         self._lease_heartbeat = lease_heartbeat
         self._last_lease_heartbeat = 0.0
+        # Resilience, see rpa/hongguo/dbresilience.py for the 2026-09-16 incident
+        # that motivated all of this.
+        self._spool = LogSpool(spool_dir)
+        self._db_outage_budget = (
+            float(db_outage_budget) if db_outage_budget is not None else OUTAGE_BUDGET_SECONDS
+        )
+        self._db_outage_seen = False
+        self._db_retry_count = 0
+        self._external_reclaim_checked = False
+        self._last_foreign_repair_at = 0.0
+        self._foreign_reclaim_repairs = 0
+        # Budget for the "红果 swapped in a sibling drama near the finale" case,
+        # see TAIL_SWITCH_GRACE_EPISODES.
+        self._tail_switch_recoveries = 0
+        # When this thread last went blind and last came back.  A watchdog on
+        # another node reaps rows by looking at updated_at, so an outage longer
+        # than its threshold makes it declare a *live* thread dead the moment
+        # the link returns.  These two timestamps are what tell a false reap
+        # (we were blind, not gone) from a real one (stuck thread, healthy
+        # link).  See _is_watchdog_false_reap / _blinded_by_recent_outage.
+        self._db_down_since = None  # type: Optional[float]
+        self._db_recovered_at = 0.0
+        # Injectable so an outage test does not have to really wait it out.
+        self._db_sleep = time.sleep
 
     @property
     def is_alive(self) -> bool:
@@ -130,6 +181,9 @@ class TaskEngine:
 
     def _run_verified_flow(self) -> None:
         Path(self.screenshot_dir).mkdir(parents=True, exist_ok=True)
+        # Anything spooled by an earlier outage goes back in before this run adds
+        # more lines to the local file.
+        self._flush_spooled_logs()
         self._ai_comment_disabled_reason = ""
         try:
             os.environ.pop("PYTHONPATH", None)
@@ -203,6 +257,7 @@ class TaskEngine:
 
             for episode in range(1, total + 1):
                 self._check_pause_stop()
+                self._check_external_reclaim()
                 state = self._page_state(ops, task)
                 app = state.get("app") or {}
                 if (
@@ -381,6 +436,12 @@ class TaskEngine:
                 updated_at=completed_at,
             )
             self._log("info", "全流程v3: 任务已停止")
+        except ExternalReclaimDetected as exc:
+            # The row now belongs to whoever reclaimed it.  Do not fight over it
+            # and do not overwrite their message - stop cleanly and leave a
+            # record of what actually happened.
+            logger.warning("task %s: %s", self.task_id, exc)
+            self._log("warn", str(exc))
         except Exception as exc:
             completed_at = datetime.now()
             self._update_task(
@@ -399,7 +460,11 @@ class TaskEngine:
         total: int,
     ) -> str:
         last_error = ""
-        for attempt in range(2):
+        # This method only ever runs for the last episode, which is exactly where
+        # 红果 starts recommending siblings, so it gets the longer leash directly.
+        # Extra attempts are still bounded by the shared tail-switch budget.
+        max_attempts = 2 + MAX_TAIL_SWITCH_RECOVERIES
+        for attempt in range(max_attempts):
             self._check_pause_stop()
             try:
                 state = self._page_state_with_empty_retry(ops, task)
@@ -437,7 +502,14 @@ class TaskEngine:
                     "warn",
                     f"全流程v3: 第{attempt + 1}次完成证据校验失败 - {last_error}",
                 )
-            if attempt == 0 and self._recover_to_verified_episode(
+            if attempt + 1 >= max_attempts:
+                break
+            # The first retry is the original cheap path. Retries beyond it only
+            # exist for the finale and spend the shared tail-switch budget, so a
+            # genuinely wrong collection still fails.
+            if attempt and not self._tail_switch_recovery_allowed(total, total):
+                break
+            if self._recover_to_verified_episode(
                 ops,
                 task,
                 total,
@@ -527,7 +599,12 @@ class TaskEngine:
             uncertain = self._uncertain_engagement_episodes[action]
             for episode in sorted(uncertain):
                 self._check_pause_stop()
-                if action == "like" and not self._recover_to_verified_episode(
+                # 点赞和收藏必须一视同仁：待确认的那一次点击是在**某一集**上做的，
+                # 复核就得回到那一集去看。以前只有点赞会先恢复、收藏直接在当前页
+                # （跑完时是最后一集）上读，读到的当然是别的集的状态，收藏于是
+                # 永远确认不了（2026-10-01 seq3 的 536：30/30 跑完、点赞 2/2，
+                # 只因收藏 0/1 整部判失败）。
+                if not self._recover_to_verified_episode(
                     ops,
                     task,
                     episode,
@@ -538,6 +615,14 @@ class TaskEngine:
                     continue
                 result = ops.inspect_current_episode_engagement(action)
                 selected = result.get("selected")
+                # 状态不可读多半是切集后控件还没渲染完，再给两拍。这里只读不点，
+                # 不会造成重复点击。
+                for _ in range(2):
+                    if selected is not None:
+                        break
+                    time.sleep(1.5)
+                    result = ops.inspect_current_episode_engagement(action)
+                    selected = result.get("selected")
                 self._log(
                     "info" if selected is True else "warn",
                     f"全流程v3: 第{episode}集待确认{label}复核="
@@ -696,7 +781,31 @@ class TaskEngine:
             ):
                 raise
             recovered_state = self._page_state(ops, task)
-            self._assert_target_playback(ops, task, recovered_state, expected_total)
+            try:
+                self._assert_target_playback(ops, task, recovered_state, expected_total)
+            except RuntimeError as settle_exc:
+                # Near the finale 红果 keeps swapping in a sibling drama right
+                # after we restore, which is why task 563 reported a successful
+                # recovery and died 3s later. This drama already played
+                # ``episode - 1`` episodes, so one more bounded attempt is a
+                # 走位 fix rather than evidence of a wrong drama.
+                if not self._tail_switch_recovery_allowed(expected_total, episode):
+                    raise
+                self._log(
+                    "warn",
+                    f"全流程v3: 第{episode}集已到剧末尾段，恢复后又被切走（{settle_exc}），"
+                    f"再做一次恢复 {self._tail_switch_recoveries}/{MAX_TAIL_SWITCH_RECOVERIES}",
+                )
+                if not self._recover_to_verified_episode(
+                    ops,
+                    task,
+                    episode,
+                    expected_total,
+                    f"剧末尾段恢复后再次被切换: {settle_exc}",
+                ):
+                    raise
+                recovered_state = self._page_state(ops, task)
+                self._assert_target_playback(ops, task, recovered_state, expected_total)
             return recovered_state
 
     def _reschedule_engagement_episode(
@@ -862,7 +971,7 @@ class TaskEngine:
             self._log("info", "全流程v3: 切第1集前检测到广告，已上滑继续观看")
             time.sleep(2)
 
-        total_before = int(ops.get_total_episodes() or 0)
+        total_before = self._read_stable_total_episodes(ops)
         if task_total and total_before and task_total != total_before:
             shot = ops.take_screenshot("select_drama_total_mismatch", self.screenshot_dir)
             self._log(
@@ -893,8 +1002,13 @@ class TaskEngine:
             raise RuntimeError(f"首集播放失败，已截图 {shot}")
 
         state = self._page_state_with_empty_retry(ops, task)
-        total = int(state.get("total_episodes") or total_before or task_total or 0)
-        verified_total = int(total_before or task_total or total or 0)
+        # 只认「共识读数」：单次快照可能因为懒加载偏小，也可能因为相邻推荐位或
+        # 残留节点偏大。首集播完后再采一次共识值，两次取大者——懒加载只增不减。
+        stable_total = self._read_stable_total_episodes(ops, attempts=3)
+        total = max(stable_total, int(total_before or 0))
+        if total <= 0:
+            total = int(state.get("total_episodes") or 0) or int(task_total or 0)
+        verified_total = int(total or total_before or task_total or 0)
         try:
             self._assert_target_playback(
                 ops,
@@ -1251,7 +1365,7 @@ class TaskEngine:
         return self._missing_verified_comment_episodes(missing_comments)
 
     def _comment_contents_for_episode(self, episode: int) -> set[str]:
-        try:
+        def work() -> set[str]:
             with self._connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -1267,6 +1381,9 @@ class TaskEngine:
                         for row in cur.fetchall() or []
                         if str(row.get("comment_text") or "").strip()
                     }
+
+        try:
+            return self._run_db(work, label="comment_contents_episode", critical=True)
         except Exception:
             return set()
 
@@ -1275,36 +1392,40 @@ class TaskEngine:
         try:
             task = self._load_task() or {}
             multi_run_id = str(task.get("multi_run_id") or "").strip()
-            with self._connection() as conn:
-                with conn.cursor() as cur:
-                    if multi_run_id:
-                        cur.execute(
-                            """
-                            SELECT record.comment_text
-                            FROM hongguo_comment_records AS record
-                            JOIN hongguo_comment_tasks AS task ON task.id=record.task_id
-                            WHERE task.multi_run_id=%s
-                              AND record.comment_text IS NOT NULL
-                              AND TRIM(record.comment_text) <> ''
-                            """,
-                            (multi_run_id,),
-                        )
-                    else:
-                        cur.execute(
-                            """
-                            SELECT comment_text
-                            FROM hongguo_comment_records
-                            WHERE task_id=%s
-                              AND comment_text IS NOT NULL
-                              AND TRIM(comment_text) <> ''
-                            """,
-                            (self.task_id,),
-                        )
-                    return {
-                        str(row.get("comment_text") or "").strip()
-                        for row in cur.fetchall() or []
-                        if str(row.get("comment_text") or "").strip()
-                    }
+
+            def work() -> set[str]:
+                with self._connection() as conn:
+                    with conn.cursor() as cur:
+                        if multi_run_id:
+                            cur.execute(
+                                """
+                                SELECT record.comment_text
+                                FROM hongguo_comment_records AS record
+                                JOIN hongguo_comment_tasks AS task ON task.id=record.task_id
+                                WHERE task.multi_run_id=%s
+                                  AND record.comment_text IS NOT NULL
+                                  AND TRIM(record.comment_text) <> ''
+                                """,
+                                (multi_run_id,),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT comment_text
+                                FROM hongguo_comment_records
+                                WHERE task_id=%s
+                                  AND comment_text IS NOT NULL
+                                  AND TRIM(comment_text) <> ''
+                                """,
+                                (self.task_id,),
+                            )
+                        return {
+                            str(row.get("comment_text") or "").strip()
+                            for row in cur.fetchall() or []
+                            if str(row.get("comment_text") or "").strip()
+                        }
+
+            return self._run_db(work, label="comment_contents_batch", critical=True)
         except Exception:
             return set()
 
@@ -1938,6 +2059,18 @@ class TaskEngine:
                     f"跳过待执行集: 目标第{recovery_target}集，当前第{current}集"
                 )
             if current and current < episode:
+                # Around the finale 红果 hops to a sibling drama whose first
+                # episode reads as "第1集" (2026-10-03 task 566: 上一集第47集，
+                # 当前第1集). That is the tail switch, not a rewind, so re-enter
+                # the target drama instead of failing one episode short.
+                if self._tail_switch_recovery_allowed(expected_total, episode) and self._recover_to_verified_episode(
+                    ops,
+                    task,
+                    target,
+                    expected_total,
+                    f"剧末尾段红果切到其它短剧，上一集第{episode}集，当前第{current}集",
+                ):
+                    return True
                 raise RuntimeError(f"回退异常: 上一集第{episode}集，当前第{current}集")
             time.sleep(2)
         # The episode marker can update immediately after the deadline. Confirm
@@ -2251,12 +2384,26 @@ class TaskEngine:
                     ):
                         confirmed = self._confirm_current_episode(ops, target)
                         if confirmed == target:
-                            self._log("info", f"全流程v3: 已恢复到第{target}集")
-                            return True
-                        self._log(
-                            "warn",
-                            f"全流程v3: 第{target}集恢复校验曾成功，但强确认当前集={confirmed or 0}，继续恢复",
-                        )
+                            # The episode counter keeps showing the old value for
+                            # a moment after 红果 swaps in a recommendation, so a
+                            # matching counter alone is not proof: task 563 was
+                            # told "已恢复到第48集" and failed 3s later on the
+                            # collection title. Confirm the drama too.
+                            settled = self._page_state(ops, task)
+                            if not self._state_is_other_drama(ops, task, settled):
+                                self._log("info", f"全流程v3: 已恢复到第{target}集")
+                                return True
+                            self._log(
+                                "warn",
+                                f"全流程v3: 第{target}集集数已对上，但页面仍是别的短剧"
+                                f"（{settled.get('collection_title') or settled.get('playing_title') or '-'}），"
+                                "拒绝误判成功，继续恢复",
+                            )
+                        else:
+                            self._log(
+                                "warn",
+                                f"全流程v3: 第{target}集恢复校验曾成功，但强确认当前集={confirmed or 0}，继续恢复",
+                            )
             except RuntimeError as exc:
                 self._log("warn", f"全流程v3: 常规恢复第{target}集失败: {exc}")
                 if any(marker in str(exc) for marker in ("总集数不匹配", "非目标合集")):
@@ -2294,6 +2441,9 @@ class TaskEngine:
             if reopened:
                 confirmed = self._confirm_current_episode(ops, target)
                 if confirmed == target:
+                    # A re-search genuinely re-entered the drama, so the episode
+                    # counter is trustworthy here; callers still run
+                    # ``_assert_target_playback`` on the returned state.
                     self._log(
                         "info",
                         f"全流程v3: 第{reopen_attempt + 1}轮重新进入短剧后已恢复到第{target}集",
@@ -2620,6 +2770,48 @@ class TaskEngine:
                 time.sleep(2)
         return state
 
+    def _read_stable_total_episodes(
+        self,
+        ops: HongguoOperations,
+        attempts: int = 4,
+        interval: float = 1.0,
+    ) -> int:
+        """Read the drama's episode total without trusting one snapshot.
+
+        Hongguo renders the collection's episode list lazily: right after the
+        player opens only the first few episodes exist in the view hierarchy,
+        so ``get_total_episodes`` reports less than the drama really has.
+        Freezing that first reading into the task row is what killed
+        seq3《丧尸狂潮》on 2026-10-01 - the row was written with 29, the next read
+        saw 30, and the mismatch guard failed the whole drama.
+
+        Lazy rendering only ever grows, so a non-decreasing series yields the
+        last sample. A read that jumps up and comes back down is a neighbouring
+        card's count (61 next to a 30-episode drama), so the most frequent value
+        wins instead of the maximum.
+        """
+        rounds = max(1, attempts)
+        samples: List[int] = []
+        for index in range(rounds):
+            try:
+                value = int(ops.get_total_episodes() or 0)
+            except Exception as exc:  # pragma: no cover - defensive
+                self._log("warn", f"全流程v3: 读取总集数失败({index + 1}/{rounds}): {exc}")
+                value = 0
+            if value > 0:
+                samples.append(value)
+            if index + 1 < rounds:
+                time.sleep(max(0.0, interval))
+        if not samples:
+            return 0
+        if all(earlier <= later for earlier, later in zip(samples, samples[1:])):
+            return samples[-1]
+        counts: Dict[int, int] = {}
+        for value in samples:
+            counts[value] = counts.get(value, 0) + 1
+        best = max(counts.values())
+        return min(value for value, count in counts.items() if count == best)
+
     def _take_diagnostic_screenshot(self, ops: HongguoOperations, name: str) -> str:
         try:
             return str(ops.take_screenshot(name, self.screenshot_dir) or "")
@@ -2781,6 +2973,89 @@ class TaskEngine:
                 return
             raise RuntimeError("未检测到播放控件")
 
+    def _title_conflicts(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> bool:
+        """True when a *reliable* on-screen title clearly contradicts the task.
+
+        The collection / playing title is what actually identifies a drama on
+        Hongguo; the episode count is a lazily re-rendered number. Keep the
+        total-based guard anchored to the signal that cannot drift.
+        """
+        keyword = str(task.get("drama_name") or "").strip()
+        if not keyword:
+            return False
+        aliases = getattr(ops, "_search_title_aliases", {}) or {}
+        for key in ("collection_title", "playing_title"):
+            title = str(state.get(key) or "").strip()
+            if not title:
+                continue
+            if not self._reliable_title_signal(keyword, title, aliases):
+                # An unrelated caption is not evidence of the wrong drama. Leave
+                # it to ``_assert_target_playback``, which reports it as
+                # "非目标合集" and drives the re-search recovery, instead of
+                # failing the drama with a total-mismatch message.
+                continue
+            if not self._strict_title_matches(keyword, title, aliases):
+                return True
+        return False
+
+    def _in_drama_tail(self, expected_total: int, episode: int) -> bool:
+        """True once playback has reached the last couple of episodes.
+
+        That is where 红果 starts recommending sibling dramas, so an unexpected
+        collection/title swap is a走位 to recover from rather than proof of the
+        wrong drama. See TAIL_SWITCH_GRACE_EPISODES.
+        """
+        total = int(expected_total or 0)
+        if total <= 0:
+            return False
+        return int(episode or 0) >= total - TAIL_SWITCH_GRACE_EPISODES
+
+    def _tail_switch_recovery_allowed(self, expected_total: int, episode: int) -> bool:
+        """Consume one tail-switch slot, refusing once the budget is spent.
+
+        Bounded on purpose: the recommendation hop is expected near the finale,
+        but a task that keeps landing on another drama is a real mismatch and
+        has to fail rather than loop forever.
+        """
+        if not self._in_drama_tail(expected_total, episode):
+            return False
+        if self._tail_switch_recoveries >= MAX_TAIL_SWITCH_RECOVERIES:
+            return False
+        self._tail_switch_recoveries += 1
+        return True
+
+    def _state_is_other_drama(
+        self,
+        ops: HongguoOperations,
+        task: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> bool:
+        """True when the on-screen identity belongs to a different drama.
+
+        Mirrors the collection / playing-title checks in
+        ``_assert_target_playback``: on 红果 those two signals are what actually
+        name the drama, while ``detail_title`` is a recommendation-card caption
+        that needs the reliability filter. Recovery has to use the very same
+        yardstick, otherwise a counter still showing the old episode reads as a
+        successful recovery and the next verification kills the task 1 episode
+        short (2026-10-03 task 563: "已恢复到第48集", then "检测到非目标合集:
+        期望 胭脂如梦如雨如尘2，实际 铁齿铜牙纪晓岚").
+        """
+        keyword = str(task.get("drama_name") or "").strip()
+        if not keyword:
+            return False
+        aliases = getattr(ops, "_search_title_aliases", {}) or {}
+        for key in ("collection_title", "playing_title"):
+            title = str(state.get(key) or "").strip()
+            if title and not self._strict_title_matches(keyword, title, aliases):
+                return True
+        return False
+
     def _total_mismatch_is_fatal(
         self,
         ops: HongguoOperations,
@@ -2797,7 +3072,18 @@ class TaskEngine:
         keyword = str(task.get("drama_name") or "").strip()
         detail_title = str(state.get("detail_title") or "").strip()
         title_matches = bool(detail_title and keyword and ops._title_matches(keyword, detail_title))
-        if title_matches and total < expected_total:
+        if total > expected_total:
+            # Hongguo renders the episode total lazily, so an on-screen total
+            # larger than the one we recorded is almost always "the first read
+            # was too early", never proof of the wrong drama. Treating it as
+            # fatal killed a healthy task 347s in (2026-10-01 seq3《丧尸狂潮》:
+            # 期望 29 / 实际 30) and replayed the whole batch. A genuinely wrong
+            # collection is caught by the title checks in
+            # ``_assert_target_playback`` and ``_mismatched_collection_title``;
+            # on the playback surface the larger number may even belong to a
+            # neighbouring recommendation card (期望 40 / 实际 48).
+            return self._title_conflicts(ops, task, state)
+        if title_matches:
             observed_floor = max(current, target)
             if observed_floor and total >= observed_floor:
                 return False
@@ -2939,19 +3225,23 @@ class TaskEngine:
         params: List[Any] = [self.task_id, episode]
         if started_at:
             params.append(started_at)
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT id
-                    FROM hongguo_comment_records
-                    WHERE task_id=%s AND episode_number=%s AND status='success' {run_filter}
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    params,
-                )
-                return cur.fetchone() is not None
+
+        def work() -> bool:
+            with self._connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id
+                        FROM hongguo_comment_records
+                        WHERE task_id=%s AND episode_number=%s AND status='success' {run_filter}
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        params,
+                    )
+                    return cur.fetchone() is not None
+
+        return bool(self._run_db(work, label="comment_verified_check", critical=True))
 
     def _missing_verified_comment_episodes(self, comment_episodes: Iterable[int]) -> List[int]:
         return [episode for episode in sorted(set(comment_episodes)) if not self._comment_already_verified(episode)]
@@ -3737,34 +4027,41 @@ class TaskEngine:
             return []
 
     def _completed_comment_episodes(self) -> set[int]:
-        episodes: set[int] = set()
         task = self._load_task()
         started_at = task.get("started_at") if task else None
         run_filter = "AND created_at >= %s" if started_at else ""
         params: List[Any] = [self.task_id]
         if started_at:
             params.append(started_at)
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT episode_number
-                    FROM hongguo_comment_records
-                    WHERE task_id=%s AND status='success' {run_filter}
-                    """,
-                    params,
-                )
-                for row in cur.fetchall():
-                    episode = row.get("episode_number")
-                    if isinstance(episode, int) and episode > 0:
-                        episodes.add(episode)
-        return episodes
+
+        def work() -> set[int]:
+            episodes: set[int] = set()
+            with self._connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT episode_number
+                        FROM hongguo_comment_records
+                        WHERE task_id=%s AND status='success' {run_filter}
+                        """,
+                        params,
+                    )
+                    for row in cur.fetchall():
+                        episode = row.get("episode_number")
+                        if isinstance(episode, int) and episode > 0:
+                            episodes.add(episode)
+            return episodes
+
+        return self._run_db(work, label="completed_comment_episodes", critical=True)
 
     def _load_task(self) -> Optional[Dict[str, Any]]:
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM hongguo_comment_tasks WHERE id=%s", (self.task_id,))
-                return cur.fetchone()
+        def work() -> Optional[Dict[str, Any]]:
+            with self._connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT * FROM hongguo_comment_tasks WHERE id=%s", (self.task_id,))
+                    return cur.fetchone()
+
+        return self._run_db(work, label="load_task", critical=True)
 
     def _current_ai_config(self) -> Dict[str, Any]:
         manager = TaskEngineManager.get_instance()
@@ -3779,28 +4076,298 @@ class TaskEngine:
         screenshot_path = screenshot_match.group(1).rstrip("。.;；") if screenshot_match else None
         return episode, screenshot_path
 
-    def _log(self, level: str, message: str) -> None:
-        episode_number, screenshot_path = self._structured_log_context(message)
+    def _run_db(self, work: Callable[[], Any], *, label: str, critical: bool) -> Any:
+        """Run one database interaction, riding out a transient outage.
+
+        ``critical`` decides how much the task is willing to pay for the call.
+        Losing a task status, a counter or a comment record silently is worse
+        than stalling, so those wait an outage out (up to
+        ``self._db_outage_budget``).  A log line is not worth blocking the device
+        flow for, so it gives up quickly and spools instead.
+
+        A process that has never reached the database is misconfigured rather
+        than unlucky, so it fails fast instead of sitting in the retry loop for
+        half an hour - which is also what keeps a broken ``db_config`` in a test
+        from hanging.
+        """
+        budget = self._db_outage_budget if critical else BEST_EFFORT_BUDGET_SECONDS
+        if not DB_HEALTH.ever_connected:
+            budget = 0.0
+
+        def should_abort() -> bool:
+            return self._stop_event.is_set()
+
+        if critical and DB_HEALTH.is_down():
+            # Known outage: pay for a real probe loop before touching the work.
+            wait_for_database(
+                self.db_config,
+                budget=budget,
+                should_abort=should_abort,
+                sleep=self._db_sleep,
+            )
         try:
+            result = call_with_retry(
+                work,
+                label=label,
+                budget=budget,
+                should_abort=should_abort,
+                on_retry=self._note_db_retry,
+                sleep=self._db_sleep,
+            )
+        finally:
+            self._maybe_flush_spool()
+        if self._db_down_since is not None:
+            # First success after a blind spell: datable recovery.
+            self._db_down_since = None
+            self._db_recovered_at = time.monotonic()
+        return result
+
+    def _note_db_retry(self, attempt: int, wait: float, exc: BaseException) -> None:
+        """Record the first retry of an outage; the rest would just be noise."""
+        if self._db_down_since is None:
+            # Stamped before the de-duplication below, so *every* outage this
+            # thread lives through is datable - not just the first one it ever
+            # saw.  The timestamp is what proves a later reap was written while
+            # this thread was blind rather than stuck.
+            self._db_down_since = time.monotonic()
+        if self._db_outage_seen:
+            return
+        self._db_outage_seen = True
+        self._db_retry_count += 1
+        logger.warning(
+            "task %s: 数据库不可达，开始退避重试(%s): %s",
+            self.task_id,
+            exc,
+            round(wait, 2),
+        )
+
+    def _flush_spooled_logs(self) -> int:
+        """Push rows spooled during an outage back into hongguo_execution_logs."""
+        try:
+            if self._spool.pending_count() == 0:
+                return 0
+            delivered = flush_spooled_logs(execution_log_row, self._spool, self.db_config)
+        except Exception:
+            return 0
+        if delivered:
+            logger.info("task %s: 补写离线期间的执行日志 %s 条", self.task_id, delivered)
+        return delivered
+
+    def _maybe_flush_spool(self) -> None:
+        if DB_HEALTH.is_down():
+            return
+        self._flush_spooled_logs()
+
+    # Statuses only an outside writer can leave on a row this thread is driving.
+    # Anything else (blank, unknown, "running"/"paused") is not evidence of a stop.
+    _TERMINAL_STATUSES = frozenset({"stopped", "failed", "completed"})
+
+    #: How long after the database comes back a watchdog reap is still read as
+    #: "written while this thread was blind".  Reaps land within seconds of
+    #: recovery, so a few minutes is ample slack, and it is short enough that a
+    #: genuinely stuck thread cannot hide behind an old outage.
+    _FALSE_REAP_WINDOW_SECONDS = 300.0
+
+    def _check_external_reclaim(self) -> None:
+        """React to a status this thread did not write.
+
+        An outside writer can reap a row this thread is still driving, and three
+        very different stories look identical in the database:
+
+        * A genuine stop - the operator pressed 停止, this machine's own API
+          restarted, or a watchdog decided the thread was gone.  The row is
+          right and the thread is wrong, so the run ends loudly.
+        * An **old-version node's startup reconcile**.  Before commit 3790522
+          (2026-09-11) ``reconcile_runtime_state`` had no worker filter: it
+          stopped *every* running task in the shared database and deleted *every*
+          device lease.  A node still running that build therefore reaps the
+          whole fleet every time it starts - tasks 373, 377, 380-383, 394-398,
+          399-401 and 418 all died that way, and on 2026-09-16 somebody repaired
+          394-398 by hand ("为共享库被其它节点启动时误标，任务线程实际仍在运行").
+        * A **watchdog reaping a thread that was only blind**.  A watchdog ages
+          ``updated_at``, and while MySQL is unreachable this thread cannot
+          refresh it, so an outage longer than the threshold reads as "went
+          silent".  Tasks 420-423 were reaped that way at episode 47/48 on
+          2026-09-17 after 113 minutes offline, with the threads still alive.
+
+        Each is told apart by its message.  The old build wrote
+        ``服务进程已重启，原执行线程不存在，请手动重新启动任务`` naming no owner at all,
+        while this machine's own reconcile prefixes it with ``执行电脑 <worker> 的``;
+        the watchdog writes ``执行线程已失联（N 分钟无心跳，节点 <worker>）``.  A
+        watchdog reap is repaired only when this thread carries a fresh recovery
+        stamp, so a thread that really did go quiet still stays reaped and its
+        device still gets freed.
+
+        This used to run only after a database outage, so a sweep arriving over a
+        perfectly healthy link - task 418 on 2026-09-17 - went unnoticed while the
+        thread kept driving a device no row was tracking any more.
+        """
+        if self._stop_event.is_set():
+            return
+        try:
+            task = self._load_task() or {}
+        except Exception:
+            return  # a failed read is not a verdict; the next episode retries
+        status = str(task.get("status") or "").strip().lower()
+        if status in {"running", "paused"}:
+            # Healthy row.  Clear the marker so a stop landing later is still
+            # caught instead of being silenced by one early check.
+            self._external_reclaim_checked = False
+            return
+        if status not in self._TERMINAL_STATUSES:
+            # A blank or unknown status is missing information, not a verdict.
+            # Reading it as "somebody stopped us" ended a healthy run whenever a
+            # row could not be read - and a deleted row is just as inconclusive.
+            # Only a terminal status proves an outside writer touched the row.
+            return
+        message = str(task.get("error_message") or "")
+        if self._is_foreign_fleet_reconcile(message):
+            self._repair_foreign_reclaim(message)
+            return
+        if self._is_watchdog_false_reap(message) and self._blinded_by_recent_outage():
+            # Fleet watchdogs reap by the age of updated_at.  An outage longer
+            # than their threshold makes them read "this thread stopped
+            # heartbeating" when the truth is "this thread could not write" -
+            # so the row is wrong and the live thread takes it back, exactly as
+            # for the fleet-wide reconcile.
+            self._repair_foreign_reclaim(
+                message, reason="断线期间其它节点的看门狗误判本机任务失联"
+            )
+            return
+        if self._external_reclaim_checked:
+            return
+        self._external_reclaim_checked = True
+        raise ExternalReclaimDetected(
+            "任务行已被外部置为 {0}，本机线程仍在运行（大概率是节点看门狗回收）：{1}".format(
+                status, message
+            )
+        )
+
+    @staticmethod
+    def _is_foreign_fleet_reconcile(message: str) -> bool:
+        """True only for the pre-3790522 message, which named no machine.
+
+        Kept as a named method because the call site reads better for it, but
+        the rule itself lives in :mod:`rpa.hongguo.reclaim` so the queue
+        dispatcher judges the same sentence the same way.
+        """
+        return is_foreign_fleet_reconcile(message)
+
+    @staticmethod
+    def _is_watchdog_false_reap(message: str) -> bool:
+        """True for the fleet watchdog's "this thread went silent" reap.
+
+        Shape-matched rather than call-site-matched because it is written from
+        outside this repo; see :mod:`rpa.hongguo.reclaim` for the rule and the
+        2026-09-17 tasks it was derived from.
+        """
+        return is_watchdog_reap(message)
+
+    def _blinded_by_recent_outage(self) -> bool:
+        """Whether this thread was locked out of the database moments ago.
+
+        The guard that keeps a false reap apart from a real one.  A thread that
+        was merely blind has a fresh recovery stamp, so the missing heartbeats
+        are explained by the outage.  A thread that wedged while the link was
+        healthy has no such stamp - it really did go quiet, and must stay
+        reaped so the watchdog can still free its device.
+        """
+        return (time.monotonic() - self._db_recovered_at) < self._FALSE_REAP_WINDOW_SECONDS
+
+    def _repair_foreign_reclaim(self, message: str, reason: str = "") -> None:
+        """Put the row back under this thread and keep going.
+
+        The thread is demonstrably alive - the caller is running inside it - so
+        the honest reading of an outside sweep is "the row is wrong", not "the
+        thread is wrong".  Without this, an unrelated node starting up silently
+        ends a run that is still holding a device.  Repairs are rate limited to
+        120s so a node restarting in a loop cannot turn this into a write storm.
+        """
+        now = time.monotonic()
+        if now - self._last_foreign_repair_at < 120.0:
+            return
+        self._last_foreign_repair_at = now
+        self._foreign_reclaim_repairs += 1
+        note = "（原 error_message：{0}）".format(message)
+        note = (
+            reason
+            or "检测到其它节点旧版本的全库 reconcile 误标本机任务，已纠正状态并继续执行"
+        ) + note
+
+        def work() -> bool:
             with self._connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO hongguo_execution_logs (
-                            task_id, level, message, episode_number, screenshot_path, created_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        UPDATE hongguo_comment_tasks
+                        SET status='running', error_message=NULL, completed_at=NULL,
+                            updated_at=%s
+                        WHERE id=%s AND status IN ('stopped', 'failed')
                         """,
-                        (
-                            self.task_id,
-                            level,
-                            message,
-                            episode_number,
-                            screenshot_path,
-                            datetime.now(),
-                        ),
+                        (datetime.now(), self.task_id),
                     )
-        except Exception:
-            pass
+                    repaired = int(cur.rowcount or 0)
+                    if repaired:
+                        cur.execute(
+                            """
+                            INSERT INTO hongguo_execution_logs
+                                (task_id, level, message, created_at)
+                            VALUES (%s, 'warn', %s, %s)
+                            """,
+                            (self.task_id, note, datetime.now()),
+                        )
+            return bool(repaired)
+
+        try:
+            repaired = self._run_db(work, label="repair_foreign_reclaim", critical=False)
+        except Exception as exc:
+            logger.warning("task %s: 纠正外部误标失败，下一集重试: %s", self.task_id, exc)
+            return
+        if repaired:
+            logger.warning("task %s: %s", self.task_id, note)
+
+    def _log(self, level: str, message: str) -> None:
+        """Append one execution-log row.
+
+        Best effort by design: a log line must never block the device flow and
+        must never take the task down.  When the database is unreachable the row
+        goes to the local spool instead and is replayed with its original
+        timestamp once the link returns - an outage no longer looks like a silent
+        thread, which is exactly how tasks 409/410/412 lost three hours of
+        evidence.
+        """
+        episode_number, screenshot_path = self._structured_log_context(message)
+        row = {
+            "task_id": self.task_id,
+            "level": level,
+            "message": message,
+            "episode_number": episode_number,
+            "screenshot_path": screenshot_path,
+            "created_at": datetime.now(),
+        }
+        if DB_HEALTH.is_down():
+            # The link is known to be broken: do not stall the run for a log line.
+            self._spool.append(row)
+            return
+        try:
+            self._run_db(
+                lambda: self._write_log_row(row),
+                label="execution_log",
+                critical=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "task %s: 日志写入失败，已转入本地缓冲 %s: %s",
+                self.task_id,
+                self._spool.path,
+                exc,
+            )
+            self._spool.append(row)
+
+    def _write_log_row(self, row: Dict[str, Any]) -> None:
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                execution_log_row(cur, row)
 
     def _save_record(
         self,
@@ -3815,54 +4382,65 @@ class TaskEngine:
         sent_at: Optional[datetime] = None,
         verified_at: Optional[datetime] = None,
     ) -> None:
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO hongguo_comment_records (
-                        task_id, episode_number, comment_text, generated_by,
-                        status, sent_at, verified_at, screenshot_input, screenshot_sent,
-                        screenshot_verified, error_message, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        self.task_id,
-                        episode,
-                        content,
-                        source,
-                        status,
-                        sent_at,
-                        verified_at,
-                        screenshot_input or None,
-                        screenshot_sent or None,
-                        screenshot_verified or None,
-                        error_message,
-                        datetime.now(),
-                    ),
-                )
+        def work() -> None:
+            with self._connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO hongguo_comment_records (
+                            task_id, episode_number, comment_text, generated_by,
+                            status, sent_at, verified_at, screenshot_input, screenshot_sent,
+                            screenshot_verified, error_message, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            self.task_id,
+                            episode,
+                            content,
+                            source,
+                            status,
+                            sent_at,
+                            verified_at,
+                            screenshot_input or None,
+                            screenshot_sent or None,
+                            screenshot_verified or None,
+                            error_message,
+                            datetime.now(),
+                        ),
+                    )
+
+        self._run_db(work, label="comment_record", critical=True)
 
     def _increment_counter(self, counter: str) -> None:
         if counter not in {"sent", "verified"}:
             return
         column = "comments_verified" if counter == "verified" else "comments_sent"
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"UPDATE hongguo_comment_tasks SET {column}={column}+1 WHERE id=%s",
-                    (self.task_id,),
-                )
+
+        def work() -> None:
+            with self._connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE hongguo_comment_tasks SET {column}={column}+1 WHERE id=%s",
+                        (self.task_id,),
+                    )
+
+        self._run_db(work, label="counter_{0}".format(counter), critical=True)
 
     def _increment_engagement_counter(self, action: str) -> None:
         columns = {"like": "likes_completed", "favorite": "favorites_completed"}
         column = columns.get(action)
         if not column:
             return
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"UPDATE hongguo_comment_tasks SET {column}={column}+1 WHERE id=%s",
-                    (self.task_id,),
-                )
+
+        def work() -> None:
+            with self._connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE hongguo_comment_tasks SET {column}={column}+1 WHERE id=%s",
+                        (self.task_id,),
+                    )
+
+        self._run_db(work, label="engagement_{0}".format(action), critical=True)
 
     def _update_task(self, **kwargs: Any) -> None:
         if not kwargs:
@@ -3879,16 +4457,18 @@ class TaskEngine:
             assignments.append(f"{key}=%s")
             values.append(value)
         values.append(self.task_id)
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"UPDATE hongguo_comment_tasks SET {', '.join(assignments)} WHERE id=%s",
-                    values,
-                )
+        statement = f"UPDATE hongguo_comment_tasks SET {', '.join(assignments)} WHERE id=%s"
+
+        def work() -> None:
+            with self._connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(statement, values)
+
+        self._run_db(work, label="task_update", critical=True)
 
     @contextmanager
     def _connection(self):
-        conn = pymysql.connect(**self.db_config)
+        conn = resilient_connect(self.db_config)
         try:
             yield conn
             conn.commit()
@@ -4022,3 +4602,10 @@ class TaskEngineManager:
 
 class StopRequested(Exception):
     """Raised internally when the task is stopped."""
+
+
+class ExternalReclaimDetected(Exception):
+    """Raised when another node's watchdog reclaimed a task this thread runs."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
