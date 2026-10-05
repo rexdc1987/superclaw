@@ -1,0 +1,33 @@
+{
+  "_comment": "Runtime distributions bundled into the shipped Python embeddable. Derived from the import closure of api.main:app plus uvicorn (see deploy/README.md). Keep this list minimal: every entry adds size to the release artifact and Gitee caps a single attachment at 100MB.",
+  "distributions": [
+    "fastapi",
+    "starlette",
+    "uvicorn",
+    "h11",
+    "click",
+    "colorama",
+    "anyio",
+    "sniffio",
+    "idna",
+    "pydantic",
+    "pydantic_core",
+    "annotated-types",
+    "annotated-doc",
+    "typing_extensions",
+    "exceptiongroup",
+    "SQLAlchemy",
+    "PyMySQL",
+    "cryptography",
+    "cffi",
+    "pycparser",
+    "PyYAML"
+  ],
+  "excluded_by_design": {
+    "PySide6": "legacy desktop GUI — the web dashboard replaced it",
+    "playwright": "browser automation, only used by the retired collector flows",
+    "uiautomator2": "device automation — installed only on executor machines",
+    "adbutils": "device automation — installed only on executor machines",
+    "pillow": "image processing for screenshot diffing on executor machines"
+  }
+}

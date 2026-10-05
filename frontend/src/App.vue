@@ -40,6 +40,7 @@
     <main class="main-content">
       <header class="content-header">
         <h2>{{ route.meta.title }}</h2>
+        <UpdateNotifier />
       </header>
       <div class="content-body">
         <router-view v-slot="{ Component }">
@@ -76,6 +77,7 @@ import { ElMessage } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { changePassword } from '@/api'
+import UpdateNotifier from '@/components/UpdateNotifier.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -88,6 +90,8 @@ const allMenuItems = [
   { path: '/hongguo', title: '红果短剧', icon: 'VideoPlay' },
   { path: '/hongguo/multi', title: '红果多开', icon: 'Operation' },
   { path: '/hongguo/templates', title: '红果模板', icon: 'Document' },
+  { path: '/soda', title: '汽水音乐', icon: 'Headset' },
+  { path: '/machines', title: '机器归属', icon: 'Monitor', adminOnly: true },
   { path: '/hongguo/settings', title: 'AI配置', icon: 'Setting', adminOnly: true },
   { path: '/users', title: '账号管理', icon: 'UserFilled', adminOnly: true },
 ]

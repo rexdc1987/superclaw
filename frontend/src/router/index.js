@@ -113,6 +113,18 @@ const routes = [
     component: () => import('@/views/HongguoSettings.vue'),
     meta: { title: 'AI配置', icon: 'Setting', requiresAdmin: true }
   },
+  {
+    path: '/soda',
+    name: 'SodaMusic',
+    component: () => import('@/views/SodaMusic.vue'),
+    meta: { title: '汽水音乐', icon: 'Headset' }
+  },
+  {
+    path: '/machines',
+    name: 'MachineAttribution',
+    component: () => import('@/views/MachineAttribution.vue'),
+    meta: { title: '机器归属', icon: 'Monitor', requiresAdmin: true }
+  },
 ]
 
 const router = createRouter({
