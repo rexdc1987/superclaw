@@ -127,3 +127,33 @@ def isolated_db_spool(tmp_path, monkeypatch):
     dbresilience.DB_HEALTH.reset()
     yield
     dbresilience.DB_HEALTH.reset()
+
+
+@pytest.fixture(autouse=True)
+def isolated_device_call_guards():
+    """Undo the process-wide device call guards after every test.
+
+    ``connect_exact()`` installs wall-clock deadlines inside uiautomator2 itself
+    - it replaces ``AdbHTTPConnection.connect`` and lowers ``HTTP_TIMEOUT`` from
+    its 300s default.  That is a deliberate process-global patch, so a test that
+    reaches the real ``connect_exact`` would otherwise hand a patched
+    uiautomator2 to every test that runs after it.  Put the originals back.
+    """
+    import rpa.hongguo.device as device_module
+
+    try:
+        import uiautomator2.base as u2_base
+        import uiautomator2.core as u2_core
+    except Exception:  # uiautomator2 is not part of every deployment
+        yield
+        return
+
+    original_connect = u2_core.AdbHTTPConnection.connect
+    original_http_timeout = u2_base.HTTP_TIMEOUT
+    original_flag = device_module._device_call_guards_applied
+    try:
+        yield
+    finally:
+        u2_core.AdbHTTPConnection.connect = original_connect
+        u2_base.HTTP_TIMEOUT = original_http_timeout
+        device_module._device_call_guards_applied = original_flag

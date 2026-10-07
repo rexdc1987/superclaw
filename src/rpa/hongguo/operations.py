@@ -1183,7 +1183,7 @@ class HongguoOperations:
         if self.is_playback_paused():
             return True
         try:
-            self.d.shell("input keyevent 127")
+            call_with_timeout(lambda: self.d.shell("input keyevent 127"), 12, "pause keyevent 127")
             time.sleep(1)
             if self.is_playback_paused():
                 return True
@@ -1199,7 +1199,7 @@ class HongguoOperations:
         if self.skip_ad_if_present():
             return True
         try:
-            self.d.shell("input keyevent 126")
+            call_with_timeout(lambda: self.d.shell("input keyevent 126"), 12, "resume keyevent 126")
             time.sleep(1.5)
         except Exception:
             pass
@@ -3945,9 +3945,9 @@ class HongguoOperations:
         submit_actions.extend(
             [
                 ("press_enter", lambda: self.d.press("enter")),
-                ("keyevent_enter", lambda: self.d.shell("input keyevent 66")),
+                ("keyevent_enter", lambda: call_with_timeout(lambda: self.d.shell("input keyevent 66"), 12, "keyevent enter")),
                 ("press_search", lambda: self.d.press("search")),
-                ("keyevent_search", lambda: self.d.shell("input keyevent 84")),
+                ("keyevent_search", lambda: call_with_timeout(lambda: self.d.shell("input keyevent 84"), 12, "keyevent search")),
             ]
         )
         for action_name, action in submit_actions:
@@ -4135,7 +4135,7 @@ class HongguoOperations:
             self.d.set_clipboard(value)
             time.sleep(0.2)
             try:
-                self.d.shell("input keyevent 279")
+                call_with_timeout(lambda: self.d.shell("input keyevent 279"), 12, "paste keyevent 279")
             except Exception:
                 self.d.press("paste")
             time.sleep(0.3)
@@ -4192,7 +4192,13 @@ class HongguoOperations:
         start_y = int(self.height * 0.92)
         end_y = int(self.height * 0.16)
         try:
-            self.d.shell(f"input swipe {cx} {start_y} {cx + random.randint(-8, 8)} {end_y} 650")
+            call_with_timeout(
+                lambda: self.d.shell(
+                    f"input swipe {cx} {start_y} {cx + random.randint(-8, 8)} {end_y} 650"
+                ),
+                12,
+                "continue ad swipe shell",
+            )
         except Exception:
             pass
 

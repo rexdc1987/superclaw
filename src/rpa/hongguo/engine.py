@@ -44,6 +44,11 @@ DEFAULT_SCREENSHOT_ROOT = os.environ.get(
     str((Path(__file__).resolve().parents[3] / "screenshots" / "hongguo").as_posix()),
 )
 REGULAR_RECOVERY_BUDGET_SECONDS = 90
+# Closing the in-feed LiveLite ad can momentarily park 红果 on SearchActivity.
+# A single stray glance at such a transitional page used to abort the entire
+# local recovery, so allow one more round before handing the drama over to a
+# full re-search (task 614 spent 88s here before falling back).
+MAX_STRAY_LIVE_LITE_ROUNDS = 2
 # A playback page with a hidden episode label used to be probed only after
 # 45s of blind waiting. The live-ad overlay cases in tasks 353-356 sat there
 # for ~60s before the engine gave up and re-searched the whole drama, so probe
@@ -2274,6 +2279,7 @@ class TaskEngine:
         expected_total: int,
     ) -> bool:
         """Try a bounded in-player recovery before reopening the whole drama."""
+        stray_page_rounds = 0
         for attempt in range(3):
             self._check_pause_stop()
             advanced = bool(ops.play_episode(target))
@@ -2303,11 +2309,26 @@ class TaskEngine:
                 current = int(state.get("current_episode") or 0)
                 total = int(state.get("total_episodes") or 0)
                 if activity != SHORT_SERIES_ACTIVITY or not self._has_playback_context(state):
+                    # One glance at a transitional page used to abort the whole
+                    # local recovery and hand the drama to a full re-search,
+                    # which on a slow device lands even further behind (task
+                    # 614 spent 88s here before falling back). Drop only this
+                    # probe round so the next attempt can re-drive the
+                    # selector; two stray rounds in a row mean the player is
+                    # genuinely gone and the caller should re-search.
+                    stray_page_rounds += 1
                     self._log(
                         "warn",
-                        f"全流程v3: LiveLite本地恢复离开短剧播放页，activity={activity or '-'}",
+                        f"全流程v3: LiveLite本地恢复本轮未回到短剧播放页，"
+                        f"activity={activity or '-'}，继续尝试{attempt + 1}/3",
                     )
-                    return False
+                    if stray_page_rounds >= MAX_STRAY_LIVE_LITE_ROUNDS:
+                        self._log(
+                            "warn",
+                            "全流程v3: LiveLite本地恢复连续未回到短剧播放页，交由上层重新进入短剧",
+                        )
+                        return False
+                    break
                 if self._total_mismatch_is_fatal(
                     ops,
                     task,
@@ -2447,6 +2468,29 @@ class TaskEngine:
                     self._log(
                         "info",
                         f"全流程v3: 第{reopen_attempt + 1}轮重新进入短剧后已恢复到第{target}集",
+                    )
+                    return True
+                # ``_reopen_target_episode`` already cleared
+                # ``_wait_for_episode_verified``, which tolerates the player
+                # having run past the target as long as the skipped range
+                # holds no pending work. Re-reading the counter here is
+                # inherently later than that decision, so on a slow device it
+                # always looked like a jump and vetoed recoveries that had
+                # just succeeded (task 614 looped three re-searches, ~6min
+                # each, and then failed). Trust the reopen, but still refuse
+                # when the page is demonstrably a different drama.
+                settled = self._page_state(ops, task)
+                settled_app = settled.get("app") or {}
+                settled_activity = str(settled_app.get("activity") or "")
+                if settled_activity == SHORT_SERIES_ACTIVITY and not self._state_is_other_drama(
+                    ops,
+                    task,
+                    settled,
+                ):
+                    self._log(
+                        "info",
+                        f"全流程v3: 第{reopen_attempt + 1}轮重新进入短剧后强确认当前集="
+                        f"{confirmed or 0}，页面仍是目标短剧，接受本次恢复",
                     )
                     return True
                 self._log(

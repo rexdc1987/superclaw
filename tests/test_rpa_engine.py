@@ -32,6 +32,61 @@ def test_connect_exact_does_not_block_on_device_info():
     fake_u2.connect.assert_called_once_with("192.168.3.209:5555")
 
 
+def test_connect_exact_installs_device_call_guards():
+    from rpa.hongguo import device as device_module
+
+    connected = object()
+    fake_u2 = MagicMock()
+    fake_u2.connect.return_value = connected
+    with patch.object(device_module, "_load_u2", return_value=fake_u2):
+        with patch.object(device_module, "install_device_call_guards") as guards:
+            assert device_module.connect_exact("192.168.3.209:5555") is connected
+    guards.assert_called_once_with()
+
+
+def test_device_call_guards_lower_the_shared_http_timeout():
+    from rpa.hongguo import device as device_module
+    import uiautomator2.base as u2_base
+
+    device_module._device_call_guards_applied = False
+    assert device_module.install_device_call_guards(connect_timeout=3, http_timeout=7) is True
+    assert u2_base.HTTP_TIMEOUT == 7
+    # A second install must not stack another wrapper on top of the first.
+    assert device_module.install_device_call_guards(connect_timeout=3, http_timeout=7) is False
+
+
+def test_device_call_guards_abort_a_wedged_socket_connect():
+    from rpa.hongguo import device as device_module
+    import uiautomator2.core as u2_core
+
+    def wedged(self):
+        time.sleep(30)
+
+    u2_core.AdbHTTPConnection.connect = wedged
+    device_module._device_call_guards_applied = False
+    device_module.install_device_call_guards(connect_timeout=0.2, http_timeout=5)
+
+    started = time.monotonic()
+    with pytest.raises(device_module.DeviceCallTimeout):
+        u2_core.AdbHTTPConnection.connect(object())
+    assert time.monotonic() - started < 5
+
+
+def test_device_call_guards_keep_the_original_error():
+    from rpa.hongguo import device as device_module
+    import uiautomator2.core as u2_core
+
+    def failing(self):
+        raise OSError("adb server went away")
+
+    u2_core.AdbHTTPConnection.connect = failing
+    device_module._device_call_guards_applied = False
+    device_module.install_device_call_guards(connect_timeout=2, http_timeout=5)
+
+    with pytest.raises(OSError, match="adb server went away"):
+        u2_core.AdbHTTPConnection.connect(object())
+
+
 def test_hongguo_log_context_extracts_episode_and_screenshot_path():
     from rpa.hongguo.engine import TaskEngine
 
@@ -7974,6 +8029,164 @@ def test_final_evidence_still_fails_on_a_permanently_wrong_collection():
             engine._capture_final_episode_evidence(
                 ops, {"drama_name": "胭脂如梦如雨如尘2"}, 48
             )
+
+
+def test_live_lite_recovery_retries_after_a_transitional_stray_page():
+    """过渡页只该打断本轮探测，不能把剩下的重试一起带走（614 的现场）。"""
+    engine = TaskEngine(task_id=301, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._has_playback_context = MagicMock(return_value=False)
+    engine._page_state = MagicMock(
+        return_value={
+            "current_episode": 0,
+            "total_episodes": 0,
+            "app": {"activity": "com.dragon.read.component.biz.impl.SearchActivity"},
+        }
+    )
+    ops = MagicMock()
+    ops.play_episode.side_effect = [False, True]
+    ops.resume_playback_safely.return_value = False
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._recover_live_lite_next_episode_locally(
+            ops, {"drama_name": "三清观里的挽劫小道士"}, 4, 56
+        ) is True
+
+    assert ops.play_episode.call_count == 2
+
+
+def test_live_lite_recovery_gives_up_only_after_two_stray_rounds():
+    """页面确实离开播放器时仍然放弃，但至少给满两轮。"""
+    engine = TaskEngine(task_id=302, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._has_playback_context = MagicMock(return_value=False)
+    engine._page_state = MagicMock(
+        return_value={
+            "current_episode": 0,
+            "total_episodes": 0,
+            "app": {"activity": "com.dragon.read.component.biz.impl.SearchActivity"},
+        }
+    )
+    ops = MagicMock()
+    ops.play_episode.return_value = False
+    ops.resume_playback_safely.return_value = False
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._recover_live_lite_next_episode_locally(
+            ops, {"drama_name": "三清观里的挽劫小道士"}, 4, 56
+        ) is False
+
+    assert ops.play_episode.call_count == 2
+    logged = " ".join(call.args[1] for call in engine._log.call_args_list)
+    assert "连续未回到短剧播放页" in logged
+
+
+def test_recovery_accepts_a_reopen_that_ran_past_the_target():
+    """重搜后播放器继续前进，只要还在目标剧就接受，不再空转三轮重搜（614）。"""
+    engine = TaskEngine(task_id=303, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._skip_ad_if_present = MagicMock(return_value=False)
+    engine._recovery_page_has_player = MagicMock(return_value=False)
+    engine._reopen_target_episode = MagicMock(return_value=True)
+    engine._confirm_current_episode = MagicMock(return_value=6)
+    engine._state_is_other_drama = MagicMock(return_value=False)
+    engine._page_state = MagicMock(
+        return_value={
+            "current_episode": 6,
+            "app": {
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity"
+            },
+        }
+    )
+    ops = MagicMock()
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._recover_to_verified_episode(
+            ops,
+            {"drama_name": "三清观里的挽劫小道士"},
+            4,
+            56,
+            "第3集后直播页反复拦截自动连播",
+        ) is True
+
+    engine._reopen_target_episode.assert_called_once()
+
+
+def test_recovery_still_refuses_a_reopen_on_another_drama():
+    """集数推进但页面是别的短剧 => 仍然拒绝，563 的误判防线不能松。"""
+    engine = TaskEngine(task_id=304, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._skip_ad_if_present = MagicMock(return_value=False)
+    engine._recovery_page_has_player = MagicMock(return_value=False)
+    engine._reopen_target_episode = MagicMock(return_value=True)
+    engine._confirm_current_episode = MagicMock(return_value=6)
+    engine._state_is_other_drama = MagicMock(return_value=True)
+    engine._page_state = MagicMock(
+        return_value={
+            "current_episode": 6,
+            "app": {
+                "activity": "com.dragon.read.component.shortvideo.impl.ShortSeriesActivity"
+            },
+        }
+    )
+    ops = MagicMock()
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._recover_to_verified_episode(
+            ops, {"drama_name": "三清观里的挽劫小道士"}, 4, 56, "重搜"
+        ) is False
+
+    assert engine._reopen_target_episode.call_count == 3
+    logged = " ".join(call.args[1] for call in engine._log.call_args_list)
+    assert "拒绝误判成功" in logged
+
+
+def test_recovery_refuses_a_reopen_that_left_the_player():
+    """集数读不到且页面已不在播放器 => 不能算恢复成功。"""
+    engine = TaskEngine(task_id=305, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._skip_ad_if_present = MagicMock(return_value=False)
+    engine._recovery_page_has_player = MagicMock(return_value=False)
+    engine._reopen_target_episode = MagicMock(return_value=True)
+    engine._confirm_current_episode = MagicMock(return_value=0)
+    engine._state_is_other_drama = MagicMock(return_value=False)
+    engine._page_state = MagicMock(
+        return_value={
+            "current_episode": 0,
+            "app": {"activity": "com.dragon.read.component.biz.impl.SearchActivity"},
+        }
+    )
+    ops = MagicMock()
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._recover_to_verified_episode(
+            ops, {"drama_name": "三清观里的挽劫小道士"}, 4, 56, "重搜"
+        ) is False
+
+
+def test_recovery_keeps_the_exact_episode_fast_path():
+    """集数精确命中时仍走原分支，不必再读页面状态。"""
+    engine = TaskEngine(task_id=306, db_config={}, screenshot_dir="C:/tmp")
+    engine._log = MagicMock()
+    engine._check_pause_stop = MagicMock()
+    engine._skip_ad_if_present = MagicMock(return_value=False)
+    engine._recovery_page_has_player = MagicMock(return_value=False)
+    engine._reopen_target_episode = MagicMock(return_value=True)
+    engine._confirm_current_episode = MagicMock(return_value=4)
+    engine._page_state = MagicMock()
+    ops = MagicMock()
+
+    with patch("rpa.hongguo.engine.time.sleep"):
+        assert engine._recover_to_verified_episode(
+            ops, {"drama_name": "三清观里的挽劫小道士"}, 4, 56, "重搜"
+        ) is True
+
+    engine._page_state.assert_not_called()
 
 
 # TASK_COMPLETE: phase2_rpa_engine

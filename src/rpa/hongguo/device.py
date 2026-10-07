@@ -59,6 +59,97 @@ def call_with_timeout(func: Callable[[], T], timeout: float, label: str = "devic
     raise value
 
 
+# --- Device call guards -------------------------------------------------
+# uiautomator2 3.6.0 leaves a device call with two ways to hang for minutes:
+#   * AdbHTTPConnection.connect() opens its socket through adbutils, and
+#     adbutils clears the socket timeout right after it finishes talking to the
+#     adb server (adbutils/_adb.py: s.settimeout(None)). The "tcp:<port>"
+#     handshake with the emulator therefore has no deadline at all.
+#   * the shared default HTTP timeout is 300s (uiautomator2/_proto.py:
+#     HTTP_TIMEOUT = 300), so a reply that never arrives only fails after five
+#     minutes.
+# A wedged emulator or a busy shared ADB server then stalls a single
+# click/press/screenshot for 2-8 minutes with zero log lines, and the engine
+# later reads the missing comments as "the drama jumped episodes".
+# Both defaults are overridden once per process, at the only place a real
+# device is created (connect_exact). Callers keep the plain uiautomator2 Device
+# object, so nothing else about the device changes - only the deadline.
+DEVICE_SOCKET_CONNECT_TIMEOUT_SECONDS = float(
+    os.environ.get("SUPERCLAW_DEVICE_CONNECT_TIMEOUT", "20") or 20
+)
+DEVICE_HTTP_TIMEOUT_SECONDS = float(
+    os.environ.get("SUPERCLAW_DEVICE_HTTP_TIMEOUT", "25") or 25
+)
+
+_device_call_guards_applied = False
+
+
+def install_device_call_guards(
+    connect_timeout: float = DEVICE_SOCKET_CONNECT_TIMEOUT_SECONDS,
+    http_timeout: float = DEVICE_HTTP_TIMEOUT_SECONDS,
+) -> bool:
+    """Give every uiautomator2 device call a wall-clock deadline.
+
+    Returns True when the guards were installed by this call, False when they
+    were already in place or when the uiautomator2 internals do not look the
+    way they did when this was written. It never raises: a guard that cannot be
+    installed must not stop the automation from starting.
+    """
+    global _device_call_guards_applied
+    if _device_call_guards_applied:
+        return False
+
+    try:
+        import uiautomator2.base as u2_base
+        import uiautomator2.core as u2_core
+    except Exception as exc:  # pragma: no cover - import guard
+        logger.warning("device call guards unavailable: %s", exc)
+        return False
+
+    original_connect = getattr(getattr(u2_core, "AdbHTTPConnection", None), "connect", None)
+    if original_connect is None or getattr(original_connect, "_superclaw_guarded", False):
+        logger.warning("device call guards skipped: AdbHTTPConnection.connect not found")
+        return False
+
+    def guarded_connect(self) -> None:
+        # adbutils clears the socket timeout before the device handshake, so
+        # the only reliable deadline is the caller thread's own wall clock.
+        outcome: list = []
+
+        def run() -> None:
+            try:
+                original_connect(self)
+                outcome.append(None)
+            except BaseException as exc:  # re-raised on the caller thread
+                outcome.append(exc)
+
+        worker = threading.Thread(target=run, name="hongguo-u2-connect", daemon=True)
+        worker.start()
+        worker.join(max(0.1, float(connect_timeout)))
+        if worker.is_alive():
+            raise DeviceCallTimeout(
+                f"device socket connect timed out after {connect_timeout:g}s"
+            )
+        if outcome and outcome[0] is not None:
+            raise outcome[0]
+
+    guarded_connect._superclaw_guarded = True  # type: ignore[attr-defined]
+    u2_core.AdbHTTPConnection.connect = guarded_connect
+
+    try:
+        u2_base.HTTP_TIMEOUT = float(http_timeout)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("device http timeout not applied: %s", exc)
+
+    _device_call_guards_applied = True
+    logger.info(
+        "device call guards installed: socket connect %.0fs, http %.0fs",
+        connect_timeout,
+        http_timeout,
+    )
+    return True
+
+
 def _load_u2():
     try:
         import uiautomator2 as u2
@@ -560,6 +651,7 @@ def discover_addrs() -> list[str]:
 def connect_exact(addr: str) -> Any:
     """Connect to one specific uiautomator2 device without fallback."""
     os.environ.pop("PYTHONPATH", None)
+    install_device_call_guards()
 
     def do_connect() -> Any:
         u2 = _load_u2()
